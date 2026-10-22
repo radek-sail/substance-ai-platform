@@ -81,19 +81,3 @@ export const VideoMetadataSchema = z.object({
 });
 export type VideoMetadata = z.infer<typeof VideoMetadataSchema>;
 
-export const VideoMetadataSchema = z.object({
-  videoId: z.string(),
-  customerId: z.string(),
-  databaseId: z.string(),
-  originalGcsUri: z.string(),
-  normalizedGcsUri: z.string(),
-  status: z.string(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
-  fileName: z.string().optional(),
-  fileSize: z.number().optional(),
-  durationSec: z.number().optional(),
-  metadata: z.record(z.any()).optional(),
-});
-export type VideoMetadata = z.infer<typeof VideoMetadataSchema>;
-export type Refinement = z.infer<typeof RefinementSchema>;

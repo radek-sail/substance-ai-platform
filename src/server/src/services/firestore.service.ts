@@ -70,6 +70,32 @@ export async function getVideoMetadata(
 }
 
 /**
+ * Persists or updates video analysis in the tenant's `video_analyses` collection.
+ * Target document path: `/databases/{databaseID}/documents/video_analyses/{videoId}`
+ */
+export async function saveVideoAnalysis(
+  databaseId: string,
+  videoId: string,
+  analysis: Record<string, any>
+): Promise<WriteResult> {
+  const db = getTenantFirestore(databaseId);
+  const docRef = db.collection('video_analyses').doc(videoId);
+  return await docRef.set(analysis, { merge: true });
+}
+
+/**
+ * Retrieves video analysis from the tenant's `video_analyses` collection.
+ */
+export async function getVideoAnalysis(
+  databaseId: string,
+  videoId: string
+): Promise<DocumentData | null> {
+  const db = getTenantFirestore(databaseId);
+  const docSnap = await db.collection('video_analyses').doc(videoId).get();
+  return docSnap.exists ? docSnap.data()! : null;
+}
+
+/**
  * Clears the internal database instance cache (primarily used for testing).
  */
 export function clearDatabaseCache(): void {

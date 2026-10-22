@@ -2,7 +2,9 @@ import express, { Express, Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import videoRoutes from './routes/video.routes';
+import pipelineRoutes from './routes/pipeline.routes';
 import { uploadMiddleware, uploadVideoHandler } from './controllers/video.controller';
+import { analyzePipelineHandler } from './controllers/pipeline.controller';
 
 // Load environment variables
 dotenv.config();
@@ -36,6 +38,10 @@ app.use('/api/videos', videoRoutes);
 
 // Direct route registration for POST /api/videos/upload
 app.post('/api/videos/upload', uploadMiddleware, uploadVideoHandler);
+
+// Pipeline analysis routes
+app.use('/api/pipeline', pipelineRoutes);
+app.post('/api/pipeline/analyze', analyzePipelineHandler);
 
 const PORT = Number(process.env.PORT) || 8080;
 
