@@ -1,0 +1,14 @@
+{
+  "name": "substance-ai-platform",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev:client": "pnpm --filter @sail/client dev",
+    "dev:server": "pnpm --filter @sail/server dev",
+    "build": "pnpm --filter @sail/shared build && pnpm --filter @sail/server build && pnpm --filter @sail/client build",
+    "typecheck": "pnpm -r exec tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

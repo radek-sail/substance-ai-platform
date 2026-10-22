@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.local
+*.log
+
+# Editor directories
+.vscode/
+.idea/
+.DS_Store
