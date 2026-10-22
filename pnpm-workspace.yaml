@@ -2,3 +2,10 @@ packages:
   - 'src/shared'
   - 'src/client'
   - 'src/server'
+
+allowBuilds:
+  protobufjs: true
+
+onlyBuiltDependencies:
+  - protobufjs
+  - 'src/server'
