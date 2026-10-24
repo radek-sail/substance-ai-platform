@@ -81,3 +81,48 @@ export const VideoMetadataSchema = z.object({
 });
 export type VideoMetadata = z.infer<typeof VideoMetadataSchema>;
 
+export const BoxUpdateSchema = z.object({
+  boxId: z.string().default('box_01'),
+  row: z.string(),
+  col: z.number(),
+  cellLineName: z.string(),
+  lotNumber: z.string().optional(),
+  passage: z.number().optional(),
+  operatorInitials: z.string().optional(),
+  status: z.enum(['OCCUPIED', 'EMPTY', 'RESERVED']).default('OCCUPIED'),
+  updatedAt: z.string().optional(),
+});
+export type BoxUpdate = z.infer<typeof BoxUpdateSchema>;
+
+export const InventorySignOffPayloadSchema = z.object({
+  databaseId: z.string(),
+  videoId: z.string(),
+  inventoryId: z.string(),
+  boxUpdates: z.array(BoxUpdateSchema),
+  signedOffAt: z.string().optional(),
+  operatorInitials: z.string().optional(),
+});
+export type InventorySignOffPayload = z.infer<typeof InventorySignOffPayloadSchema>;
+
+export const ArchiveSignOffPayloadSchema = z.object({
+  databaseId: z.string(),
+  videoId: z.string(),
+  archiveId: z.string(),
+  markdownDoc: z.string(),
+  signedOffAt: z.string().optional(),
+  operatorInitials: z.string().optional(),
+});
+export type ArchiveSignOffPayload = z.infer<typeof ArchiveSignOffPayloadSchema>;
+
+export const VideoAnalysisDocSchema = z.object({
+  videoId: z.string().optional(),
+  workflowClassification: WorkflowClassificationSchema.optional(),
+  workloadClassification: WorkflowClassificationSchema.optional(),
+  actions: z.array(ActionSchema),
+  events: z.array(EventSchema),
+  refinements: z.array(RefinementSchema),
+  isSignedOff: z.boolean().default(false),
+  signedOffAt: z.string().optional(),
+  updatedAt: z.string().optional(),
+});
+export type VideoAnalysisDoc = z.infer<typeof VideoAnalysisDocSchema>;
