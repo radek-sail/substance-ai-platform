@@ -1,17 +1,32 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   rowIndexToLetter,
   letterToRowIndex,
+  letterToRowNumber,
+  rowNumberToLetter,
+  toTopLeftGridPosition,
   computeGridCoordinateFromNormalized,
   calculateSpatialDistance,
   formatCoordinate,
   parseCoordinate,
+  validateMicroplateSeeding,
 } from '../src/utils/coordinates.ts';
 
-describe('Phase 4: Client Coordinate Utilities & Top-Left Box Origin', () => {
-  describe('Row Index and Letter Conversions', () => {
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const archiveFixturePath = path.resolve(
+  __dirname,
+  '../../server/tests/fixtures/archiveWorkflowFixture.json'
+);
+const archiveFixture = JSON.parse(fs.readFileSync(archiveFixturePath, 'utf-8'));
+
+describe('Phase 4 & 5: Client Coordinate Transformation & 96-Well Seeding Validator', () => {
+  describe('Row Index, Row Number (1-Based A=1, B=2...) and Letter Conversions', () => {
     it('should accurately convert zero-based row indices to uppercase letters (A-Z)', () => {
       assert.strictEqual(rowIndexToLetter(0), 'A');
       assert.strictEqual(rowIndexToLetter(1), 'B');
@@ -32,6 +47,31 @@ describe('Phase 4: Client Coordinate Utilities & Top-Left Box Origin', () => {
       assert.throws(() => letterToRowIndex('!'), RangeError);
       assert.throws(() => letterToRowIndex(''), TypeError);
     });
+
+    it('should map top-left origin with row descending alphabetical (A=1, B=2...) and column horizontal (1, 2, 3...)', () => {
+      assert.strictEqual(letterToRowNumber('A'), 1);
+      assert.strictEqual(letterToRowNumber('B'), 2);
+      assert.strictEqual(letterToRowNumber('C'), 3);
+      assert.strictEqual(letterToRowNumber('H'), 8);
+      assert.strictEqual(letterToRowNumber('I'), 9);
+
+      assert.strictEqual(rowNumberToLetter(1), 'A');
+      assert.strictEqual(rowNumberToLetter(2), 'B');
+      assert.strictEqual(rowNumberToLetter(8), 'H');
+      assert.strictEqual(rowNumberToLetter(9), 'I');
+
+      const posA4 = toTopLeftGridPosition('A4');
+      assert.strictEqual(posA4.row, 'A');
+      assert.strictEqual(posA4.rowNumber, 1);
+      assert.strictEqual(posA4.col, 4);
+      assert.strictEqual(posA4.coordinate, 'A4');
+
+      const posB2 = toTopLeftGridPosition('B', 2);
+      assert.strictEqual(posB2.row, 'B');
+      assert.strictEqual(posB2.rowNumber, 2);
+      assert.strictEqual(posB2.col, 2);
+      assert.strictEqual(posB2.coordinate, 'B2');
+    });
   });
 
   describe('Top-Left Origin Normalized Coordinate Mapping', () => {
@@ -39,6 +79,12 @@ describe('Phase 4: Client Coordinate Utilities & Top-Left Box Origin', () => {
       const topLeft = computeGridCoordinateFromNormalized(0.05, 0.05, 9, 9);
       assert.strictEqual(topLeft.row, 'A');
       assert.strictEqual(topLeft.col, 1);
+    });
+
+    it('should map normalized coordinates to slot A4 for 9x9 cryo-box', () => {
+      const slotA4 = computeGridCoordinateFromNormalized(0.38, 0.05, 9, 9);
+      assert.strictEqual(slotA4.row, 'A');
+      assert.strictEqual(slotA4.col, 4);
     });
 
     it('should map (0.95, 0.95) to bottom-right slot I9 for 9x9 cryo-box', () => {
@@ -54,24 +100,20 @@ describe('Phase 4: Client Coordinate Utilities & Top-Left Box Origin', () => {
     });
 
     it('should map normalized box coordinates to slot C4 (target coordinate)', () => {
-      // Slot C4: row C is index 2 (2/9 approx 0.222..0.333), col 4 is (3/9 approx 0.333..0.444)
       const coordC4 = computeGridCoordinateFromNormalized(0.38, 0.28, 9, 9);
       assert.strictEqual(coordC4.row, 'C');
       assert.strictEqual(coordC4.col, 4);
     });
 
     it('should map 8x12 96-well microplate normalized coordinates (A-H, 1-12)', () => {
-      // Top-left: A1
       const wellA1 = computeGridCoordinateFromNormalized(0.02, 0.02, 8, 12);
       assert.strictEqual(wellA1.row, 'A');
       assert.strictEqual(wellA1.col, 1);
 
-      // Bottom-right: H12
       const wellH12 = computeGridCoordinateFromNormalized(0.98, 0.98, 8, 12);
       assert.strictEqual(wellH12.row, 'H');
       assert.strictEqual(wellH12.col, 12);
 
-      // Well C4: row C is index 2 (2/8 = 0.25..0.375), col 4 is (3/12 = 0.25..0.333)
       const wellC4 = computeGridCoordinateFromNormalized(0.29, 0.31, 8, 12);
       assert.strictEqual(wellC4.row, 'C');
       assert.strictEqual(wellC4.col, 4);
@@ -81,7 +123,7 @@ describe('Phase 4: Client Coordinate Utilities & Top-Left Box Origin', () => {
   describe('Spatial Distance & Differencing', () => {
     it('should calculate spatial delta and Euclidean distance between two coordinates', () => {
       const coordA = { row: 'A', col: 1 };
-      const coordB = { row: 'C', col: 4 }; // Row A->C (+2), Col 1->4 (+3)
+      const coordB = { row: 'C', col: 4 };
       const diff = calculateSpatialDistance(coordA, coordB);
       assert.strictEqual(diff.rowDiff, 2);
       assert.strictEqual(diff.colDiff, 3);
@@ -99,7 +141,7 @@ describe('Phase 4: Client Coordinate Utilities & Top-Left Box Origin', () => {
   describe('String Formatting and Parsing', () => {
     it('should format row and column into coordinate string', () => {
       assert.strictEqual(formatCoordinate('c', 4), 'C4');
-      assert.strictEqual(formatCoordinate('a', 1), 'A1');
+      assert.strictEqual(formatCoordinate('a', 4), 'A4');
       assert.strictEqual(formatCoordinate('h', 12), 'H12');
     });
 
@@ -112,6 +154,35 @@ describe('Phase 4: Client Coordinate Utilities & Top-Left Box Origin', () => {
 
       assert.strictEqual(parseCoordinate('INVALID'), null);
       assert.strictEqual(parseCoordinate(''), null);
+    });
+  });
+
+  describe('Microplate 96-Well Seeding Validator (12 Columns)', () => {
+    it('should confirm all 12 columns are verified as seeded from archiveWorkflowFixture.json', () => {
+      const validation = validateMicroplateSeeding(archiveFixture);
+      assert.strictEqual(validation.isFullySeeded, true);
+      assert.strictEqual(validation.totalColumnsVerified, 12);
+      assert.strictEqual(validation.totalWellsSeeded, 96);
+      assert.deepStrictEqual(validation.seededColumns, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+      assert.deepStrictEqual(validation.missingColumns, []);
+    });
+
+    it('should confirm all 12 columns when passed the 12 seeding events directly', () => {
+      const seedingEvents = archiveFixture.events.filter(
+        (e) => e.actionId === 'act_arch_002'
+      );
+      const validation = validateMicroplateSeeding(seedingEvents);
+      assert.strictEqual(validation.isFullySeeded, true);
+      assert.strictEqual(validation.totalColumnsVerified, 12);
+      assert.strictEqual(validation.totalWellsSeeded, 96);
+    });
+
+    it('should detect missing columns when fewer than 12 columns are seeded', () => {
+      const partialValidation = validateMicroplateSeeding([1, 2, 3, 4, 5, 6]);
+      assert.strictEqual(partialValidation.isFullySeeded, false);
+      assert.strictEqual(partialValidation.totalColumnsVerified, 6);
+      assert.strictEqual(partialValidation.totalWellsSeeded, 48);
+      assert.deepStrictEqual(partialValidation.missingColumns, [7, 8, 9, 10, 11, 12]);
     });
   });
 });

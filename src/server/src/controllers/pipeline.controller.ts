@@ -1,6 +1,11 @@
 import { Request, Response } from 'express';
 import { executeHierarchicalPipeline } from '../services/gemini.service';
-import { saveVideoAnalysis } from '../services/firestore.service';
+import {
+  saveVideoAnalysis,
+  getVideoAnalysis,
+  commitInventorySignOff,
+  commitArchiveSignOff,
+} from '../services/firestore.service';
 
 /**
  * Controller for POST /api/pipeline/analyze
@@ -44,6 +49,7 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
 
     const nowIso = new Date().toISOString();
     const analysisPayload = {
+      videoId,
       workloadClassification,
       workflowClassification: workloadClassification,
       actions,
@@ -73,5 +79,136 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
       error: error?.message || 'Pipeline analysis execution failed',
       videoId,
     });
+  }
+}
+
+/**
+ * Controller for POST /api/signoff/inventory (and POST /api/pipeline/signoff/inventory)
+ *
+ * Atomically commits occupied cryo-box cells to `inventories/{inventoryId}/contents/{boxId}`
+ * and marks `video_analyses/{videoId}.isSignedOff = true`.
+ */
+export async function inventorySignOffHandler(req: Request, res: Response): Promise<Response | void> {
+  const databaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
+  const { videoId, inventoryId, boxUpdates, operatorInitials, signedOffAt } = req.body || {};
+
+  if (!databaseId) {
+    return res.status(400).json({ error: 'Missing required field or header: databaseId / x-database-id' });
+  }
+  if (!videoId) {
+    return res.status(400).json({ error: 'Missing required field: videoId' });
+  }
+  if (!inventoryId) {
+    return res.status(400).json({ error: 'Missing required field: inventoryId' });
+  }
+  if (!Array.isArray(boxUpdates)) {
+    return res.status(400).json({ error: 'Missing required array field: boxUpdates' });
+  }
+
+  try {
+    const result = await commitInventorySignOff({
+      databaseId,
+      videoId,
+      inventoryId,
+      boxUpdates,
+      operatorInitials,
+      signedOffAt,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Successfully committed ${boxUpdates.length} cell updates to inventories/${inventoryId}/contents/${result.boxId} and signed off analysis ${videoId}.`,
+      signedOffAt: result.signedOffAt,
+      documentPath: result.documentPath,
+      details: {
+        inventoryId,
+        videoId,
+        boxId: result.boxId,
+        updatesCount: boxUpdates.length,
+        occupiedCells: result.occupiedCells,
+        isSignedOff: result.isSignedOff,
+      },
+    });
+  } catch (error: any) {
+    return res.status(400).json({
+      error: error?.message || 'Inventory sign-off failed',
+    });
+  }
+}
+
+/**
+ * Controller for POST /api/signoff/archive (and POST /api/pipeline/signoff/archive)
+ *
+ * Formats and persists the experiment Markdown document (`## Description`, `## Reagents Used`, `## Experiment Steps`)
+ * in `archives/{archiveId}` and marks `video_analyses/{videoId}.isSignedOff = true`.
+ */
+export async function archiveSignOffHandler(req: Request, res: Response): Promise<Response | void> {
+  const databaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
+  const { videoId, archiveId, markdownDoc, analysis, description, reagents, steps, operatorInitials, signedOffAt } =
+    req.body || {};
+
+  if (!databaseId) {
+    return res.status(400).json({ error: 'Missing required field or header: databaseId / x-database-id' });
+  }
+  if (!videoId) {
+    return res.status(400).json({ error: 'Missing required field: videoId' });
+  }
+  if (!archiveId) {
+    return res.status(400).json({ error: 'Missing required field: archiveId' });
+  }
+
+  try {
+    const result = await commitArchiveSignOff({
+      databaseId,
+      videoId,
+      archiveId,
+      markdownDoc,
+      analysis,
+      description,
+      reagents,
+      steps,
+      operatorInitials,
+      signedOffAt,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Successfully compiled and committed experiment archive to archives/${archiveId} and marked analysis ${videoId} as signed off.`,
+      signedOffAt: result.signedOffAt,
+      documentPath: result.documentPath,
+      markdownDoc: result.markdownDoc,
+      details: {
+        archiveId,
+        videoId,
+        isSignedOff: result.isSignedOff,
+        contentLength: result.markdownDoc.length,
+      },
+    });
+  } catch (error: any) {
+    return res.status(400).json({
+      error: error?.message || 'Archive sign-off failed',
+    });
+  }
+}
+
+/**
+ * Controller for GET /databases/:databaseId/documents/video_analyses/:videoId
+ */
+export async function getVideoAnalysisHandler(req: Request, res: Response): Promise<Response | void> {
+  const databaseId = (req.params.databaseId || req.headers['x-database-id']) as string | undefined;
+  const videoId = req.params.videoId as string | undefined;
+
+  if (!databaseId || !videoId) {
+    return res.status(400).json({ error: 'Missing databaseId or videoId' });
+  }
+
+  try {
+    const analysis = await getVideoAnalysis(databaseId, videoId);
+    if (!analysis) {
+      return res.status(404).json({ error: `Video analysis ${videoId} not found` });
+    }
+    return res.status(200).json({ videoId, ...analysis });
+  } catch (error: any) {
+    return res.status(500).json({ error: error?.message || 'Failed to retrieve video analysis' });
   }
 }

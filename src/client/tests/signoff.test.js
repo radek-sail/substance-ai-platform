@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   BoxUpdateSchema,
@@ -13,9 +16,26 @@ import {
   DEFAULT_TENANT_CONFIG,
   SAMPLE_INVENTORY_ANALYSIS,
   SAMPLE_ARCHIVE_ANALYSIS,
+  compileArchiveMarkdownFromAnalysis,
+  generateInventorySignOffPayload,
+  generateArchiveSignOffPayload,
+  generateSignOffPayload,
 } from '../src/services/api.service.ts';
 
-describe('Phase 4: Atomic Sign-Off Payload Assembly & Multi-Tenant Scoping', () => {
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const inventoryFixturePath = path.resolve(
+  __dirname,
+  '../../server/tests/fixtures/inventoryWorkflowFixture.json'
+);
+const archiveFixturePath = path.resolve(
+  __dirname,
+  '../../server/tests/fixtures/archiveWorkflowFixture.json'
+);
+const inventoryFixture = JSON.parse(fs.readFileSync(inventoryFixturePath, 'utf-8'));
+const archiveFixture = JSON.parse(fs.readFileSync(archiveFixturePath, 'utf-8'));
+
+describe('Phase 4 & 5: Atomic Sign-Off Payload Generator Utility & Multi-Tenant Scoping', () => {
   describe('1. Box Update and Inventory Sign-Off Schema Validation', () => {
     it('should validate a conforming BoxUpdateSchema item', () => {
       const validBoxUpdate = {
@@ -72,7 +92,6 @@ describe('Phase 4: Atomic Sign-Off Payload Assembly & Multi-Tenant Scoping', () 
     it('should reject invalid InventorySignOffPayload with missing required fields', () => {
       const invalid = {
         databaseId: 'test-db',
-        // missing videoId and inventoryId
         boxUpdates: [],
       };
       assert.throws(() => InventorySignOffPayloadSchema.parse(invalid));
@@ -109,7 +128,51 @@ describe('Phase 4: Atomic Sign-Off Payload Assembly & Multi-Tenant Scoping', () 
     });
   });
 
-  describe('3. ApiService Atomic Sign-Off Assembly and Multi-Tenant Isolation', () => {
+  describe('3. SignOff Payload Generator Utilities (Inventory & Archive)', () => {
+    it('should generate a valid InventorySignOffPayload from inventoryWorkflowFixture.json', () => {
+      const payload = generateInventorySignOffPayload(inventoryFixture);
+      const validated = InventorySignOffPayloadSchema.parse(payload);
+
+      assert.strictEqual(validated.databaseId, 'customer-alpha-db');
+      assert.strictEqual(validated.videoId, 'vid_inventory_fixture_01');
+      assert.strictEqual(validated.inventoryId, 'inv_alpha_01');
+      assert.strictEqual(validated.boxUpdates.length, 1);
+      assert.strictEqual(validated.boxUpdates[0].boxId, 'box_01');
+      assert.strictEqual(validated.boxUpdates[0].row, 'A');
+      assert.strictEqual(validated.boxUpdates[0].col, 4);
+      assert.strictEqual(validated.boxUpdates[0].cellLineName, 'HEK293T');
+      assert.strictEqual(validated.boxUpdates[0].lotNumber, 'LOT-2026-A4');
+      assert.strictEqual(validated.boxUpdates[0].passage, 4);
+      assert.strictEqual(validated.boxUpdates[0].status, 'OCCUPIED');
+    });
+
+    it('should generate a valid ArchiveSignOffPayload from archiveWorkflowFixture.json', () => {
+      const payload = generateArchiveSignOffPayload(archiveFixture);
+      const validated = ArchiveSignOffPayloadSchema.parse(payload);
+
+      assert.strictEqual(validated.databaseId, 'customer-alpha-db');
+      assert.strictEqual(validated.videoId, 'vid_archive_fixture_02');
+      assert.strictEqual(validated.archiveId, 'archive_exp_96well_01');
+      assert.ok(validated.markdownDoc.includes('## Description'));
+      assert.ok(validated.markdownDoc.includes('## Reagents Used'));
+      assert.ok(validated.markdownDoc.includes('## Experiment Steps'));
+      assert.ok(validated.markdownDoc.includes('FBS: Fetal Bovine Serum'));
+      assert.ok(validated.markdownDoc.includes('100 µL / 3000 cells/well'));
+    });
+
+    it('should dispatch automatically via generateSignOffPayload based on workflowType', () => {
+      const invPayload = generateSignOffPayload(inventoryFixture);
+      assert.ok('boxUpdates' in invPayload);
+      assert.strictEqual(invPayload.boxUpdates[0].row, 'A');
+      assert.strictEqual(invPayload.boxUpdates[0].col, 4);
+
+      const archPayload = generateSignOffPayload(archiveFixture);
+      assert.ok('markdownDoc' in archPayload);
+      assert.ok(archPayload.markdownDoc.includes('## Description'));
+    });
+  });
+
+  describe('4. ApiService Atomic Sign-Off Assembly and Multi-Tenant Isolation', () => {
     it('should construct atomic batch payload for commitInventorySignOff with tenant scoping', async () => {
       const api = new ApiService({
         tenant: {
@@ -140,7 +203,11 @@ describe('Phase 4: Atomic Sign-Off Payload Assembly & Multi-Tenant Scoping', () 
       );
 
       assert.strictEqual(res.success, true);
-      assert.ok(res.documentPath.includes('/databases/biolab-db-01/documents/inventories/tank_alpha_01/contents/box_03'));
+      assert.ok(
+        res.documentPath.includes(
+          '/databases/biolab-db-01/documents/inventories/tank_alpha_01/contents/box_03'
+        )
+      );
       assert.strictEqual(res.details.isSignedOff, true);
       assert.strictEqual(res.details.updatesCount, 1);
     });
@@ -154,7 +221,7 @@ describe('Phase 4: Atomic Sign-Off Payload Assembly & Multi-Tenant Scoping', () 
         },
       });
 
-      const markdown = `## Description\nTested protocol.\n## Reagents Used\n- FBS\n## Experiment Steps\n1. Run`;
+      const markdown = compileArchiveMarkdownFromAnalysis(SAMPLE_ARCHIVE_ANALYSIS);
 
       const res = await api.commitArchiveSignOff(
         'biolab-db-01',
@@ -164,7 +231,9 @@ describe('Phase 4: Atomic Sign-Off Payload Assembly & Multi-Tenant Scoping', () 
       );
 
       assert.strictEqual(res.success, true);
-      assert.ok(res.documentPath.includes('/databases/biolab-db-01/documents/archives/archive_exp_402'));
+      assert.ok(
+        res.documentPath.includes('/databases/biolab-db-01/documents/archives/archive_exp_402')
+      );
       assert.strictEqual(res.details.isSignedOff, true);
       assert.strictEqual(res.details.archiveId, 'archive_exp_402');
     });

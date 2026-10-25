@@ -1,0 +1,63 @@
+# Google Cloud Build Pipeline for Substance AI Labs (SAIL) Monorepo
+# Builds and verifies @sail/shared, @sail/server, and @sail/client, exports frontend assets,
+# and builds/deploys the Cloud Run backend container (gcr.io/$PROJECT_ID/sail-backend).
+
+steps:
+  # Step 1: Install dependencies, build workspaces, run typechecks & verification tests, and export frontend assets
+  - name: 'node:20-bullseye'
+    id: 'build-and-export-frontend'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        corepack enable
+        pnpm install --frozen-lockfile
+        pnpm build
+        pnpm typecheck
+        pnpm test
+        mkdir -p dist/frontend
+        cp -r src/client/dist/* dist/frontend/
+
+  # Step 2: Build the Docker container targeting Cloud Run (gcr.io/$PROJECT_ID/sail-backend)
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-backend-container'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/sail-backend:$SHORT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/sail-backend:latest'
+      - '.'
+
+  # Step 3: Push the Docker image to Google Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-backend-container'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/sail-backend:$SHORT_SHA'
+
+  # Step 4: Deploy container to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-cloud-run'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'sail-backend'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/sail-backend:$SHORT_SHA'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+
+substitutions:
+  _REGION: 'us-central1'
+
+images:
+  - 'gcr.io/$PROJECT_ID/sail-backend:$SHORT_SHA'
+  - 'gcr.io/$PROJECT_ID/sail-backend:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

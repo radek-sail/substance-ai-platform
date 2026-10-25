@@ -625,3 +625,217 @@ export const commitArchiveSignOff = (
   archiveId: string,
   markdownDoc: string
 ) => apiService.commitArchiveSignOff(databaseId, videoId, archiveId, markdownDoc);
+
+
+/**
+ * Compiles a structured Experiment Notebook Markdown document (`## Description`, `## Reagents Used`, `## Experiment Steps`)
+ * from a VideoAnalysisDoc or fixture object.
+ */
+export function compileArchiveMarkdownFromAnalysis(
+  analysis: VideoAnalysisDoc | Record<string, any>
+): string {
+  const src = analysis as Record<string, any>;
+  const classification =
+    src.workflowClassification || src.workloadClassification || {};
+  const description =
+    classification.transcribedAudio ||
+    classification.archiveName ||
+    'Experiment notebook entry compiled from SAIL video analysis.';
+
+  const reagentLines: string[] = [];
+  const refinements = Array.isArray(src.refinements) ? src.refinements : [];
+  for (const ref of refinements) {
+    if (
+      ref.refinementClass === 'REAGENT_OCR_CONFLATION' ||
+      ref.refinementClass === 'ACRONYM_MAPPING' ||
+      ref.refinementClass === 'REAGENT_ACRONYM_RESOLUTION'
+    ) {
+      reagentLines.push(`- ${ref.transcriptionText}`);
+    }
+  }
+  const actions = Array.isArray(src.actions) ? src.actions : [];
+  for (const act of actions) {
+    if (act.cellLineName) {
+      reagentLines.push(`- Cell Line: ${act.cellLineName}`);
+    }
+  }
+  if (reagentLines.length === 0) {
+    reagentLines.push('- Verified protocol reagents');
+  }
+
+  const stepLines: string[] = [];
+  actions.forEach((act: Record<string, any>, idx: number) => {
+    const relatedRefs = refinements.filter((r: Record<string, any>) =>
+      (act.eventList || []).includes(r.eventId)
+    );
+    const refText =
+      relatedRefs.length > 0
+        ? ` — ${relatedRefs.map((r: Record<string, any>) => r.transcriptionText).join('; ')}`
+        : '';
+    stepLines.push(
+      `${idx + 1}. **${act.actionClass}** (${act.actionId}): ${(act.eventList || []).length} events${refText}`
+    );
+  });
+  if (stepLines.length === 0) {
+    stepLines.push('1. Executed experiment steps.');
+  }
+
+  return [
+    '## Description',
+    description,
+    '',
+    '## Reagents Used',
+    ...reagentLines,
+    '',
+    '## Experiment Steps',
+    ...stepLines,
+  ].join('\n');
+}
+
+/**
+ * Utility to generate and validate an InventorySignOffPayload from an analysis document or explicit parameters.
+ */
+export function generateInventorySignOffPayload(
+  source: VideoAnalysisDoc | Record<string, any>,
+  options: {
+    databaseId?: string;
+    videoId?: string;
+    inventoryId?: string;
+    boxId?: string;
+    operatorInitials?: string;
+    signedOffAt?: string;
+  } = {}
+): InventorySignOffPayload {
+  const src = source as Record<string, any>;
+  const databaseId =
+    options.databaseId || src.databaseId || DEFAULT_TENANT_CONFIG.databaseId;
+  const videoId = options.videoId || src.videoId || 'vid_inventory_01';
+  const actions = Array.isArray(src.actions) ? src.actions : [];
+  const refinements = Array.isArray(src.refinements) ? src.refinements : [];
+
+  const inventoryId =
+    options.inventoryId ||
+    src.inventoryId ||
+    actions[0]?.inventoryId ||
+    src.workflowClassification?.inventoryName ||
+    'inv_default_01';
+
+  const defaultBoxId =
+    options.boxId ||
+    src.boxId ||
+    actions[0]?.cellLineInfo?.boxId ||
+    'box_01';
+
+  const signedOffAt = options.signedOffAt || new Date().toISOString();
+  const operatorInitials =
+    options.operatorInitials ||
+    actions[0]?.cellLineInfo?.operatorInitials ||
+    actions[0]?.cellLineInfo?.operator ||
+    DEFAULT_TENANT_CONFIG.operatorInitials;
+
+  const boxUpdates: BoxUpdate[] = Array.isArray(src.boxUpdates)
+    ? src.boxUpdates.map((u: any) => BoxUpdateSchema.parse(u))
+    : actions.map((act: Record<string, any>) => {
+        const spatialRef = refinements.find(
+          (r: Record<string, any>) =>
+            (act.eventList || []).includes(r.eventId) && r.spatialResult
+        );
+        const row = (
+          act.boxRowId ||
+          spatialRef?.spatialResult?.row ||
+          'A'
+        ).toUpperCase();
+        const col = Number(
+          act.boxColId ?? spatialRef?.spatialResult?.col ?? 1
+        );
+        const status =
+          act.actionClass === 'VIAL_REMOVAL_ACTION' ? 'EMPTY' : 'OCCUPIED';
+
+        return BoxUpdateSchema.parse({
+          boxId: act.cellLineInfo?.boxId || defaultBoxId,
+          row,
+          col,
+          cellLineName: act.cellLineName || 'Unknown',
+          lotNumber:
+            act.cellLineInfo?.lotNumber || act.cellLineInfo?.lot || undefined,
+          passage:
+            typeof act.cellLineInfo?.passage === 'number'
+              ? act.cellLineInfo.passage
+              : undefined,
+          operatorInitials,
+          status,
+          updatedAt: signedOffAt,
+        });
+      });
+
+  return InventorySignOffPayloadSchema.parse({
+    databaseId,
+    videoId,
+    inventoryId,
+    boxUpdates,
+    signedOffAt,
+    operatorInitials,
+  });
+}
+
+/**
+ * Utility to generate and validate an ArchiveSignOffPayload from an analysis document or explicit parameters.
+ */
+export function generateArchiveSignOffPayload(
+  source: VideoAnalysisDoc | Record<string, any>,
+  options: {
+    databaseId?: string;
+    videoId?: string;
+    archiveId?: string;
+    markdownDoc?: string;
+    operatorInitials?: string;
+    signedOffAt?: string;
+  } = {}
+): ArchiveSignOffPayload {
+  const src = source as Record<string, any>;
+  const databaseId =
+    options.databaseId || src.databaseId || DEFAULT_TENANT_CONFIG.databaseId;
+  const videoId = options.videoId || src.videoId || 'vid_archive_01';
+  const actions = Array.isArray(src.actions) ? src.actions : [];
+  const archiveId =
+    options.archiveId ||
+    src.archiveId ||
+    actions[0]?.archiveId ||
+    src.workflowClassification?.archiveName ||
+    'archive_default_01';
+  const markdownDoc =
+    options.markdownDoc ||
+    src.markdownDoc ||
+    compileArchiveMarkdownFromAnalysis(src);
+  const signedOffAt = options.signedOffAt || new Date().toISOString();
+  const operatorInitials =
+    options.operatorInitials || DEFAULT_TENANT_CONFIG.operatorInitials;
+
+  return ArchiveSignOffPayloadSchema.parse({
+    databaseId,
+    videoId,
+    archiveId,
+    markdownDoc,
+    signedOffAt,
+    operatorInitials,
+  });
+}
+
+/**
+ * Unified SignOff payload generator utility that inspects workflowClassification.workflowType
+ * and produces a schema-validated InventorySignOffPayload or ArchiveSignOffPayload.
+ */
+export function generateSignOffPayload(
+  analysis: VideoAnalysisDoc | Record<string, any>,
+  options: Record<string, any> = {}
+): InventorySignOffPayload | ArchiveSignOffPayload {
+  const src = analysis as Record<string, any>;
+  const workflowType =
+    src.workflowClassification?.workflowType ||
+    src.workloadClassification?.workflowType;
+
+  if (workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW') {
+    return generateArchiveSignOffPayload(src, options);
+  }
+  return generateInventorySignOffPayload(src, options);
+}

@@ -4,7 +4,12 @@ import dotenv from 'dotenv';
 import videoRoutes from './routes/video.routes';
 import pipelineRoutes from './routes/pipeline.routes';
 import { uploadMiddleware, uploadVideoHandler } from './controllers/video.controller';
-import { analyzePipelineHandler } from './controllers/pipeline.controller';
+import {
+  analyzePipelineHandler,
+  inventorySignOffHandler,
+  archiveSignOffHandler,
+  getVideoAnalysisHandler,
+} from './controllers/pipeline.controller';
 
 // Load environment variables
 dotenv.config();
@@ -43,6 +48,13 @@ app.post('/api/videos/upload', uploadMiddleware, uploadVideoHandler);
 app.use('/api/pipeline', pipelineRoutes);
 app.post('/api/pipeline/analyze', analyzePipelineHandler);
 
+// Atomic Sign-Off endpoints
+app.post('/api/signoff/inventory', inventorySignOffHandler);
+app.post('/api/signoff/archive', archiveSignOffHandler);
+
+// Multi-tenant document lookup endpoint
+app.get('/databases/:databaseId/documents/video_analyses/:videoId', getVideoAnalysisHandler);
+
 const PORT = Number(process.env.PORT) || 8080;
 
 if (process.env.NODE_ENV !== 'test') {
@@ -53,4 +65,3 @@ if (process.env.NODE_ENV !== 'test') {
 
 export { app };
 export default app;
-

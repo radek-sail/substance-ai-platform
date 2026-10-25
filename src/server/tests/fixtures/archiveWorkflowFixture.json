@@ -1,0 +1,289 @@
+{
+  "videoId": "vid_archive_fixture_02",
+  "customerId": "customer-alpha",
+  "databaseId": "customer-alpha-db",
+  "archiveId": "archive_exp_96well_01",
+  "workflowClassification": {
+    "workflowType": "EXPERIMENT_NOTEBOOK_WORKFLOW",
+    "archiveName": "Experiment-96Well-FullPlate-Seeding",
+    "transcribedAudio": "Reconstituting DMEM basal media with 10% FBS (Fetal Bovine Serum) and 1% Penicillin-Streptomycin. Using 8-channel pipette to seed 100 µL / 3000 cells/well of HEK293T suspension across all 12 columns of the 96-well microplate."
+  },
+  "workloadClassification": {
+    "workflowType": "EXPERIMENT_NOTEBOOK_WORKFLOW",
+    "archiveName": "Experiment-96Well-FullPlate-Seeding",
+    "transcribedAudio": "Reconstituting DMEM basal media with 10% FBS (Fetal Bovine Serum) and 1% Penicillin-Streptomycin. Using 8-channel pipette to seed 100 µL / 3000 cells/well of HEK293T suspension across all 12 columns of the 96-well microplate."
+  },
+  "actions": [
+    {
+      "actionId": "act_arch_001",
+      "actionClass": "REAGENT_MIXING_ACTION",
+      "archiveId": "archive_exp_96well_01",
+      "cellLineName": "HEK293T",
+      "cellLineInfo": {
+        "reagentAcronym": "FBS",
+        "reagentFullName": "Fetal Bovine Serum",
+        "basalMedium": "DMEM",
+        "supplementVolumeMl": 50,
+        "basalVolumeMl": 450,
+        "finalConcentration": "10% v/v"
+      },
+      "eventList": [
+        "evt_arch_mix_01",
+        "evt_arch_mix_02"
+      ]
+    },
+    {
+      "actionId": "act_arch_002",
+      "actionClass": "REAGENT_SEEDING_ACTION",
+      "archiveId": "archive_exp_96well_01",
+      "cellLineName": "HEK293T",
+      "cellLineInfo": {
+        "volumePerWell": "100 µL",
+        "cellDensity": "3000 cells/well",
+        "seededColumns": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        "totalWellsSeeded": 96
+      },
+      "boxRowId": "A",
+      "boxColId": 12,
+      "eventList": [
+        "evt_arch_seed_col_01",
+        "evt_arch_seed_col_02",
+        "evt_arch_seed_col_03",
+        "evt_arch_seed_col_04",
+        "evt_arch_seed_col_05",
+        "evt_arch_seed_col_06",
+        "evt_arch_seed_col_07",
+        "evt_arch_seed_col_08",
+        "evt_arch_seed_col_09",
+        "evt_arch_seed_col_10",
+        "evt_arch_seed_col_11",
+        "evt_arch_seed_col_12"
+      ]
+    }
+  ],
+  "events": [
+    {
+      "eventId": "evt_arch_mix_01",
+      "actionId": "act_arch_001",
+      "eventClass": "REAGENT_LABEL_PRESENTATION_EVENT",
+      "eventTrack": "video",
+      "startTime": 1.0,
+      "endTime": 5.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_mix_01_3.0.jpg"
+      ],
+      "bestShotTimes": [3.0],
+      "refinementList": ["ref_arch_001", "ref_arch_002"]
+    },
+    {
+      "eventId": "evt_arch_mix_02",
+      "actionId": "act_arch_001",
+      "eventClass": "PROTOCOL_AUDIO_UTTERANCE_EVENT",
+      "eventTrack": "audio",
+      "startTime": 5.5,
+      "endTime": 10.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_mix_02_7.5.jpg"
+      ],
+      "bestShotTimes": [7.5],
+      "refinementList": ["ref_arch_002"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_01",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 11.0,
+      "endTime": 13.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_01_12.0.jpg"
+      ],
+      "bestShotTimes": [12.0],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_02",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 13.5,
+      "endTime": 15.5,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_02_14.5.jpg"
+      ],
+      "bestShotTimes": [14.5],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_03",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 16.0,
+      "endTime": 18.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_03_17.0.jpg"
+      ],
+      "bestShotTimes": [17.0],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_04",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 18.5,
+      "endTime": 20.5,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_04_19.5.jpg"
+      ],
+      "bestShotTimes": [19.5],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_05",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 21.0,
+      "endTime": 23.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_05_22.0.jpg"
+      ],
+      "bestShotTimes": [22.0],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_06",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 23.5,
+      "endTime": 25.5,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_06_24.5.jpg"
+      ],
+      "bestShotTimes": [24.5],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_07",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 26.0,
+      "endTime": 28.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_07_27.0.jpg"
+      ],
+      "bestShotTimes": [27.0],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_08",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 28.5,
+      "endTime": 30.5,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_08_29.5.jpg"
+      ],
+      "bestShotTimes": [29.5],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_09",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 31.0,
+      "endTime": 33.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_09_32.0.jpg"
+      ],
+      "bestShotTimes": [32.0],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_10",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 33.5,
+      "endTime": 35.5,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_10_34.5.jpg"
+      ],
+      "bestShotTimes": [34.5],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_11",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 36.0,
+      "endTime": 38.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_11_37.0.jpg"
+      ],
+      "bestShotTimes": [37.0],
+      "refinementList": ["ref_arch_003"]
+    },
+    {
+      "eventId": "evt_arch_seed_col_12",
+      "actionId": "act_arch_002",
+      "eventClass": "POST_TRANSFER_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 38.5,
+      "endTime": 40.5,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_archive_fixture_02/frame_evt_arch_seed_col_12_39.5.jpg"
+      ],
+      "bestShotTimes": [39.5],
+      "refinementList": ["ref_arch_003"]
+    }
+  ],
+  "refinements": [
+    {
+      "refinementId": "ref_arch_001",
+      "eventId": "evt_arch_mix_01",
+      "refinementClass": "REAGENT_OCR_CONFLATION",
+      "transcriptionText": "Gibco FBS (Fetal Bovine Serum) 50 mL + DMEM (Dulbecco's Modified Eagle Medium) 450 mL + Penicillin-Streptomycin 5 mL",
+      "conflationMetadata": {
+        "confidence": 0.991,
+        "framesEvaluated": 6,
+        "ocrEngine": "Gemini-Pro-MultiFrame-OCR"
+      }
+    },
+    {
+      "refinementId": "ref_arch_002",
+      "eventId": "evt_arch_mix_02",
+      "refinementClass": "ACRONYM_MAPPING",
+      "transcriptionText": "FBS: Fetal Bovine Serum (10% v/v, 50 mL); DMEM: Dulbecco's Modified Eagle Medium (450 mL); P/S: Penicillin-Streptomycin (1% v/v, 5 mL)",
+      "conflationMetadata": {
+        "confidence": 0.995,
+        "framesEvaluated": 4,
+        "ocrEngine": "ReagentAcronymMapper"
+      }
+    },
+    {
+      "refinementId": "ref_arch_003",
+      "eventId": "evt_arch_seed_col_01",
+      "refinementClass": "SEEDING_TRANSCRIPTION_CONFIRMATION",
+      "transcriptionText": "100 µL / 3000 cells/well HEK293T seeded across all 12 columns (Wells A1-H12)",
+      "spatialResult": {
+        "row": "A",
+        "col": 12
+      },
+      "conflationMetadata": {
+        "confidence": 0.994,
+        "framesEvaluated": 12,
+        "ocrEngine": "AudioVisualSeedingVerifier"
+      }
+    }
+  ],
+  "isSignedOff": false,
+  "updatedAt": "2026-10-25T15:05:00.000Z"
+}

@@ -1,0 +1,130 @@
+{
+  "videoId": "vid_inventory_fixture_01",
+  "customerId": "customer-alpha",
+  "databaseId": "customer-alpha-db",
+  "inventoryId": "inv_alpha_01",
+  "boxId": "box_01",
+  "workflowClassification": {
+    "workflowType": "INVENTORY_UPDATE_WORKFLOW",
+    "inventoryName": "CryoTank-Alpha",
+    "transcribedAudio": "Operator RS accessing CryoTank-Alpha, Tower 1, Box 1. Presenting HEK293T Passage 4 Lot LOT-2026-A4 cryovial label to camera and inserting vial into coordinate slot A4."
+  },
+  "workloadClassification": {
+    "workflowType": "INVENTORY_UPDATE_WORKFLOW",
+    "inventoryName": "CryoTank-Alpha",
+    "transcribedAudio": "Operator RS accessing CryoTank-Alpha, Tower 1, Box 1. Presenting HEK293T Passage 4 Lot LOT-2026-A4 cryovial label to camera and inserting vial into coordinate slot A4."
+  },
+  "actions": [
+    {
+      "actionId": "act_inv_001",
+      "actionClass": "VIAL_INSERTION_ACTION",
+      "inventoryId": "inv_alpha_01",
+      "cellLineName": "HEK293T",
+      "cellLineInfo": {
+        "lotNumber": "LOT-2026-A4",
+        "passage": 4,
+        "operatorInitials": "RS",
+        "boxId": "box_01",
+        "targetCoordinate": "A4"
+      },
+      "towerId": "tower_01",
+      "boxRowId": "A",
+      "boxColId": 4,
+      "eventList": [
+        "evt_inv_001",
+        "evt_inv_002",
+        "evt_inv_003"
+      ]
+    }
+  ],
+  "events": [
+    {
+      "eventId": "evt_inv_001",
+      "actionId": "act_inv_001",
+      "eventClass": "VIAL_LABEL_PRESENTATION_EVENT",
+      "eventTrack": "video",
+      "startTime": 2.0,
+      "endTime": 6.5,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_inventory_fixture_01/frame_evt_inv_001_4.2.jpg"
+      ],
+      "bestShotTimes": [4.2],
+      "refinementList": ["ref_inv_001"]
+    },
+    {
+      "eventId": "evt_inv_002",
+      "actionId": "act_inv_001",
+      "eventClass": "PRE_ACTION_BOX_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 7.0,
+      "endTime": 11.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_inventory_fixture_01/frame_evt_inv_002_9.0.jpg"
+      ],
+      "bestShotTimes": [9.0],
+      "refinementList": ["ref_inv_002"]
+    },
+    {
+      "eventId": "evt_inv_003",
+      "actionId": "act_inv_001",
+      "eventClass": "POST_ACTION_BOX_STATE_EVENT",
+      "eventTrack": "video",
+      "startTime": 15.0,
+      "endTime": 20.0,
+      "bestShotUrls": [
+        "gs://customer-alpha-video-manager-storage/frames/vid_inventory_fixture_01/frame_evt_inv_003_17.5.jpg"
+      ],
+      "bestShotTimes": [17.5],
+      "refinementList": ["ref_inv_003"]
+    }
+  ],
+  "refinements": [
+    {
+      "refinementId": "ref_inv_001",
+      "eventId": "evt_inv_001",
+      "refinementClass": "OCR_CONFLATION",
+      "transcriptionText": "HEK293T | Passage 4 | Lot: LOT-2026-A4 | Pos: A4 | Initials: RS",
+      "spatialResult": {
+        "row": "A",
+        "col": 4
+      },
+      "conflationMetadata": {
+        "confidence": 0.992,
+        "framesEvaluated": 5,
+        "ocrEngine": "Gemini-Pro-MultiFrame-OCR"
+      }
+    },
+    {
+      "refinementId": "ref_inv_002",
+      "eventId": "evt_inv_002",
+      "refinementClass": "PRE_ACTION_SPATIAL_DIFF",
+      "transcriptionText": "Pre-action cryo-box scan: Slot A4 verified empty prior to insertion",
+      "spatialResult": {
+        "row": "A",
+        "col": 4
+      },
+      "conflationMetadata": {
+        "confidence": 0.985,
+        "framesEvaluated": 3,
+        "ocrEngine": "SpatialDifferencingEngine"
+      }
+    },
+    {
+      "refinementId": "ref_inv_003",
+      "eventId": "evt_inv_003",
+      "refinementClass": "POST_ACTION_SPATIAL_DIFF",
+      "transcriptionText": "Post-action cryo-box scan: Slot A4 verified occupied following vial insertion",
+      "spatialResult": {
+        "row": "A",
+        "col": 4
+      },
+      "conflationMetadata": {
+        "confidence": 0.996,
+        "framesEvaluated": 4,
+        "ocrEngine": "SpatialDifferencingEngine"
+      }
+    }
+  ],
+  "isSignedOff": false,
+  "updatedAt": "2026-10-25T15:00:00.000Z"
+}
