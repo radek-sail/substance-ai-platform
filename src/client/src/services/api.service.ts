@@ -9,6 +9,7 @@ import {
   ArchiveSignOffPayloadSchema,
   type VideoMetadata,
 } from '@sail/shared';
+import { auth } from '../firebase';
 
 export interface TenantConfig {
   customerId: string;
@@ -329,12 +330,14 @@ export class ApiService {
   }
 
   /**
-   * Builds headers with strict multi-tenant enforcement.
+   * Builds headers with strict multi-tenant enforcement and Firebase Auth ID token injection.
    */
-  private getHeaders(extraHeaders: Record<string, string> = {}): HeadersInit {
+  public async getHeaders(extraHeaders: Record<string, string> = {}): Promise<Record<string, string>> {
+    const token = await auth.currentUser?.getIdToken();
     return {
       'x-customer-id': this.tenant.customerId,
       'x-database-id': this.tenant.databaseId,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...extraHeaders,
     };
   }
@@ -351,12 +354,13 @@ export class ApiService {
     const url = `${this.baseUrl}/databases/${databaseId}/documents/video_analyses/${videoId}`;
 
     try {
+      const headers = await this.getHeaders({
+        'x-customer-id': customerId,
+        'x-database-id': databaseId,
+      });
       const response = await fetch(url, {
         method: 'GET',
-        headers: this.getHeaders({
-          'x-customer-id': customerId,
-          'x-database-id': databaseId,
-        }),
+        headers,
       });
 
       if (response.ok) {
@@ -393,13 +397,12 @@ export class ApiService {
     const fileName = options?.fileName || (file as File).name || `video_${Date.now()}.mp4`;
     formData.append('file', file, fileName);
 
-    const headers: Record<string, string> = {
-      'x-customer-id': customerId,
-      'x-database-id': databaseId,
-      'x-video-id': videoId,
-    };
-
     try {
+      const headers = await this.getHeaders({
+        'x-customer-id': customerId,
+        'x-database-id': databaseId,
+        'x-video-id': videoId,
+      });
       const response = await fetch(`${this.baseUrl}/api/videos/upload`, {
         method: 'POST',
         headers,
@@ -449,13 +452,14 @@ export class ApiService {
     const databaseId = options?.databaseId || this.tenant.databaseId;
 
     try {
+      const headers = await this.getHeaders({
+        'Content-Type': 'application/json',
+        'x-customer-id': customerId,
+        'x-database-id': databaseId,
+      });
       const response = await fetch(`${this.baseUrl}/api/pipeline/analyze`, {
         method: 'POST',
-        headers: this.getHeaders({
-          'Content-Type': 'application/json',
-          'x-customer-id': customerId,
-          'x-database-id': databaseId,
-        }),
+        headers,
         body: JSON.stringify({
           videoId,
           videoGcsUri,
@@ -508,12 +512,13 @@ export class ApiService {
     InventorySignOffPayloadSchema.parse(payload);
 
     try {
+      const headers = await this.getHeaders({
+        'Content-Type': 'application/json',
+        'x-database-id': databaseId,
+      });
       const response = await fetch(`${this.baseUrl}/api/signoff/inventory`, {
         method: 'POST',
-        headers: this.getHeaders({
-          'Content-Type': 'application/json',
-          'x-database-id': databaseId,
-        }),
+        headers,
         body: JSON.stringify(payload),
       });
 
@@ -564,12 +569,13 @@ export class ApiService {
     ArchiveSignOffPayloadSchema.parse(payload);
 
     try {
+      const headers = await this.getHeaders({
+        'Content-Type': 'application/json',
+        'x-database-id': databaseId,
+      });
       const response = await fetch(`${this.baseUrl}/api/signoff/archive`, {
         method: 'POST',
-        headers: this.getHeaders({
-          'Content-Type': 'application/json',
-          'x-database-id': databaseId,
-        }),
+        headers,
         body: JSON.stringify(payload),
       });
 

@@ -5,7 +5,13 @@ packages:
 
 allowBuilds:
   protobufjs: true
+  '@firebase/util': true
+  esbuild: true
+  '@google/genai': true
 
 onlyBuiltDependencies:
   - protobufjs
+  - '@firebase/util'
+  - esbuild
+  - '@google/genai'
   - 'src/server'

@@ -1,4 +1,4 @@
-FROM node:20-bullseye-slim
+FROM node:20-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -7,12 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY package*.json pnpm-workspace.yaml tsconfig*.json ./
+COPY package*.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig*.json ./
 COPY src/shared/package*.json ./src/shared/
 COPY src/server/package*.json ./src/server/
 COPY src/client/package*.json ./src/client/
 
-RUN npm install -g pnpm && pnpm install --frozen-lockfile
+RUN npm install -g pnpm@9 && pnpm install --frozen-lockfile
 
 COPY config ./config
 COPY src ./src

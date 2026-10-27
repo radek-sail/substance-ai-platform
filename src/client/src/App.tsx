@@ -22,9 +22,22 @@ import {
   SAMPLE_ARCHIVE_ANALYSIS,
 } from './services/api.service';
 import type { VideoAnalysisDoc } from '@sail/shared';
-import { CheckCircle2, AlertCircle, Info, Lock, Loader2 } from 'lucide-react';
+import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
+import { CheckCircle2, AlertCircle, Info, Lock, Loader2, LogOut } from 'lucide-react';
+import { auth } from './firebase';
+import { Login } from './components/Login';
 
 export const App: React.FC = () => {
+  // Authentication state gated via Firebase Auth
+  const [user, setUser] = useState<User | null>(auth.currentUser);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribe();
+  }, []);
+
   // Navigation tab state
   const [activeTab, setActiveTab] = useState<WorkflowTab>('inventory');
 
@@ -180,6 +193,19 @@ export const App: React.FC = () => {
   const safeEvents = analysis?.events ?? [];
   const safeRefinements = analysis?.refinements ?? [];
 
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth);
+      setUser(null);
+    } catch (err) {
+      showToast('error', 'Failed to sign out');
+    }
+  };
+
+  if (!user) {
+    return <Login />;
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-white">
       {/* Navigation Ribbon Shell */}
@@ -195,6 +221,23 @@ export const App: React.FC = () => {
         isSignedOff={isSignedOff}
         onOpenSignOffModal={() => setIsSignOffModalOpen(true)}
         videoTitle={`${activeVideoId}.mp4`}
+        userEmail={user.email}
+        onSignOut={handleSignOut}
+        authControls={
+          <div className="flex items-center gap-2 pl-2 border-l border-slate-800">
+            <span className="text-xs font-mono text-slate-300 bg-slate-800/60 border border-slate-700/60 px-2.5 py-1.5 rounded-lg">
+              {user.email}
+            </span>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="flex items-center gap-1.5 bg-slate-800 hover:bg-rose-950/80 text-slate-300 hover:text-rose-200 border border-slate-700 hover:border-rose-500/50 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Sign Out</span>
+            </button>
+          </div>
+        }
       />
 
       {/* Real-time Toast Notifications */}

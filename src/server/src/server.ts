@@ -1,3 +1,4 @@
+import path from 'path';
 import express, { Express, Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -54,6 +55,22 @@ app.post('/api/signoff/archive', archiveSignOffHandler);
 
 // Multi-tenant document lookup endpoint
 app.get('/databases/:databaseId/documents/video_analyses/:videoId', getVideoAnalysisHandler);
+
+// Multi-tenant document lookup endpoint
+app.get('/databases/:databaseId/documents/video_analyses/:videoId', getVideoAnalysisHandler);
+
+// ----------------------------------------------------
+// Serve Vite frontend static assets
+// ----------------------------------------------------
+// From /app/src/server/dist -> ../../client/dist -> /app/src/client/dist
+const clientDistPath = path.resolve(__dirname, '../../client/dist');
+
+app.use(express.static(clientDistPath));
+
+// For all non-API GET requests, return index.html for React SPA client-side routing
+app.get('*', (req: Request, res: Response) => {
+  res.sendFile(path.join(clientDistPath, 'index.html'));
+});
 
 const PORT = Number(process.env.PORT) || 8080;
 

@@ -11,6 +11,7 @@ import {
   FileCheck2,
   Sliders,
   Sparkles,
+  LogOut,
 } from 'lucide-react';
 import { TenantConfig } from '../../services/api.service';
 
@@ -24,6 +25,9 @@ interface RibbonNavProps {
   isSignedOff?: boolean;
   onOpenSignOffModal?: () => void;
   videoTitle?: string;
+  userEmail?: string | null;
+  onSignOut?: () => void;
+  authControls?: React.ReactNode;
 }
 
 export const RibbonNav: React.FC<RibbonNavProps> = ({
@@ -34,6 +38,9 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
   isSignedOff = false,
   onOpenSignOffModal,
   videoTitle = 'vid_cryo_demo_01.mp4',
+  userEmail,
+  onSignOut,
+  authControls,
 }) => {
   const [showTenantModal, setShowTenantModal] = useState(false);
   const [tempCustomer, setTempCustomer] = useState(tenant.customerId);
@@ -159,6 +166,29 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
                   <span>Review & Sign Off</span>
                 </button>
               )}
+
+              {/* Authenticated Operator Controls */}
+              {authControls ? (
+                authControls
+              ) : (userEmail || onSignOut) ? (
+                <div className="flex items-center gap-2 pl-2 border-l border-slate-800">
+                  {userEmail && (
+                    <span className="text-xs font-mono text-slate-300 bg-slate-800/60 border border-slate-700/60 px-2.5 py-1.5 rounded-lg">
+                      {userEmail}
+                    </span>
+                  )}
+                  {onSignOut && (
+                    <button
+                      type="button"
+                      onClick={onSignOut}
+                      className="flex items-center gap-1.5 bg-slate-800 hover:bg-rose-950/80 text-slate-300 hover:text-rose-200 border border-slate-700 hover:border-rose-500/50 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                      <span>Sign Out</span>
+                    </button>
+                  )}
+                </div>
+              ) : null}
             </div>
           </div>
         </div>
