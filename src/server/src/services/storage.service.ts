@@ -5,24 +5,24 @@ export const storage = new Storage({
 });
 
 /**
- * Resolves the tenant bucket name according to SAIL platform architecture:
- * gs://{customerID}-video-manager-storage/
+ * Resolves the active GCS bucket name using process.env.GCS_BUCKET_NAME
+ * (defaulting to 'sail-platform-videos').
  */
-export function getTenantBucketName(customerId: string): string {
-  const suffix = process.env.GCS_BUCKET_SUFFIX || 'video-manager-storage';
-  return `${customerId}-${suffix}`;
+export function getTenantBucketName(_customerId?: string): string {
+  const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+  return bucketName;
 }
 
 /**
- * Returns a Storage Bucket instance for the specified tenant.
+ * Returns a Storage Bucket instance for the active GCS bucket.
  */
-export function getTenantBucket(customerId: string): Bucket {
+export function getTenantBucket(customerId?: string): Bucket {
   const bucketName = getTenantBucketName(customerId);
   return storage.bucket(bucketName);
 }
 
 /**
- * Generates the full gs:// URI for an asset inside a tenant bucket.
+ * Generates the full gs:// URI for an asset inside the active GCS bucket.
  */
 export function getTenantGcsUri(customerId: string, destinationGcsPath: string): string {
   const bucketName = getTenantBucketName(customerId);
@@ -31,13 +31,13 @@ export function getTenantGcsUri(customerId: string, destinationGcsPath: string):
 }
 
 /**
- * Uploads a local file to the tenant's GCS bucket and returns the full gs:// URI.
+ * Uploads a local file to the active GCS bucket and returns the full gs:// URI.
  *
  * @param customerId - Customer/Tenant identifier
  * @param localFilePath - Path to the local file to upload
- * @param destinationGcsPath - Destination relative path in the tenant bucket
+ * @param destinationGcsPath - Destination relative path in the bucket
  * @param contentType - MIME type of the uploaded file (defaults to video/mp4)
- * @returns Full gs:// URI, e.g. gs://{customerID}-video-manager-storage/{destinationGcsPath}
+ * @returns Full gs:// URI, e.g. gs://sail-platform-videos/{destinationGcsPath}
  */
 export async function uploadToTenantStorage(
   customerId: string,
@@ -57,4 +57,40 @@ export async function uploadToTenantStorage(
 
   return getTenantGcsUri(customerId, cleanDestination);
 }
+
+/**
+ * Parses a gs://{bucket}/{objectPath} URI into the active bucket name and object path.
+ */
+export function parseGcsUri(gcsUri: string): { bucketName: string; objectPath: string } {
+  const match = gcsUri.trim().match(/^gs:\/\/([^/]+)\/(.+)$/);
+  if (!match) {
+    throw new Error(`Invalid GCS URI format: ${gcsUri}`);
+  }
+  const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+  return {
+    bucketName,
+    objectPath: match[2],
+  };
+}
+
+/**
+ * Downloads a file from a gs:// URI to a local destination path using the active bucket name.
+ *
+ * @param gcsUri - Full gs:// URI (e.g. gs://sail-platform-videos/normalized/norm_{videoId}.mp4)
+ * @param destinationLocalPath - Local filesystem path to write the downloaded file
+ * @returns Resolved local file path
+ */
+export async function downloadFromGcsUri(
+  gcsUri: string,
+  destinationLocalPath: string
+): Promise<string> {
+  const { objectPath } = parseGcsUri(gcsUri);
+  const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+  const bucket = storage.bucket(bucketName);
+  await bucket.file(objectPath).download({
+    destination: destinationLocalPath,
+  });
+  return destinationLocalPath;
+}
+
 

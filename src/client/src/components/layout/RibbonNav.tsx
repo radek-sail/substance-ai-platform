@@ -13,7 +13,7 @@ import {
   Sparkles,
   LogOut,
 } from 'lucide-react';
-import { TenantConfig } from '../../services/api.service';
+import { TenantConfig, DEFAULT_GCS_BUCKET } from '../../services/api.service';
 
 export type WorkflowTab = 'inventory' | 'archive' | 'videos';
 
@@ -240,7 +240,7 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
                   required
                 />
                 <p className="text-[10px] text-slate-500 mt-1">
-                  Scopes Cloud Storage bucket: <code>gs://&#123;customerId&#125;-video-manager-storage/</code>
+                  Scopes Cloud Storage bucket: <code>gs://{tenant.bucketName || DEFAULT_GCS_BUCKET}/</code>
                 </p>
               </div>
 

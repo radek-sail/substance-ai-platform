@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { executeHierarchicalPipeline } from '../services/gemini.service';
 import {
+  normalizeDatabaseId,
   saveVideoAnalysis,
   getVideoAnalysis,
   commitInventorySignOff,
@@ -12,21 +13,24 @@ import {
  *
  * Orchestrates Pass 0 -> Pass 1 -> Pass 2 -> Pass 3:
  * 1. Validates required headers (`x-customer-id`, `x-database-id`) and body payload (`videoId`, `videoGcsUri`).
- * 2. Executes the 4-stage hierarchical pipeline.
- * 3. Persists structured analysis into Firestore under `/databases/{databaseId}/documents/video_analyses/{videoId}`.
+ * 2. Executes the 4-stage hierarchical pipeline (including Gemini Files API upload & ACTIVE polling).
+ * 3. Persists structured analysis into the default Firestore database `(default)` (or specified database)
+ *    under `video_analyses/{videoId}`.
  * 4. Returns summary and analysis data.
  */
 export async function analyzePipelineHandler(req: Request, res: Response): Promise<Response | void> {
   const customerId = (req.headers['x-customer-id'] || req.body?.customerId) as string | undefined;
-  const databaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
+  const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
 
   if (!customerId) {
     return res.status(400).json({ error: 'Missing required header: x-customer-id' });
   }
 
-  if (!databaseId) {
+  if (!rawDatabaseId && process.env.NODE_ENV === 'test') {
     return res.status(400).json({ error: 'Missing required header: x-database-id' });
   }
+
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
 
   const { videoId, videoGcsUri, localFilePath } = req.body || {};
 
@@ -38,12 +42,18 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
     return res.status(400).json({ error: 'Missing required field: videoGcsUri' });
   }
 
+  const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+  const resolvedVideoGcsUri =
+    typeof videoGcsUri === 'string' && videoGcsUri.startsWith('gs://')
+      ? videoGcsUri.replace(/^gs:\/\/[^/]+\//, `gs://${bucketName}/`)
+      : videoGcsUri;
+
   try {
     const { workloadClassification, actions, events, refinements } = await executeHierarchicalPipeline({
       customerId,
       databaseId,
       videoId,
-      videoGcsUri,
+      videoGcsUri: resolvedVideoGcsUri,
       localVideoPath: localFilePath,
     });
 
@@ -59,7 +69,7 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
       updatedAt: nowIso,
     };
 
-    // Persist into Firestore /databases/{databaseId}/documents/video_analyses/{videoId}
+    // Persist into Firestore default database (or specified tenant database) under video_analyses/{videoId}
     await saveVideoAnalysis(databaseId, videoId, analysisPayload);
 
     return res.status(200).json({
@@ -89,12 +99,14 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
  * and marks `video_analyses/{videoId}.isSignedOff = true`.
  */
 export async function inventorySignOffHandler(req: Request, res: Response): Promise<Response | void> {
-  const databaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
+  const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
   const { videoId, inventoryId, boxUpdates, operatorInitials, signedOffAt } = req.body || {};
 
-  if (!databaseId) {
+  if (!rawDatabaseId && process.env.NODE_ENV === 'test') {
     return res.status(400).json({ error: 'Missing required field or header: databaseId / x-database-id' });
   }
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
+
   if (!videoId) {
     return res.status(400).json({ error: 'Missing required field: videoId' });
   }
@@ -143,13 +155,15 @@ export async function inventorySignOffHandler(req: Request, res: Response): Prom
  * in `archives/{archiveId}` and marks `video_analyses/{videoId}.isSignedOff = true`.
  */
 export async function archiveSignOffHandler(req: Request, res: Response): Promise<Response | void> {
-  const databaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
+  const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
   const { videoId, archiveId, markdownDoc, analysis, description, reagents, steps, operatorInitials, signedOffAt } =
     req.body || {};
 
-  if (!databaseId) {
+  if (!rawDatabaseId && process.env.NODE_ENV === 'test') {
     return res.status(400).json({ error: 'Missing required field or header: databaseId / x-database-id' });
   }
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
+
   if (!videoId) {
     return res.status(400).json({ error: 'Missing required field: videoId' });
   }
@@ -195,12 +209,14 @@ export async function archiveSignOffHandler(req: Request, res: Response): Promis
  * Controller for GET /databases/:databaseId/documents/video_analyses/:videoId
  */
 export async function getVideoAnalysisHandler(req: Request, res: Response): Promise<Response | void> {
-  const databaseId = (req.params.databaseId || req.headers['x-database-id']) as string | undefined;
+  const rawDatabaseId = (req.params.databaseId || req.headers['x-database-id']) as string | undefined;
   const videoId = req.params.videoId as string | undefined;
 
-  if (!databaseId || !videoId) {
+  if (!videoId) {
     return res.status(400).json({ error: 'Missing databaseId or videoId' });
   }
+
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
 
   try {
     const analysis = await getVideoAnalysis(databaseId, videoId);

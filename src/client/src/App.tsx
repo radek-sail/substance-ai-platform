@@ -20,12 +20,31 @@ import {
   SignOffResponse,
   SAMPLE_INVENTORY_ANALYSIS,
   SAMPLE_ARCHIVE_ANALYSIS,
+  compileArchiveMarkdownFromAnalysis,
 } from './services/api.service';
 import type { VideoAnalysisDoc } from '@sail/shared';
 import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import { CheckCircle2, AlertCircle, Info, Lock, Loader2, LogOut } from 'lucide-react';
 import { auth } from './firebase';
 import { Login } from './components/Login';
+
+function deriveInventoryDataFromAnalysis(doc: VideoAnalysisDoc | null): HumanEditedVialData {
+  const firstAction = doc?.actions?.[0];
+  const spatialRef = doc?.refinements?.find(
+    (r) => r.spatialResult?.row && r.spatialResult?.col !== undefined
+  );
+  const row = (firstAction?.boxRowId || spatialRef?.spatialResult?.row || 'C').toUpperCase();
+  const col = Number(firstAction?.boxColId ?? spatialRef?.spatialResult?.col ?? 4);
+  const cellLineInfo = (firstAction?.cellLineInfo || {}) as Record<string, any>;
+
+  return {
+    cellLineName: firstAction?.cellLineName || 'HEK293T',
+    lotNumber: String(cellLineInfo.lotNumber || cellLineInfo.lot || 'LOT-8841'),
+    passage: typeof cellLineInfo.passage === 'number' ? cellLineInfo.passage : 5,
+    operatorInitials: String(cellLineInfo.operatorInitials || cellLineInfo.operator || 'RS'),
+    targetCoordinate: String(cellLineInfo.targetCoordinate || `${row}${col}`),
+  };
+}
 
 export const App: React.FC = () => {
   // Authentication state gated via Firebase Auth
@@ -59,21 +78,17 @@ export const App: React.FC = () => {
   // --- State persistence across tab toggles ---
 
   // Inventory workspace persistent state
-  const rawAiInventoryData: HumanEditedVialData = {
-    cellLineName: 'HEK293T',
-    lotNumber: 'LOT-8841',
-    passage: 5,
-    operatorInitials: 'RS',
-    targetCoordinate: 'C4',
-  };
-  const [editedInventoryData, setEditedInventoryData] = useState<HumanEditedVialData>({
-    ...rawAiInventoryData,
-  });
+  const [rawAiInventoryData, setRawAiInventoryData] = useState<HumanEditedVialData>(() =>
+    deriveInventoryDataFromAnalysis(SAMPLE_INVENTORY_ANALYSIS)
+  );
+  const [editedInventoryData, setEditedInventoryData] = useState<HumanEditedVialData>(() =>
+    deriveInventoryDataFromAnalysis(SAMPLE_INVENTORY_ANALYSIS)
+  );
 
   // Archive workspace persistent state
   const [seededColumns, setSeededColumns] = useState<number[]>([1, 2, 3, 4, 5, 6]);
   const [markdownDoc, setMarkdownDoc] = useState<string>(DEFAULT_EXPERIMENT_MARKDOWN);
-  const [reagentMappings, setReagentMappings] = useState<ReagentMapping[]>(DEFAULT_REAGENTS);
+  const [reagentMappings] = useState<ReagentMapping[]>(DEFAULT_REAGENTS);
 
   // Sign-Off & Lock State
   const [isSignedOff, setIsSignedOff] = useState<boolean>(false);
@@ -90,40 +105,91 @@ export const App: React.FC = () => {
     }, 4500);
   };
 
-  // Switch video stream when tab changes if needed
-  const handleSelectTab = (tab: WorkflowTab) => {
-    setActiveTab(tab);
-    if (tab === 'inventory' && activeVideoId !== 'vid_cryo_demo_01') {
-      setActiveVideoId('vid_cryo_demo_01');
-      setAnalysis(SAMPLE_INVENTORY_ANALYSIS);
-      setDuration(35.0);
-      setCurrentTime(6.5);
-      setSelectedActionId('act_cryo_001');
-      setSelectedEventId('evt_001');
-    } else if (tab === 'archive' && activeVideoId !== 'vid_archive_demo_02') {
-      setActiveVideoId('vid_archive_demo_02');
-      setAnalysis(SAMPLE_ARCHIVE_ANALYSIS);
-      setDuration(45.0);
-      setCurrentTime(6.5);
-      setSelectedActionId('act_arch_001');
-      setSelectedEventId('evt_arch_001');
+  // Apply a loaded or newly analyzed VideoAnalysisDoc to active application state
+  const applyAnalysisDocument = (
+    videoId: string,
+    doc: VideoAnalysisDoc,
+    targetTab?: WorkflowTab
+  ) => {
+    setActiveVideoId(videoId);
+    setAnalysis(doc);
+    setIsSignedOff(Boolean(doc.isSignedOff));
+
+    const maxEnd = doc.events?.reduce((max, e) => Math.max(max, e.endTime || 0), 0) || 0;
+    const fallbackDuration = targetTab === 'archive' ? 45.0 : 35.0;
+    setDuration(maxEnd > 0 ? Math.max(maxEnd + 5, fallbackDuration) : fallbackDuration);
+    setCurrentTime(doc.events?.[0]?.startTime ?? 0);
+    setSelectedActionId(doc.actions?.[0]?.actionId ?? null);
+    setSelectedEventId(doc.events?.[0]?.eventId ?? null);
+
+    const derivedInv = deriveInventoryDataFromAnalysis(doc);
+    setRawAiInventoryData(derivedInv);
+    setEditedInventoryData(derivedInv);
+
+    if (videoId === 'vid_archive_demo_02') {
+      setMarkdownDoc(DEFAULT_EXPERIMENT_MARKDOWN);
+    } else if (
+      targetTab === 'archive' ||
+      doc.workflowClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+      doc.workloadClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+    ) {
+      setMarkdownDoc(compileArchiveMarkdownFromAnalysis(doc));
     }
   };
 
-  // Handle switching video from Video Manager
-  const handleSelectVideoFromManager = (videoId: string, targetTab: 'inventory' | 'archive') => {
+  // Switch video stream when tab changes only if currently viewing a built-in demo stream
+  const handleSelectTab = (tab: WorkflowTab) => {
+    setActiveTab(tab);
+    const isDemoStream =
+      activeVideoId === 'vid_cryo_demo_01' || activeVideoId === 'vid_archive_demo_02';
+    if (!isDemoStream) {
+      return;
+    }
+    if (tab === 'inventory' && activeVideoId !== 'vid_cryo_demo_01') {
+      applyAnalysisDocument('vid_cryo_demo_01', SAMPLE_INVENTORY_ANALYSIS, 'inventory');
+    } else if (tab === 'archive' && activeVideoId !== 'vid_archive_demo_02') {
+      applyAnalysisDocument('vid_archive_demo_02', SAMPLE_ARCHIVE_ANALYSIS, 'archive');
+    }
+  };
+
+  // Handle switching video from Video Manager (or upon analysis completion)
+  const handleSelectVideoFromManager = async (
+    videoId: string,
+    targetTab: 'inventory' | 'archive',
+    analysisDoc?: VideoAnalysisDoc
+  ) => {
     setActiveVideoId(videoId);
     setActiveTab(targetTab);
-    if (targetTab === 'inventory') {
-      setAnalysis(SAMPLE_INVENTORY_ANALYSIS);
-      setDuration(35.0);
-      setCurrentTime(6.5);
-    } else {
-      setAnalysis(SAMPLE_ARCHIVE_ANALYSIS);
-      setDuration(45.0);
-      setCurrentTime(6.5);
+
+    if (analysisDoc) {
+      applyAnalysisDocument(videoId, analysisDoc, targetTab);
+      showToast('info', `Loaded stream ${videoId} into ${targetTab} manager`);
+      return;
     }
-    showToast('info', `Loaded stream ${videoId} into ${targetTab} manager`);
+
+    if (videoId === 'vid_cryo_demo_01') {
+      applyAnalysisDocument(videoId, SAMPLE_INVENTORY_ANALYSIS, 'inventory');
+      showToast('info', `Loaded stream ${videoId} into ${targetTab} manager`);
+      return;
+    }
+
+    if (videoId === 'vid_archive_demo_02') {
+      applyAnalysisDocument(videoId, SAMPLE_ARCHIVE_ANALYSIS, 'archive');
+      showToast('info', `Loaded stream ${videoId} into ${targetTab} manager`);
+      return;
+    }
+
+    setAnalysis(null);
+    try {
+      const fetchedDoc = await apiService.fetchVideoAnalysis(videoId, {
+        customerId: tenant.customerId,
+        databaseId: tenant.databaseId,
+      });
+      applyAnalysisDocument(videoId, fetchedDoc, targetTab);
+      showToast('info', `Loaded stream ${videoId} into ${targetTab} manager`);
+    } catch {
+      showToast('error', `Failed to load analysis for ${videoId}`);
+    }
   };
 
   // Handle seeking from timeline
@@ -189,9 +255,16 @@ export const App: React.FC = () => {
   const targetRow = targetMatch ? targetMatch[1] : 'C';
   const targetCol = targetMatch ? parseInt(targetMatch[2], 10) : 4;
 
+  const rawCoordStr = rawAiInventoryData?.targetCoordinate || 'C4';
+  const rawMatch = rawCoordStr.match(/^([A-Z])(\d+)$/);
+  const rawTargetRow = rawMatch ? rawMatch[1] : 'C';
+  const rawTargetCol = rawMatch ? parseInt(rawMatch[2], 10) : 4;
+
   const safeActions = analysis?.actions ?? [];
   const safeEvents = analysis?.events ?? [];
   const safeRefinements = analysis?.refinements ?? [];
+  const selectedAction =
+    safeActions.find((a) => a.actionId === selectedActionId) ?? safeActions[0];
 
   const handleSignOut = async () => {
     try {
@@ -220,7 +293,7 @@ export const App: React.FC = () => {
         }}
         isSignedOff={isSignedOff}
         onOpenSignOffModal={() => setIsSignOffModalOpen(true)}
-        videoTitle={`${activeVideoId}.mp4`}
+        videoTitle={activeVideoId.endsWith('.mp4') ? activeVideoId : `${activeVideoId}.mp4`}
         userEmail={user.email}
         onSignOut={handleSignOut}
         authControls={
@@ -303,7 +376,9 @@ export const App: React.FC = () => {
             </div>
             <button
               type="button"
-              onClick={() => setAnalysis(SAMPLE_INVENTORY_ANALYSIS)}
+              onClick={() =>
+                applyAnalysisDocument('vid_cryo_demo_01', SAMPLE_INVENTORY_ANALYSIS, 'inventory')
+              }
               className="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition-colors"
             >
               Load Sample Stream Data
@@ -354,8 +429,8 @@ export const App: React.FC = () => {
                     boxId="CryoBox_Tower02_B03"
                     targetRow={targetRow}
                     targetCol={targetCol}
-                    differencedRow="C"
-                    differencedCol={4}
+                    differencedRow={rawTargetRow}
+                    differencedCol={rawTargetCol}
                     onSelectSlot={handleSelectGridSlot}
                     readOnly={isSignedOff}
                   />
@@ -364,7 +439,7 @@ export const App: React.FC = () => {
                 {/* Multi-Pass Extraction Vial Inspector */}
                 <div className="lg:col-span-6">
                   <VialInspector
-                    action={safeActions[0]}
+                    action={selectedAction}
                     events={safeEvents}
                     refinements={safeRefinements}
                     editedData={editedInventoryData}
@@ -414,12 +489,24 @@ export const App: React.FC = () => {
         isOpen={isSignOffModalOpen}
         onClose={() => setIsSignOffModalOpen(false)}
         workflowType={
-          activeTab === 'archive' ? 'EXPERIMENT_NOTEBOOK_WORKFLOW' : 'INVENTORY_UPDATE_WORKFLOW'
+          activeTab === 'archive' ||
+          analysis?.workflowClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+          analysis?.workloadClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+            ? 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+            : 'INVENTORY_UPDATE_WORKFLOW'
         }
         tenant={tenant}
         videoId={activeVideoId}
-        inventoryId="tank_alpha_01"
-        archiveId="archive_exp_402"
+        inventoryId={
+          analysis?.actions?.[0]?.inventoryId ||
+          analysis?.workflowClassification?.inventoryName ||
+          'tank_alpha_01'
+        }
+        archiveId={
+          analysis?.actions?.[0]?.archiveId ||
+          analysis?.workflowClassification?.archiveName ||
+          'archive_exp_402'
+        }
         rawAiInventoryData={rawAiInventoryData}
         editedInventoryData={editedInventoryData}
         markdownDoc={markdownDoc}

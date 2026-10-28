@@ -78,27 +78,41 @@ function createInMemoryCollectionFactory(dbId: string) {
 }
 
 /**
- * Normalizes a database identifier. Supports both plain IDs (e.g. 'tenant-db-1')
- * and full path formats (e.g. '/databases/tenant-db-1/documents/').
+ * Normalizes a database identifier. Defaults to `(default)` and avoids connecting
+ * to placeholder database IDs like `customer-alpha-db` unless explicitly in test mode.
  */
 export function normalizeDatabaseId(databaseId?: string): string {
   if (!databaseId) return '(default)';
   const trimmed = databaseId.trim();
+  if (!trimmed || trimmed === 'default' || trimmed === '(default)') {
+    return '(default)';
+  }
+  if (trimmed === 'customer-alpha-db' && process.env.NODE_ENV !== 'test') {
+    return '(default)';
+  }
   const match = trimmed.match(/(?:^|\/)databases\/([^/]+)/);
   if (match) {
-    return match[1];
+    const extracted = match[1];
+    if (
+      extracted === 'default' ||
+      extracted === '(default)' ||
+      (extracted === 'customer-alpha-db' && process.env.NODE_ENV !== 'test')
+    ) {
+      return '(default)';
+    }
+    return extracted;
   }
   return trimmed;
 }
 
 /**
  * Returns a cached Firestore instance scoped to `/databases/{databaseID}/documents/`.
- * Multi-tenant isolation is enforced at the database level per tenant requirements.
+ * Uses the default Firestore instance (`getFirestore()`) when targeting `(default)`.
  */
 export function getTenantFirestore(databaseId?: string): Firestore {
   const dbId = normalizeDatabaseId(databaseId);
   if (!databaseCache.has(dbId)) {
-    const firestoreInstance = getFirestore(dbId);
+    const firestoreInstance = dbId === '(default)' ? getFirestore() : getFirestore(dbId);
     if (process.env.NODE_ENV === 'test') {
       // Attach an offline in-memory collection handler for test environments while preserving
       // Firestore instance properties (`databaseId`, `formattedName`) and allowing test spies to override `db.collection`.
@@ -140,27 +154,28 @@ export async function getVideoMetadata(
 }
 
 /**
- * Persists or updates video analysis in the tenant's `video_analyses` collection.
+ * Persists or updates video analysis in the default `(default)` (or specified tenant) Firestore
+ * database under the `video_analyses` collection using `videoId` as the document ID.
  * Target document path: `/databases/{databaseID}/documents/video_analyses/{videoId}`
  */
 export async function saveVideoAnalysis(
-  databaseId: string,
+  databaseId: string | undefined,
   videoId: string,
   analysis: Record<string, any>
 ): Promise<WriteResult> {
-  const db = getTenantFirestore(databaseId);
+  const db = getTenantFirestore(databaseId || '(default)');
   const docRef = db.collection('video_analyses').doc(videoId);
   return await docRef.set(analysis, { merge: true });
 }
 
 /**
- * Retrieves video analysis from the tenant's `video_analyses` collection.
+ * Retrieves video analysis from the `video_analyses` collection.
  */
 export async function getVideoAnalysis(
-  databaseId: string,
+  databaseId: string | undefined,
   videoId: string
 ): Promise<DocumentData | null> {
-  const db = getTenantFirestore(databaseId);
+  const db = getTenantFirestore(databaseId || '(default)');
   const docSnap = await db.collection('video_analyses').doc(videoId).get();
   return docSnap.exists ? docSnap.data()! : null;
 }

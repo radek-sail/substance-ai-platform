@@ -15,6 +15,7 @@ export interface TenantConfig {
   customerId: string;
   databaseId: string;
   operatorInitials?: string;
+  bucketName?: string;
 }
 
 export interface ApiClientOptions {
@@ -53,11 +54,16 @@ export interface SignOffResponse {
   details?: Record<string, any>;
 }
 
+export const DEFAULT_GCS_BUCKET: string =
+  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_GCS_BUCKET_NAME) ||
+  'sail-platform-videos';
+
 // Default tenant configuration
 export const DEFAULT_TENANT_CONFIG: TenantConfig = {
   customerId: 'customer-alpha',
-  databaseId: 'customer-alpha-db',
+  databaseId: '(default)',
   operatorInitials: 'RS',
+  bucketName: DEFAULT_GCS_BUCKET,
 };
 
 /**
@@ -422,14 +428,14 @@ export class ApiService {
         videoId,
         customerId,
         databaseId,
-        originalGcsUri: `gs://${customerId}-video-manager-storage/uploads/${videoId}.mp4`,
-        normalizedGcsUri: `gs://${customerId}-video-manager-storage/normalized/norm_${videoId}.mp4`,
+        originalGcsUri: `gs://${this.tenant.bucketName || DEFAULT_GCS_BUCKET}/uploads/${videoId}.mp4`,
+        normalizedGcsUri: `gs://${this.tenant.bucketName || DEFAULT_GCS_BUCKET}/normalized/norm_${videoId}.mp4`,
         metadata: {
           videoId,
           customerId,
           databaseId,
-          originalGcsUri: `gs://${customerId}-video-manager-storage/uploads/${videoId}.mp4`,
-          normalizedGcsUri: `gs://${customerId}-video-manager-storage/normalized/norm_${videoId}.mp4`,
+          originalGcsUri: `gs://${this.tenant.bucketName || DEFAULT_GCS_BUCKET}/uploads/${videoId}.mp4`,
+          normalizedGcsUri: `gs://${this.tenant.bucketName || DEFAULT_GCS_BUCKET}/normalized/norm_${videoId}.mp4`,
           status: 'NORMALIZED',
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
@@ -709,6 +715,7 @@ export function generateInventorySignOffPayload(
     inventoryId?: string;
     boxId?: string;
     operatorInitials?: string;
+  bucketName?: string;
     signedOffAt?: string;
   } = {}
 ): InventorySignOffPayload {
@@ -795,6 +802,7 @@ export function generateArchiveSignOffPayload(
     archiveId?: string;
     markdownDoc?: string;
     operatorInitials?: string;
+  bucketName?: string;
     signedOffAt?: string;
   } = {}
 ): ArchiveSignOffPayload {

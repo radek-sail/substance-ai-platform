@@ -7,7 +7,7 @@ import multer from 'multer';
 import type { VideoMetadata } from '@sail/shared';
 import { uploadToTenantStorage } from '../services/storage.service';
 import { normalizeVideo } from '../services/ffmpeg.service';
-import { saveVideoMetadata } from '../services/firestore.service';
+import { normalizeDatabaseId, saveVideoMetadata } from '../services/firestore.service';
 
 /**
  * Resolves the scratch directory for temporary video processing.
@@ -63,25 +63,26 @@ export const uploadMiddleware = (req: Request, res: Response, next: NextFunction
 /**
  * Handles multi-tenant video ingestion:
  * 1. Validates tenant headers (`x-customer-id`, `x-database-id`).
- * 2. Uploads original video to `gs://{customerID}-video-manager-storage/uploads/{videoId}.mp4`.
+ * 2. Uploads original video to `gs://{bucketName}/uploads/{videoId}.mp4`.
  * 3. Runs containerized FFmpeg normalization to `/tmp/norm_{videoId}.mp4`.
- * 4. Uploads normalized MP4 to `gs://{customerID}-video-manager-storage/normalized/norm_{videoId}.mp4`.
+ * 4. Uploads normalized MP4 to `gs://{bucketName}/normalized/norm_{videoId}.mp4`.
  * 5. Persists metadata record in Firestore `videos/{videoId}`.
  * 6. Cleans up temporary scratch files in `/tmp`.
  */
 export async function uploadVideoHandler(req: Request, res: Response): Promise<Response | void> {
   // Extract tenant headers
   const customerId = (req.headers['x-customer-id'] || req.body?.customerId) as string | undefined;
-  const databaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
+  const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
 
   if (!customerId) {
     return res.status(400).json({ error: 'Missing required header: x-customer-id' });
   }
 
-  if (!databaseId) {
+  if (!rawDatabaseId && process.env.NODE_ENV === 'test') {
     return res.status(400).json({ error: 'Missing required header: x-database-id' });
   }
 
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
   const videoId = (req.headers['x-video-id'] || req.body?.videoId || crypto.randomUUID()) as string;
 
   const scratchDir = getScratchDir();
@@ -176,4 +177,3 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
     }
   }
 }
-

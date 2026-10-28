@@ -2,20 +2,29 @@ import React, { useState } from 'react';
 import {
   UploadCloud,
   FileVideo,
-  Play,
   CheckCircle2,
   Loader2,
   Sparkles,
   ArrowRight,
-  Database,
   Building,
   Layers,
 } from 'lucide-react';
-import { TenantConfig, apiService, UploadVideoResponse, TriggerAnalysisResponse } from '../../services/api.service';
+import type { VideoAnalysisDoc } from '@sail/shared';
+import {
+  TenantConfig,
+  DEFAULT_GCS_BUCKET,
+  apiService,
+  UploadVideoResponse,
+  TriggerAnalysisResponse,
+} from '../../services/api.service';
 
 interface VideoManagerViewProps {
   tenant: TenantConfig;
-  onSelectVideoForReview: (videoId: string, workflowType: 'inventory' | 'archive') => void;
+  onSelectVideoForReview: (
+    videoId: string,
+    workflowType: 'inventory' | 'archive',
+    analysis?: VideoAnalysisDoc
+  ) => void;
 }
 
 export const VideoManagerView: React.FC<VideoManagerViewProps> = ({
@@ -66,6 +75,15 @@ export const VideoManagerView: React.FC<VideoManagerViewProps> = ({
       );
       setAnalysisResult(analysisRes);
       setStatusMessage('Pipeline analysis complete! Ready for Human-in-the-Loop review.');
+
+      const detectedWorkflow =
+        analysisRes.analysis?.workflowClassification?.workflowType ||
+        analysisRes.analysis?.workloadClassification?.workflowType ||
+        analysisRes.summary?.workflowType;
+      const targetTab: 'inventory' | 'archive' =
+        detectedWorkflow === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ? 'archive' : 'inventory';
+
+      onSelectVideoForReview(uploadRes.videoId, targetTab, analysisRes.analysis);
     } catch (err: any) {
       setStatusMessage(`Error: ${err.message}`);
     } finally {
@@ -95,7 +113,7 @@ export const VideoManagerView: React.FC<VideoManagerViewProps> = ({
 
           <div className="flex items-center gap-2 text-xs font-mono text-cyan-300 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
             <Building className="w-3.5 h-3.5 text-cyan-400" />
-            <span>gs://{tenant.customerId}-video-manager-storage/</span>
+            <span>gs://{tenant.bucketName || DEFAULT_GCS_BUCKET}/</span>
           </div>
         </div>
 
@@ -155,9 +173,29 @@ export const VideoManagerView: React.FC<VideoManagerViewProps> = ({
 
         {/* Status message */}
         {statusMessage && (
-          <div className="mt-4 p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-cyan-300 flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span>{statusMessage}</span>
+          <div className="mt-4 p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-cyan-300 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>{statusMessage}</span>
+            </div>
+            {analysisResult && uploadResult && (
+              <button
+                type="button"
+                onClick={() => {
+                  const detectedWorkflow =
+                    analysisResult.analysis?.workflowClassification?.workflowType ||
+                    analysisResult.analysis?.workloadClassification?.workflowType ||
+                    analysisResult.summary?.workflowType;
+                  const targetTab: 'inventory' | 'archive' =
+                    detectedWorkflow === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ? 'archive' : 'inventory';
+                  onSelectVideoForReview(uploadResult.videoId, targetTab, analysisResult.analysis);
+                }}
+                className="flex items-center gap-1.5 bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-300 border border-cyan-500/40 px-3 py-1 rounded-lg text-xs font-semibold transition-colors shrink-0"
+              >
+                <span>Open Stream ({uploadResult.videoId})</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -230,4 +268,3 @@ export const VideoManagerView: React.FC<VideoManagerViewProps> = ({
 };
 
 export default VideoManagerView;
-

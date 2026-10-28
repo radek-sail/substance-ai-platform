@@ -8,7 +8,7 @@ import { App } from '../src/App.tsx';
 
 describe('Firebase Authentication & API Token Injection', () => {
   it('should initialize Firebase with project sail-platform-prod and export auth', () => {
-    assert.strictEqual(firebaseConfig.apiKey, 'AIzaSyDFGrZ8nvF6L3xNw1_gx-RDSJCWJoAQoYQ');
+    assert.strictEqual(firebaseConfig.apiKey, 'AIzaSy_MOCK_TEST_KEY_NOT_REAL');
     assert.strictEqual(firebaseConfig.authDomain, 'sail-platform-prod.firebaseapp.com');
     assert.strictEqual(firebaseConfig.projectId, 'sail-platform-prod');
     assert.strictEqual(firebaseConfig.storageBucket, 'sail-platform-prod.firebasestorage.app');

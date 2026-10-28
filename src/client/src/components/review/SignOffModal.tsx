@@ -11,7 +11,7 @@ import {
   Lock,
   ArrowRight,
 } from 'lucide-react';
-import { TenantConfig, apiService, SignOffResponse } from '../../services/api.service';
+import { TenantConfig, DEFAULT_GCS_BUCKET, apiService, SignOffResponse } from '../../services/api.service';
 import { HumanEditedVialData } from '../inventory/VialInspector';
 import type { BoxUpdate } from '@sail/shared';
 
@@ -162,7 +162,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
               <span>Customer Storage:</span>
             </span>
             <span className="text-slate-200">
-              gs://{tenant.customerId}-video-manager-storage/
+              gs://{tenant.bucketName || DEFAULT_GCS_BUCKET}/
             </span>
           </div>
           <div className="flex items-center justify-between text-slate-400">

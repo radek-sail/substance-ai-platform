@@ -13,7 +13,7 @@ import {
   Refinement,
 } from '@sail/shared';
 import { extractCandidateFrame } from './ffmpeg.service';
-import { uploadToTenantStorage, getTenantGcsUri } from './storage.service';
+import { uploadToTenantStorage, getTenantGcsUri, downloadFromGcsUri } from './storage.service';
 
 /**
  * Global GenAI client holder for runtime injection and mocking during tests.
@@ -50,6 +50,115 @@ export function getGenAIClient(): GoogleGenAI | any {
 
   // Fallback to Application Default Credentials
   return new GoogleGenAI({});
+}
+
+export interface RegisteredGeminiVideo {
+  fileRecord?: any;
+  fileUri: string;
+  localVideoPath?: string;
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Downloads/streams a video from GCS (or reads its local path), uploads and registers it
+ * with the Gemini Files API (`ai.files.upload`), and polls `ai.files.get` until the file
+ * transitions from `PROCESSING` to `ACTIVE`.
+ *
+ * Returns the registered `fileUri` (and `fileRecord`) along with a `cleanup` callback
+ * that deletes the remote file via `ai.files.delete({ name: fileRecord.name })` and removes
+ * any temporary downloaded file.
+ */
+export async function uploadAndWaitForActiveFile(params: {
+  videoGcsUri: string;
+  localVideoPath?: string;
+  videoId?: string;
+}): Promise<RegisteredGeminiVideo> {
+  const ai = getGenAIClient();
+
+  // If the client is a test mock without `ai.files.upload`, or if the URI is already a registered Gemini File URI
+  if (
+    !ai?.files ||
+    typeof ai.files.upload !== 'function' ||
+    !params.videoGcsUri ||
+    params.videoGcsUri.startsWith('https://generativelanguage.googleapis.com/') ||
+    params.videoGcsUri.startsWith('files/')
+  ) {
+    return {
+      fileUri: params.videoGcsUri,
+      localVideoPath: params.localVideoPath,
+      cleanup: async () => {},
+    };
+  }
+
+  let localFilePath = params.localVideoPath;
+  let downloadedTempPath: string | null = null;
+
+  if (!localFilePath || !fs.existsSync(localFilePath)) {
+    if (!params.videoGcsUri.startsWith('gs://') && fs.existsSync(params.videoGcsUri)) {
+      localFilePath = params.videoGcsUri;
+    } else if (params.videoGcsUri.startsWith('gs://')) {
+      const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+      const normalizedGcsUri = params.videoGcsUri.replace(/^gs:\/\/[^/]+\//, `gs://${bucketName}/`);
+      const safeVideoId = (params.videoId || `vid_${Date.now()}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+      downloadedTempPath = path.join(
+        os.tmpdir(),
+        `sail_gemini_${safeVideoId}_${Date.now()}.mp4`
+      );
+      await downloadFromGcsUri(normalizedGcsUri, downloadedTempPath);
+      localFilePath = downloadedTempPath;
+    } else {
+      throw new Error(`Video file not found locally or in GCS: ${params.videoGcsUri}`);
+    }
+  }
+
+  // Upload and register the video file with the Gemini Files API
+  const uploadResult = await ai.files.upload({
+    file: localFilePath,
+    mimeType: 'video/mp4',
+    config: {
+      mimeType: 'video/mp4',
+    },
+  } as any);
+
+  // Poll until file state transitions from PROCESSING to ACTIVE
+  let fileRecord = await ai.files.get({ name: uploadResult.name });
+  while (fileRecord.state === 'PROCESSING') {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    fileRecord = await ai.files.get({ name: uploadResult.name });
+  }
+
+  if (fileRecord.state && fileRecord.state !== 'ACTIVE') {
+    throw new Error(
+      `Gemini file registration failed for ${uploadResult.name} with state: ${fileRecord.state}`
+    );
+  }
+
+  const registeredUri = fileRecord.uri || uploadResult.uri;
+  const registeredName = fileRecord.name || uploadResult.name;
+
+  const cleanup = async () => {
+    if (registeredName && ai?.files && typeof ai.files.delete === 'function') {
+      try {
+        await ai.files.delete({ name: registeredName });
+      } catch (deleteErr) {
+        console.warn(`[GeminiService] Failed to delete file ${registeredName} from Gemini Files API:`, deleteErr);
+      }
+    }
+    if (downloadedTempPath && fs.existsSync(downloadedTempPath)) {
+      try {
+        await fs.promises.unlink(downloadedTempPath);
+      } catch (unlinkErr) {
+        console.warn(`[GeminiService] Failed to clean up temporary downloaded video ${downloadedTempPath}:`, unlinkErr);
+      }
+    }
+  };
+
+  return {
+    fileRecord,
+    fileUri: registeredUri,
+    localVideoPath: localFilePath,
+    cleanup,
+  };
 }
 
 /**
@@ -220,140 +329,32 @@ export async function runPass0WorkflowClassification(params: {
   localVideoPath?: string;
   customerId?: string;
   videoId?: string;
+  registeredFileUri?: string;
 }): Promise<WorkflowClassification> {
   const systemInstruction = loadGuideline('classification-agent-guidelines.md');
   const client = getGenAIClient();
 
-  const userPrompt = `You are analyzing video recording: ${params.videoGcsUri}.
+  const needsRegistration = !params.registeredFileUri && params.videoGcsUri?.startsWith('gs://');
+  const registered = needsRegistration
+    ? await uploadAndWaitForActiveFile({
+        videoGcsUri: params.videoGcsUri,
+        localVideoPath: params.localVideoPath,
+        videoId: params.videoId,
+      })
+    : null;
+
+  const activeFileUri = params.registeredFileUri || registered?.fileUri || params.videoGcsUri;
+
+  try {
+    const userPrompt = `You are analyzing video recording: ${activeFileUri}.
 Transcribe audible speech and classify the workflow strictly according to the system instructions.
 Return a valid JSON object matching WorkflowClassificationSchema.`;
 
-  const contents: any[] = [];
-  if (params.videoGcsUri) {
-    contents.push({
-      fileData: {
-        fileUri: params.videoGcsUri,
-        mimeType: 'video/mp4',
-      },
-    });
-  }
-  contents.push(userPrompt);
-
-  const response = await client.models.generateContent({
-    model: DEFAULT_FLASH_MODEL,
-    contents,
-    config: {
-      systemInstruction,
-      responseMimeType: 'application/json',
-    },
-  });
-
-  const rawText = extractTextFromResponse(response);
-  const parsedJson = extractJsonFromText(rawText);
-
-  return WorkflowClassificationSchema.parse(parsedJson);
-}
-
-/**
- * Pass 1 (Action Detection):
- * - Selects dynamic guidelines: `config/inventory-agent-guidelines.md` or `config/archive-agent-guidelines.md`
- *   based on Pass 0 classification result.
- * - Calls Gemini Pro at coarse sampling (1 fps) to identify temporal action boundaries.
- * - Validates output via an array of ActionSchema objects.
- */
-export async function runPass1ActionDetection(params: {
-  videoGcsUri: string;
-  classification: WorkflowClassification;
-  localVideoPath?: string;
-  customerId?: string;
-  videoId?: string;
-}): Promise<Action[]> {
-  const guidelineFile =
-    params.classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
-      ? 'archive-agent-guidelines.md'
-      : 'inventory-agent-guidelines.md';
-
-  const systemInstruction = loadGuideline(guidelineFile);
-  const client = getGenAIClient();
-
-  const userPrompt = `Workflow Type: ${params.classification.workflowType}.
-Audible Context: "${params.classification.transcribedAudio}".
-Video URI: ${params.videoGcsUri}.
-
-Identify compound temporal action boundaries at 1 fps coarse sampling.
-Valid Action Classes: VIAL_INSERTION_ACTION, VIAL_REMOVAL_ACTION, REAGENT_MIXING_ACTION, REAGENT_SEEDING_ACTION.
-Return a JSON array of Action objects conforming to ActionSchema.`;
-
-  const contents: any[] = [];
-  if (params.videoGcsUri) {
-    contents.push({
-      fileData: {
-        fileUri: params.videoGcsUri,
-        mimeType: 'video/mp4',
-      },
-    });
-  }
-  contents.push(userPrompt);
-
-  const response = await client.models.generateContent({
-    model: DEFAULT_PRO_MODEL,
-    contents,
-    config: {
-      systemInstruction,
-      responseMimeType: 'application/json',
-    },
-  });
-
-  const rawText = extractTextFromResponse(response);
-  const parsedJson = extractJsonFromText(rawText);
-
-  const actionsArray = Array.isArray(parsedJson)
-    ? parsedJson
-    : parsedJson.actions || parsedJson.actionList || [];
-
-  return ActionSchema.array().parse(actionsArray);
-}
-
-/**
- * Pass 2 (Event Detection):
- * - For each detected action, extracts sub-events at 4 fps (label presentations, before/after shots, audio utterances).
- * - Extracts candidate frame timestamps, calls extractCandidateFrame from ffmpeg.service.ts,
- *   and uploads frames to gs://{customerId}-video-manager-storage/frames/{videoId}/.
- * - Populates bestShotUrls and validates output via an array of EventSchema objects.
- */
-export async function runPass2EventDetection(params: {
-  videoGcsUri: string;
-  classification: WorkflowClassification;
-  actions: Action[];
-  localVideoPath?: string;
-  customerId: string;
-  videoId: string;
-}): Promise<Event[]> {
-  const guidelineFile =
-    params.classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
-      ? 'archive-agent-guidelines.md'
-      : 'inventory-agent-guidelines.md';
-
-  const systemInstruction = loadGuideline(guidelineFile);
-  const client = getGenAIClient();
-  const allEvents: Event[] = [];
-
-  const scratchDir = path.join(os.tmpdir(), `sail_frames_${params.videoId}`);
-  if (!fs.existsSync(scratchDir)) {
-    fs.mkdirSync(scratchDir, { recursive: true });
-  }
-
-  for (const action of params.actions) {
-    const userPrompt = `Action ID: ${action.actionId} (${action.actionClass}).
-Temporal span analysis at 4 fps.
-Extract fine-grained sub-events: label presentations, pre-action/post-action state shots, and operator speech utterances.
-Return a JSON array of Event objects conforming to EventSchema.`;
-
     const contents: any[] = [];
-    if (params.videoGcsUri) {
+    if (activeFileUri) {
       contents.push({
         fileData: {
-          fileUri: params.videoGcsUri,
+          fileUri: activeFileUri,
           mimeType: 'video/mp4',
         },
       });
@@ -371,68 +372,230 @@ Return a JSON array of Event objects conforming to EventSchema.`;
 
     const rawText = extractTextFromResponse(response);
     const parsedJson = extractJsonFromText(rawText);
-    const rawEvents: any[] = Array.isArray(parsedJson)
-      ? parsedJson
-      : parsedJson.events || parsedJson.eventList || [];
 
-    for (const rawEvent of rawEvents) {
-      const bestShotTimes: number[] = Array.isArray(rawEvent.bestShotTimes)
-        ? rawEvent.bestShotTimes
-        : [];
-      const bestShotUrls: string[] = [];
-
-      for (const timestamp of bestShotTimes) {
-        const frameFilename = `frame_${rawEvent.eventId || 'evt'}_${timestamp}.jpg`;
-        const destinationGcsPath = `frames/${params.videoId}/${frameFilename}`;
-
-        if (params.localVideoPath && fs.existsSync(params.localVideoPath)) {
-          try {
-            const frameLocalPath = await extractCandidateFrame(
-              params.localVideoPath,
-              timestamp,
-              scratchDir,
-              frameFilename
-            );
-            const uploadedGcsUri = await uploadToTenantStorage(
-              params.customerId,
-              frameLocalPath,
-              destinationGcsPath,
-              'image/jpeg'
-            );
-            bestShotUrls.push(uploadedGcsUri);
-
-            // Clean up local frame file
-            if (fs.existsSync(frameLocalPath)) {
-              await fs.promises.unlink(frameLocalPath).catch(() => {});
-            }
-          } catch (frameErr) {
-            console.warn(`[Pass 2] Frame extraction failed at ${timestamp}s:`, frameErr);
-            bestShotUrls.push(getTenantGcsUri(params.customerId, destinationGcsPath));
-          }
-        } else {
-          // Cloud-native URI mapping
-          bestShotUrls.push(getTenantGcsUri(params.customerId, destinationGcsPath));
-        }
-      }
-
-      const validatedEvent = EventSchema.parse({
-        ...rawEvent,
-        actionId: action.actionId,
-        bestShotUrls,
-        bestShotTimes,
-        refinementList: rawEvent.refinementList || [],
-      });
-
-      allEvents.push(validatedEvent);
+    return WorkflowClassificationSchema.parse(parsedJson);
+  } finally {
+    if (registered) {
+      await registered.cleanup();
     }
   }
+}
 
-  // Clean up temporary scratch frame directory
-  if (fs.existsSync(scratchDir)) {
-    fs.rmSync(scratchDir, { recursive: true, force: true });
+/**
+ * Pass 1 (Action Detection):
+ * - Selects dynamic guidelines: `config/inventory-agent-guidelines.md` or `config/archive-agent-guidelines.md`
+ *   based on Pass 0 classification result.
+ * - Calls Gemini Pro at coarse sampling (1 fps) to identify temporal action boundaries.
+ * - Validates output via an array of ActionSchema objects.
+ */
+export async function runPass1ActionDetection(params: {
+  videoGcsUri: string;
+  classification: WorkflowClassification;
+  localVideoPath?: string;
+  customerId?: string;
+  videoId?: string;
+  registeredFileUri?: string;
+}): Promise<Action[]> {
+  const guidelineFile =
+    params.classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+      ? 'archive-agent-guidelines.md'
+      : 'inventory-agent-guidelines.md';
+
+  const systemInstruction = loadGuideline(guidelineFile);
+  const client = getGenAIClient();
+
+  const needsRegistration = !params.registeredFileUri && params.videoGcsUri?.startsWith('gs://');
+  const registered = needsRegistration
+    ? await uploadAndWaitForActiveFile({
+        videoGcsUri: params.videoGcsUri,
+        localVideoPath: params.localVideoPath,
+        videoId: params.videoId,
+      })
+    : null;
+
+  const activeFileUri = params.registeredFileUri || registered?.fileUri || params.videoGcsUri;
+
+  try {
+    const userPrompt = `Workflow Type: ${params.classification.workflowType}.
+Audible Context: "${params.classification.transcribedAudio}".
+Video URI: ${activeFileUri}.
+
+Identify compound temporal action boundaries at 1 fps coarse sampling.
+Valid Action Classes: VIAL_INSERTION_ACTION, VIAL_REMOVAL_ACTION, REAGENT_MIXING_ACTION, REAGENT_SEEDING_ACTION.
+Return a JSON array of Action objects conforming to ActionSchema.`;
+
+    const contents: any[] = [];
+    if (activeFileUri) {
+      contents.push({
+        fileData: {
+          fileUri: activeFileUri,
+          mimeType: 'video/mp4',
+        },
+      });
+    }
+    contents.push(userPrompt);
+
+    const response = await client.models.generateContent({
+      model: DEFAULT_PRO_MODEL,
+      contents,
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+      },
+    });
+
+    const rawText = extractTextFromResponse(response);
+    const parsedJson = extractJsonFromText(rawText);
+
+    const actionsArray = Array.isArray(parsedJson)
+      ? parsedJson
+      : parsedJson.actions || parsedJson.actionList || [];
+
+    return ActionSchema.array().parse(actionsArray);
+  } finally {
+    if (registered) {
+      await registered.cleanup();
+    }
+  }
+}
+
+/**
+ * Pass 2 (Event Detection):
+ * - For each detected action, extracts sub-events at 4 fps (label presentations, before/after shots, audio utterances).
+ * - Extracts candidate frame timestamps, calls extractCandidateFrame from ffmpeg.service.ts,
+ *   and uploads frames to gs://${bucketName}/frames/{videoId}/.
+ * - Populates bestShotUrls and validates output via an array of EventSchema objects.
+ */
+export async function runPass2EventDetection(params: {
+  videoGcsUri: string;
+  classification: WorkflowClassification;
+  actions: Action[];
+  localVideoPath?: string;
+  customerId: string;
+  videoId: string;
+  registeredFileUri?: string;
+}): Promise<Event[]> {
+  const guidelineFile =
+    params.classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+      ? 'archive-agent-guidelines.md'
+      : 'inventory-agent-guidelines.md';
+
+  const systemInstruction = loadGuideline(guidelineFile);
+  const client = getGenAIClient();
+  const allEvents: Event[] = [];
+
+  const needsRegistration = !params.registeredFileUri && params.videoGcsUri?.startsWith('gs://');
+  const registered = needsRegistration
+    ? await uploadAndWaitForActiveFile({
+        videoGcsUri: params.videoGcsUri,
+        localVideoPath: params.localVideoPath,
+        videoId: params.videoId,
+      })
+    : null;
+
+  const activeFileUri = params.registeredFileUri || registered?.fileUri || params.videoGcsUri;
+  const effectiveLocalVideoPath = params.localVideoPath || registered?.localVideoPath;
+
+  const scratchDir = path.join(os.tmpdir(), `sail_frames_${params.videoId}`);
+  if (!fs.existsSync(scratchDir)) {
+    fs.mkdirSync(scratchDir, { recursive: true });
   }
 
-  return allEvents;
+  try {
+    for (const action of params.actions) {
+      const userPrompt = `Action ID: ${action.actionId} (${action.actionClass}).
+Temporal span analysis at 4 fps.
+Extract fine-grained sub-events: label presentations, pre-action/post-action state shots, and operator speech utterances.
+Return a JSON array of Event objects conforming to EventSchema.`;
+
+      const contents: any[] = [];
+      if (activeFileUri) {
+        contents.push({
+          fileData: {
+            fileUri: activeFileUri,
+            mimeType: 'video/mp4',
+          },
+        });
+      }
+      contents.push(userPrompt);
+
+      const response = await client.models.generateContent({
+        model: DEFAULT_FLASH_MODEL,
+        contents,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+        },
+      });
+
+      const rawText = extractTextFromResponse(response);
+      const parsedJson = extractJsonFromText(rawText);
+      const rawEvents: any[] = Array.isArray(parsedJson)
+        ? parsedJson
+        : parsedJson.events || parsedJson.eventList || [];
+
+      for (const rawEvent of rawEvents) {
+        const bestShotTimes: number[] = Array.isArray(rawEvent.bestShotTimes)
+          ? rawEvent.bestShotTimes
+          : [];
+        const bestShotUrls: string[] = [];
+
+        for (const timestamp of bestShotTimes) {
+          const frameFilename = `frame_${rawEvent.eventId || 'evt'}_${timestamp}.jpg`;
+          const destinationGcsPath = `frames/${params.videoId}/${frameFilename}`;
+
+          if (effectiveLocalVideoPath && fs.existsSync(effectiveLocalVideoPath)) {
+            try {
+              const frameLocalPath = await extractCandidateFrame(
+                effectiveLocalVideoPath,
+                timestamp,
+                scratchDir,
+                frameFilename
+              );
+              const uploadedGcsUri = await uploadToTenantStorage(
+                params.customerId,
+                frameLocalPath,
+                destinationGcsPath,
+                'image/jpeg'
+              );
+              bestShotUrls.push(uploadedGcsUri);
+
+              // Clean up local frame file
+              if (fs.existsSync(frameLocalPath)) {
+                await fs.promises.unlink(frameLocalPath).catch(() => {});
+              }
+            } catch (frameErr) {
+              console.warn(`[Pass 2] Frame extraction failed at ${timestamp}s:`, frameErr);
+              bestShotUrls.push(getTenantGcsUri(params.customerId, destinationGcsPath));
+            }
+          } else {
+            // Cloud-native URI mapping
+            bestShotUrls.push(getTenantGcsUri(params.customerId, destinationGcsPath));
+          }
+        }
+
+        const validatedEvent = EventSchema.parse({
+          ...rawEvent,
+          actionId: action.actionId,
+          bestShotUrls,
+          bestShotTimes,
+          refinementList: rawEvent.refinementList || [],
+        });
+
+        allEvents.push(validatedEvent);
+      }
+    }
+
+    return allEvents;
+  } finally {
+    // Clean up temporary scratch frame directory
+    if (fs.existsSync(scratchDir)) {
+      fs.rmSync(scratchDir, { recursive: true, force: true });
+    }
+    if (registered) {
+      await registered.cleanup();
+    }
+  }
 }
 
 /**
@@ -450,6 +613,8 @@ export async function runPass3AnalysisRefinement(params: {
   events: Event[];
   customerId: string;
   videoId: string;
+  localVideoPath?: string;
+  registeredFileUri?: string;
 }): Promise<Refinement[]> {
   const client = getGenAIClient();
   const systemInstruction = `You are the Pass 3 Analysis Refinement Engine for Substance AI Labs (SAIL).
@@ -462,42 +627,74 @@ Execute high-resolution modal tasks:
 
 Return a JSON array of Refinement objects conforming strictly to RefinementSchema.`;
 
-  const eventsSummary = params.events.map((e) => ({
-    eventId: e.eventId,
-    actionId: e.actionId,
-    eventClass: e.eventClass,
-    bestShotUrls: e.bestShotUrls,
-  }));
+  const needsRegistration = !params.registeredFileUri && params.videoGcsUri?.startsWith('gs://');
+  const registered = needsRegistration
+    ? await uploadAndWaitForActiveFile({
+        videoGcsUri: params.videoGcsUri,
+        localVideoPath: params.localVideoPath,
+        videoId: params.videoId,
+      })
+    : null;
 
-  const userPrompt = `Workflow: ${params.classification.workflowType}
+  const activeFileUri = params.registeredFileUri || registered?.fileUri || params.videoGcsUri;
+
+  try {
+    const eventsSummary = params.events.map((e) => ({
+      eventId: e.eventId,
+      actionId: e.actionId,
+      eventClass: e.eventClass,
+      bestShotUrls: e.bestShotUrls,
+    }));
+
+    const userPrompt = `Workflow: ${params.classification.workflowType}
+Video URI: ${activeFileUri}
 Events to refine:
 ${JSON.stringify(eventsSummary, null, 2)}
 
 Perform OCR conflation, spatial coordinate differencing, and speech confirmation.
 Output a JSON array of Refinement objects conforming to RefinementSchema.`;
 
-  const response = await client.models.generateContent({
-    model: DEFAULT_PRO_MODEL,
-    contents: [userPrompt],
-    config: {
-      systemInstruction,
-      responseMimeType: 'application/json',
-    },
-  });
+    const contents: any[] = [];
+    if (activeFileUri) {
+      contents.push({
+        fileData: {
+          fileUri: activeFileUri,
+          mimeType: 'video/mp4',
+        },
+      });
+    }
+    contents.push(userPrompt);
 
-  const rawText = extractTextFromResponse(response);
-  const parsedJson = extractJsonFromText(rawText);
+    const response = await client.models.generateContent({
+      model: DEFAULT_PRO_MODEL,
+      contents,
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+      },
+    });
 
-  const refinementsArray = Array.isArray(parsedJson)
-    ? parsedJson
-    : parsedJson.refinements || parsedJson.refinementList || [];
+    const rawText = extractTextFromResponse(response);
+    const parsedJson = extractJsonFromText(rawText);
 
-  return RefinementSchema.array().parse(refinementsArray);
+    const refinementsArray = Array.isArray(parsedJson)
+      ? parsedJson
+      : parsedJson.refinements || parsedJson.refinementList || [];
+
+    return RefinementSchema.array().parse(refinementsArray);
+  } finally {
+    if (registered) {
+      await registered.cleanup();
+    }
+  }
 }
 
 /**
  * Executes the complete 4-Stage Hierarchical AI Pipeline:
  * Pass 0 (Workflow Classifier) -> Pass 1 (Action Detection) -> Pass 2 (Event Detection) -> Pass 3 (Analysis Refinement)
+ *
+ * Pre-registers the video with the Gemini Files API (`ai.files.upload`) and waits for `ACTIVE` state
+ * before executing Pass 0 through Pass 3, then cleans up the remote file (`ai.files.delete`) in `finally`.
  */
 export async function executeHierarchicalPipeline(params: PipelineExecutionParams): Promise<{
   workloadClassification: WorkflowClassification;
@@ -505,47 +702,62 @@ export async function executeHierarchicalPipeline(params: PipelineExecutionParam
   events: Event[];
   refinements: Refinement[];
 }> {
-  // Pass 0: Workflow Classifier
-  const workloadClassification = await runPass0WorkflowClassification({
+  const registeredVideo = await uploadAndWaitForActiveFile({
     videoGcsUri: params.videoGcsUri,
     localVideoPath: params.localVideoPath,
-    customerId: params.customerId,
     videoId: params.videoId,
   });
 
-  // Pass 1: Action Detection
-  const actions = await runPass1ActionDetection({
-    videoGcsUri: params.videoGcsUri,
-    classification: workloadClassification,
-    localVideoPath: params.localVideoPath,
-    customerId: params.customerId,
-    videoId: params.videoId,
-  });
+  try {
+    // Pass 0: Workflow Classifier
+    const workloadClassification = await runPass0WorkflowClassification({
+      videoGcsUri: registeredVideo.fileUri,
+      registeredFileUri: registeredVideo.fileUri,
+      localVideoPath: registeredVideo.localVideoPath,
+      customerId: params.customerId,
+      videoId: params.videoId,
+    });
 
-  // Pass 2: Event Detection
-  const events = await runPass2EventDetection({
-    videoGcsUri: params.videoGcsUri,
-    classification: workloadClassification,
-    actions,
-    localVideoPath: params.localVideoPath,
-    customerId: params.customerId,
-    videoId: params.videoId,
-  });
+    // Pass 1: Action Detection
+    const actions = await runPass1ActionDetection({
+      videoGcsUri: registeredVideo.fileUri,
+      registeredFileUri: registeredVideo.fileUri,
+      classification: workloadClassification,
+      localVideoPath: registeredVideo.localVideoPath,
+      customerId: params.customerId,
+      videoId: params.videoId,
+    });
 
-  // Pass 3: Analysis Refinement
-  const refinements = await runPass3AnalysisRefinement({
-    videoGcsUri: params.videoGcsUri,
-    classification: workloadClassification,
-    actions,
-    events,
-    customerId: params.customerId,
-    videoId: params.videoId,
-  });
+    // Pass 2: Event Detection
+    const events = await runPass2EventDetection({
+      videoGcsUri: registeredVideo.fileUri,
+      registeredFileUri: registeredVideo.fileUri,
+      classification: workloadClassification,
+      actions,
+      localVideoPath: registeredVideo.localVideoPath,
+      customerId: params.customerId,
+      videoId: params.videoId,
+    });
 
-  return {
-    workloadClassification,
-    actions,
-    events,
-    refinements,
-  };
+    // Pass 3: Analysis Refinement
+    const refinements = await runPass3AnalysisRefinement({
+      videoGcsUri: registeredVideo.fileUri,
+      registeredFileUri: registeredVideo.fileUri,
+      classification: workloadClassification,
+      actions,
+      events,
+      localVideoPath: registeredVideo.localVideoPath,
+      customerId: params.customerId,
+      videoId: params.videoId,
+    });
+
+    return {
+      workloadClassification,
+      actions,
+      events,
+      refinements,
+    };
+  } finally {
+    await registeredVideo.cleanup();
+  }
 }

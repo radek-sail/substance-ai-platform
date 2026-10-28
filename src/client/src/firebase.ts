@@ -2,12 +2,12 @@ import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 
 export const firebaseConfig = {
-  apiKey: "AIzaSyDfGrZ8nVf6L3xNw1_gx-RDSJCWJoAQoYQ",
-  authDomain: "sail-platform-prod.firebaseapp.com",
-  projectId: "sail-platform-prod",
-  storageBucket: "sail-platform-prod.firebasestorage.app",
-  messagingSenderId: "820436998318",
-  appId: "1:820436998318:web:a64191af17494bc4e07537"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
 
 export const app = initializeApp(firebaseConfig);
