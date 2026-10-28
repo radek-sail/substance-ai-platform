@@ -9,7 +9,9 @@ build/
 
 # Environment and secrets
 .env
+.env*
 .env.local
+src/client/.env.production
 *.log
 
 # Editor directories

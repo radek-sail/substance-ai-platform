@@ -1,0 +1,23 @@
+# Git
+.git
+.gitignore
+
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env*
+!src/client/.env.production
+
+# Logs and editor directories
+*.log
+.vscode/
+.idea/
+.DS_Store
