@@ -1,6 +1,5 @@
-import { VideoManagerView, type VideoManagerViewProps } from './VideoManagerView';
+import { VideoManager, VideoManagerView, type VideoManagerViewProps } from '../VideoManager';
 
 export type VideoManagerProps = VideoManagerViewProps;
-export const VideoManager = VideoManagerView;
-export { VideoManagerView };
+export { VideoManager, VideoManagerView };
 export default VideoManager;

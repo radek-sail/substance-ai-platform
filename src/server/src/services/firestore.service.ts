@@ -16,11 +16,14 @@ import {
 export interface VideoRecord {
   videoId: string;
   originalName: string;
+  bucketName?: string;
   gcsBucket?: string;
   rawPath?: string;
   normalizedPath?: string;
   rawGcsUri: string;
-  normalizedGcsUri: string;
+  normalizedGcsUri?: string;
+  totalChunks?: number;
+  chunks?: Array<{ index: number; gcsUri: string }>;
   geminiFileUri?: string;
   geminiFileName?: string;
   durationSeconds?: number;
@@ -31,7 +34,9 @@ export interface VideoRecord {
     | 'READY_FOR_ANALYSIS'
     | 'ANALYZING'
     | 'ANALYSIS_COMPLETE'
-    | 'FAILED';
+    | 'FAILED'
+    | 'ERROR';
+  errorMessage?: string;
   passes?: VideoPasses;
   analysisId?: string;
   organizationId?: string;
@@ -40,20 +45,21 @@ export interface VideoRecord {
   transcodedAt?: FirebaseFirestore.FieldValue | string;
 }
 
-// Initialize Firebase Admin SDK if not already initialized
+// Initialize Firebase Admin SDK targeting the default database
 if (!admin.apps.length) {
-  const explicitProjectId =
-    process.env.FIREBASE_PROJECT_ID ||
-    process.env.GOOGLE_CLOUD_PROJECT ||
-    process.env.GCLOUD_PROJECT ||
-    process.env.GCP_PROJECT ||
-    (process.env.NODE_ENV === 'test' ? 'test-sail-project' : 'sail-platform-prod');
-  admin.initializeApp(explicitProjectId ? { projectId: explicitProjectId } : undefined);
-  try {
-    admin.firestore().settings({ ignoreUndefinedProperties: true });
-  } catch {
-    // Ignore if Firestore settings were already initialized
-  }
+  admin.initializeApp({
+    projectId:
+      process.env.GOOGLE_CLOUD_PROJECT ||
+      process.env.FIREBASE_PROJECT_ID ||
+      (process.env.NODE_ENV === 'test' ? 'test-sail-project' : 'sail-platform-prod'),
+  });
+}
+
+export const db: Firestore = admin.firestore();
+try {
+  db.settings({ ignoreUndefinedProperties: true });
+} catch {
+  // Ignore if Firestore settings were already initialized
 }
 
 function stripUndefinedFields<T extends Record<string, any>>(obj: T): T {
@@ -219,28 +225,29 @@ function createInMemoryCollectionFactory(dbId: string) {
   return makeCollection;
 }
 
+if (process.env.NODE_ENV === 'test') {
+  (db as any).collection = createInMemoryCollectionFactory('(default)');
+}
+
 /**
- * Normalizes a database identifier. Defaults to `(default)` and avoids connecting
- * to placeholder database IDs like `customer-alpha-db` unless explicitly in test mode.
+ * Normalizes a database identifier.
+ * In production/cloud environments, all Firestore data must target the '(default)' database.
+ * Custom database IDs (e.g. 'customer-alpha', 'customer-alpha-db') do not exist in GCP
+ * and cause PERMISSION_DENIED errors.
  */
 export function normalizeDatabaseId(databaseId?: string): string {
+  if (process.env.NODE_ENV !== 'test') {
+    return '(default)';
+  }
   if (!databaseId) return '(default)';
   const trimmed = databaseId.trim();
   if (!trimmed || trimmed === 'default' || trimmed === '(default)') {
     return '(default)';
   }
-  const demoTenantDbs = ['customer-alpha-db', 'biolab-db', 'pharma-db'];
-  if (demoTenantDbs.includes(trimmed) && process.env.NODE_ENV !== 'test') {
-    return '(default)';
-  }
   const match = trimmed.match(/(?:^|\/)databases\/([^/]+)/);
   if (match) {
     const extracted = match[1];
-    if (
-      extracted === 'default' ||
-      extracted === '(default)' ||
-      (demoTenantDbs.includes(extracted) && process.env.NODE_ENV !== 'test')
-    ) {
+    if (extracted === 'default' || extracted === '(default)') {
       return '(default)';
     }
     return extracted;
@@ -250,15 +257,17 @@ export function normalizeDatabaseId(databaseId?: string): string {
 
 /**
  * Returns a cached Firestore instance scoped to `/databases/{databaseID}/documents/`.
- * Uses the default Firestore instance (`admin.firestore()`) when targeting `(default)`.
+ * In production, always returns the default Firestore database instance (`db`),
+ * removing any custom databaseId configuration that sets it to anything other than `(default)`.
  */
 export function getTenantFirestore(databaseId?: string): Firestore {
   const dbId = normalizeDatabaseId(databaseId);
+  if (dbId === '(default)' || process.env.NODE_ENV !== 'test') {
+    return db;
+  }
   if (!databaseCache.has(dbId)) {
-    const firestoreInstance = dbId === '(default)' ? admin.firestore() : getFirestore(dbId);
+    const firestoreInstance = getFirestore(dbId);
     if (process.env.NODE_ENV === 'test') {
-      // Attach an offline in-memory collection handler for test environments while preserving
-      // Firestore instance properties (`databaseId`, `formattedName`) and allowing test spies to override `db.collection`.
       (firestoreInstance as any).collection = createInMemoryCollectionFactory(dbId);
     }
     databaseCache.set(dbId, firestoreInstance);
@@ -515,15 +524,19 @@ function formatVideoDocument(id: string, data: Record<string, any>): Record<stri
     hitl: data.passes?.hitl || { status: 'PENDING' },
   };
 
+  const firstChunkUri =
+    Array.isArray(data.chunks) && data.chunks.length > 0 ? data.chunks[0]?.gcsUri : undefined;
+
   return {
     ...data,
     videoId,
     originalName: data.originalName || data.fileName || `${videoId}.mp4`,
-    gcsBucket: data.gcsBucket || process.env.GCS_BUCKET_NAME || 'sail-platform-videos',
-    rawPath: data.rawPath || `raw/${videoId}_${data.originalName || `${videoId}.mp4`}`,
-    normalizedPath: data.normalizedPath || `normalized/norm_${videoId}.mp4`,
+    bucketName: data.bucketName || data.gcsBucket || process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod',
+    gcsBucket: data.gcsBucket || data.bucketName || process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod',
+    rawPath: data.rawPath || `raw/${videoId}/${data.originalName || `${videoId}.mp4`}`,
+    normalizedPath: data.normalizedPath || `normalized/${videoId}/chunk_000.mp4`,
     rawGcsUri: data.rawGcsUri || data.originalGcsUri || '',
-    normalizedGcsUri: data.normalizedGcsUri || '',
+    normalizedGcsUri: data.normalizedGcsUri || firstChunkUri || '',
     status: data.status || 'READY_FOR_ANALYSIS',
     passes,
     uploadedAt: uploadedAtIso,
@@ -1065,6 +1078,7 @@ export function clearDatabaseCache(): void {
   databaseCache.clear();
   inMemoryTenantDocs.clear();
   if (process.env.NODE_ENV === 'test') {
+    (db as any).collection = createInMemoryCollectionFactory('(default)');
     getTenantFirestore('(default)');
   }
 }

@@ -107,7 +107,7 @@ export async function uploadAndWaitForActiveFile(params: {
     } else if (!params.videoGcsUri.startsWith('gs://') && fs.existsSync(params.videoGcsUri)) {
       localFilePath = params.videoGcsUri;
     } else if (params.videoGcsUri.startsWith('gs://')) {
-      const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+      const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
       const normalizedGcsUri = params.videoGcsUri.replace(/^gs:\/\/[^/]+\//, `gs://${bucketName}/`);
       const tempId = safeVideoId || `vid_${Date.now()}`;
       downloadedTempPath = path.join(
@@ -230,7 +230,7 @@ export async function ensureGeminiFileRegistered(params: {
     if (!params.videoGcsUri.startsWith('gs://') && fs.existsSync(params.videoGcsUri)) {
       localFilePath = params.videoGcsUri;
     } else if (params.videoGcsUri.startsWith('gs://')) {
-      const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+      const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
       const normalizedGcsUri = params.videoGcsUri.replace(/^gs:\/\/[^/]+\//, `gs://${bucketName}/`);
       const cacheDir = path.join(os.tmpdir(), 'sail_normalized_cache');
       if (!fs.existsSync(cacheDir)) {

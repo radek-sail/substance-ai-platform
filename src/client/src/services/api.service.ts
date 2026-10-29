@@ -96,7 +96,7 @@ export interface SignOffResponse {
 
 export const DEFAULT_GCS_BUCKET: string =
   (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_GCS_BUCKET_NAME) ||
-  'sail-platform-videos';
+  'sail-platform-videos-prod';
 
 // Default tenant configuration
 export const DEFAULT_TENANT_CONFIG: TenantConfig = {
@@ -612,65 +612,27 @@ export class ApiService {
 
     const formData = new FormData();
     const fileName = options?.fileName || (file as File).name || `video_${Date.now()}.mp4`;
-    formData.append('file', file, fileName);
+    formData.append('video', file, fileName);
     if (options?.durationSeconds !== undefined) {
       formData.append('durationSeconds', String(options.durationSeconds));
     }
 
-    try {
-      const headers = await this.getHeaders({
-        'x-customer-id': customerId,
-        'x-database-id': databaseId,
-        'x-video-id': videoId,
-      });
-      const response = await fetch(`${this.baseUrl}/api/videos/upload`, {
-        method: 'POST',
-        headers,
-        body: formData,
-      });
+    const headers = await this.getHeaders({
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+      ...(options?.videoId ? { 'x-video-id': options.videoId } : {}),
+    });
+    const response = await fetch(`${this.baseUrl}/api/videos/upload`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
 
-      if (response.ok) {
-        return (await response.json()) as UploadVideoResponse;
-      }
-      const errText = await response.text();
-      throw new Error(`Upload failed (${response.status}): ${errText}`);
-    } catch (err: any) {
-      console.warn('[ApiService] Backend upload failed, generating simulated metadata:', err);
-      const bucket = this.tenant.bucketName || DEFAULT_GCS_BUCKET;
-      const rawGcsUri = `gs://${bucket}/uploads/${videoId}.mp4`;
-      const normalizedGcsUri = `gs://${bucket}/normalized/norm_${videoId}.mp4`;
-      const nowIso = new Date().toISOString();
-
-      const mockResult: UploadVideoResponse = {
-        success: true,
-        videoId,
-        status: 'READY_FOR_ANALYSIS',
-        originalName: fileName,
-        rawGcsUri,
-        originalGcsUri: rawGcsUri,
-        normalizedGcsUri,
-        customerId,
-        databaseId,
-        metadata: {
-          videoId,
-          customerId,
-          databaseId,
-          originalName: fileName,
-          rawGcsUri,
-          originalGcsUri: rawGcsUri,
-          normalizedGcsUri,
-          status: 'READY_FOR_ANALYSIS',
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          uploadedAt: nowIso,
-          transcodedAt: nowIso,
-          fileName,
-          fileSizeBytes: file.size,
-          durationSeconds: options?.durationSeconds,
-        },
-      };
-      return mockResult;
+    if (response.ok) {
+      return (await response.json()) as UploadVideoResponse;
     }
+    const errText = await response.text();
+    throw new Error(`Upload failed (${response.status}): ${errText}`);
   }
 
   /**

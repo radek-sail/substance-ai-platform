@@ -29,6 +29,7 @@ import {
   commitInventorySignOff,
   commitArchiveSignOff,
 } from '../services/firestore.service';
+import { downloadFromGcsUri } from '../services/storage.service';
 
 /**
  * Persists a pass JSON artifact to disk (`workflowClassification.json`, `workloadClassification.json`,
@@ -86,31 +87,47 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
     return res.status(400).json({ error: 'Missing required field: videoId' });
   }
 
-  const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+  const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
 
-  // Resolve normalizedGcsUri from request body or from Firestore videos/{videoId}
+  // Resolve normalized file path from request body or from Firestore videos/{videoId}
   let candidateGcsUri: string | undefined = videoGcsUri;
-  if (!candidateGcsUri) {
-    try {
-      const videoDoc =
-        (await getVideoMetadata(databaseId, videoId)) ||
-        (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null);
-      if (videoDoc?.normalizedGcsUri) {
-        candidateGcsUri = videoDoc.normalizedGcsUri;
+  let extractedPath: string | undefined;
+  try {
+    const videoDoc =
+      (await getVideoMetadata(databaseId, videoId)) ||
+      (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null);
+    if (!candidateGcsUri && videoDoc?.normalizedGcsUri) {
+      candidateGcsUri = videoDoc.normalizedGcsUri;
+    } else if (!candidateGcsUri && Array.isArray(videoDoc?.chunks) && videoDoc.chunks.length > 0) {
+      candidateGcsUri = videoDoc.chunks[0]?.gcsUri;
+    }
+    if (videoDoc?.normalizedPath) {
+      extractedPath = videoDoc.normalizedPath;
+    } else if (videoDoc?.rawPath) {
+      extractedPath = videoDoc.rawPath;
+    }
+  } catch {
+    // Ignore lookup errors on mocked Firestore instances
+  }
+
+  if (!extractedPath && candidateGcsUri && typeof candidateGcsUri === 'string') {
+    if (candidateGcsUri.startsWith('gs://')) {
+      const withoutScheme = candidateGcsUri.replace(/^gs:\/\//, '');
+      const firstSlash = withoutScheme.indexOf('/');
+      if (firstSlash !== -1) {
+        extractedPath = withoutScheme.substring(firstSlash + 1);
       }
-    } catch {
-      // Ignore lookup errors on mocked Firestore instances
+    } else {
+      extractedPath = candidateGcsUri;
     }
   }
 
-  if (!candidateGcsUri) {
-    candidateGcsUri = `gs://${bucketName}/normalized/norm_${videoId}.mp4`;
+  if (!extractedPath) {
+    extractedPath = `normalized/norm_${videoId}.mp4`;
   }
+  extractedPath = extractedPath.replace(/^\/+/, '');
 
-  const resolvedVideoGcsUri =
-    typeof candidateGcsUri === 'string' && candidateGcsUri.startsWith('gs://')
-      ? candidateGcsUri.replace(/^gs:\/\/[^/]+\//, `gs://${bucketName}/`)
-      : candidateGcsUri;
+  const resolvedVideoGcsUri = `gs://${bucketName}/${extractedPath}`;
 
   // Set video status in videos/{videoId} to ANALYZING
   await updateVideoRecord('(default)', videoId, {
@@ -248,7 +265,7 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
   }
 
   const { videoId, pass, videoGcsUri, localFilePath } = parsedReq.data;
-  const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+  const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
 
   // 1. Retrieve video metadata from videos/{videoId}
   const videoDoc =
@@ -256,16 +273,72 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
     (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null) ||
     {};
 
-  const candidateGcsUri =
+  // Extract relative file path from video metadata or candidate URI (e.g. normalized/norm_vid_...mp4)
+  // in case the Firestore video document contains an outdated GCS URI referencing a non-existent bucket.
+  let extractedPath = videoDoc.normalizedPath;
+  const firstChunkUri =
+    Array.isArray(videoDoc.chunks) && videoDoc.chunks.length > 0
+      ? videoDoc.chunks[0]?.gcsUri
+      : undefined;
+  const candidateUri =
     videoGcsUri ||
     videoDoc.normalizedGcsUri ||
-    (videoDoc.normalizedPath ? `gs://${videoDoc.gcsBucket || bucketName}/${videoDoc.normalizedPath}` : undefined) ||
-    `gs://${bucketName}/normalized/norm_${videoId}.mp4`;
+    firstChunkUri ||
+    videoDoc.rawGcsUri ||
+    videoDoc.originalGcsUri;
 
-  const resolvedVideoGcsUri =
-    typeof candidateGcsUri === 'string' && candidateGcsUri.startsWith('gs://')
-      ? candidateGcsUri.replace(/^gs:\/\/[^/]+\//, `gs://${bucketName}/`)
-      : candidateGcsUri;
+  if (!extractedPath && candidateUri && typeof candidateUri === 'string') {
+    if (candidateUri.startsWith('gs://')) {
+      const withoutScheme = candidateUri.replace(/^gs:\/\//, '');
+      const firstSlash = withoutScheme.indexOf('/');
+      if (firstSlash !== -1) {
+        extractedPath = withoutScheme.substring(firstSlash + 1);
+      }
+    } else {
+      extractedPath = candidateUri;
+    }
+  }
+
+  if (!extractedPath && videoDoc.rawPath) {
+    extractedPath = videoDoc.rawPath;
+  }
+
+  if (!extractedPath) {
+    extractedPath = `normalized/norm_${videoId}.mp4`;
+  }
+  extractedPath = extractedPath.replace(/^\/+/, '');
+
+  // Ensure Cloud Storage URI points to bucketName
+  const resolvedVideoGcsUri = `gs://${bucketName}/${extractedPath}`;
+
+  // If local video file is not already provided or on disk, download it from bucketName
+  let effectiveLocalVideoPath = localFilePath;
+  if (!effectiveLocalVideoPath || !fs.existsSync(effectiveLocalVideoPath)) {
+    const safeVideoId = (videoId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const cachedCandidates = safeVideoId
+      ? [
+          path.join('/tmp', 'sail_normalized_cache', `norm_${safeVideoId}.mp4`),
+          path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${safeVideoId}.mp4`),
+        ]
+      : [];
+    const foundCached = cachedCandidates.find((p) => fs.existsSync(p));
+    if (foundCached) {
+      effectiveLocalVideoPath = foundCached;
+    } else {
+      try {
+        const cacheDir = path.join(os.tmpdir(), 'sail_normalized_cache');
+        if (!fs.existsSync(cacheDir)) {
+          fs.mkdirSync(cacheDir, { recursive: true });
+        }
+        const targetDownloadedPath = path.join(cacheDir, `norm_${safeVideoId || Date.now()}.mp4`);
+        console.log(`[PipelineController] Pass 0: downloading video from GCS bucket "${bucketName}" (path: ${extractedPath}) to ${targetDownloadedPath}`);
+        await downloadFromGcsUri(resolvedVideoGcsUri, targetDownloadedPath);
+        effectiveLocalVideoPath = targetDownloadedPath;
+      } catch (dlErr) {
+        console.warn(`[PipelineController] Pass 0: could not pre-download from GCS bucket "${bucketName}":`, dlErr);
+      }
+    }
+  }
 
   let currentPasses: VideoPasses = {
     pass0: videoDoc.passes?.pass0 || { status: 'PENDING' },
@@ -283,13 +356,13 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
     const registration = await ensureGeminiFileRegistered({
       videoId,
       videoGcsUri: resolvedVideoGcsUri,
-      localVideoPath: localFilePath,
+      localVideoPath: effectiveLocalVideoPath,
       existingGeminiFileUri: videoDoc.geminiFileUri,
       existingGeminiFileName: videoDoc.geminiFileName,
     });
 
     const geminiFileUri = registration.geminiFileUri;
-    const effectiveLocalVideoPath = registration.localVideoPath || localFilePath;
+    effectiveLocalVideoPath = registration.localVideoPath || effectiveLocalVideoPath;
 
     // Cache geminiFileUri on videos/{videoId}
     const metaUpdates: Record<string, any> = {

@@ -111,9 +111,13 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   const [selectedVideoId, setSelectedVideoId] = useState<string | null>(activeStream);
 
   // Decoupled Upload & Transcoding State
+  const [uploading, setUploading] = useState<boolean>(false);
+  const [uploadProgress, setUploadProgress] = useState<string>('');
   const [uploadStep, setUploadStep] = useState<UploadStep>('IDLE');
   const [latestUploadedVideo, setLatestUploadedVideo] = useState<VideoRecord | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [transcodingVideoId, setTranscodingVideoId] = useState<string | null>(null);
+  const [pollingStoppedForActive, setPollingStoppedForActive] = useState<boolean>(false);
 
   // Per-video & per-pass AI Analysis State
   const [analyzingIds, setAnalyzingIds] = useState<Record<string, boolean>>({});
@@ -140,11 +144,13 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
   /**
    * Fetch persistent video registry from GET /api/videos on mount, refresh button click,
-   * and after video upload completion.
+   * and after video upload completion or background polling ticks.
    */
-  const fetchVideos = useCallback(async () => {
+  const fetchVideos = useCallback(async (showLoadingSpinner: boolean = true): Promise<VideoRecord[]> => {
     try {
-      setLoading(true);
+      if (showLoadingSpinner) {
+        setLoading(true);
+      }
       const res = await fetch('/api/videos');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
@@ -185,16 +191,87 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
           return list[0].videoId;
         });
       }
+      return list;
     } catch (err) {
       console.error('[VideoManager] Error fetching videos:', err);
+      return [];
     } finally {
-      setLoading(false);
+      if (showLoadingSpinner) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     fetchVideos();
   }, [fetchVideos]);
+
+  /**
+   * Poll GET /api/videos every 3-5 seconds while any video has status === 'TRANSCODING'.
+   * When the active video status becomes 'READY_FOR_ANALYSIS':
+   * - Stop polling.
+   * - Refresh the registry table so Pass 0 through Pass 3 can be executed.
+   */
+  useEffect(() => {
+    const hasTranscodingVideos = videos.some((v) => v.status === 'TRANSCODING');
+    if (!hasTranscodingVideos || pollingStoppedForActive) {
+      return;
+    }
+
+    const intervalId = setInterval(async () => {
+      try {
+        const list = await fetchVideos(false);
+        const currentActiveId = selectedVideoId || activeStreamId || transcodingVideoId;
+        const activeVid = list.find((v) => v.videoId === currentActiveId);
+
+        if (activeVid && activeVid.status === 'READY_FOR_ANALYSIS') {
+          console.log(
+            `[VideoManager] Active video ${currentActiveId} is now READY_FOR_ANALYSIS. Stopping polling.`
+          );
+          setPollingStoppedForActive(true);
+          setTranscodingVideoId(null);
+          setUploadStep('SAVED');
+          setUploading(false);
+          setUploadProgress('');
+          setLatestUploadedVideo(activeVid);
+          setStatusBanner(
+            `Video "${activeVid.originalName}" is ready for analysis (${activeVid.totalChunks ?? activeVid.chunks?.length ?? 1} chunk(s)). Pass 0 through Pass 3 can now be executed.`
+          );
+          // Refresh registry table so Pass 0 through Pass 3 can be executed
+          await fetchVideos(false);
+          if (onSelectActiveStream) {
+            onSelectActiveStream(activeVid, analysisCache[activeVid.videoId]);
+          }
+        } else if (activeVid && (activeVid.status === 'ERROR' || activeVid.status === 'FAILED')) {
+          console.error(
+            `[VideoManager] Active video ${currentActiveId} failed with status:`,
+            activeVid.status
+          );
+          setPollingStoppedForActive(true);
+          setTranscodingVideoId(null);
+          setUploadStep('ERROR');
+          setUploading(false);
+          setUploadProgress('');
+          setUploadError((activeVid as any).errorMessage || 'Video background transcoding failed');
+          setStatusBanner(null);
+          await fetchVideos(false);
+        }
+      } catch (pollErr) {
+        console.warn('[VideoManager] Polling /api/videos failed:', pollErr);
+      }
+    }, 4000);
+
+    return () => clearInterval(intervalId);
+  }, [
+    videos,
+    selectedVideoId,
+    activeStreamId,
+    transcodingVideoId,
+    pollingStoppedForActive,
+    fetchVideos,
+    onSelectActiveStream,
+    analysisCache,
+  ]);
 
   /**
    * Whenever selectedVideoId changes, sync its passes from GET /api/pipeline/passes/:videoId.
@@ -237,6 +314,13 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
   const handleSelectVideo = (video: VideoRecord) => {
     setActiveStream(video.videoId, video);
+    if (video.status === 'TRANSCODING') {
+      setPollingStoppedForActive(false);
+      setTranscodingVideoId(video.videoId);
+      setUploadStep('TRANSCODING');
+      setUploadProgress('Transcoding & segmenting video in background...');
+      setStatusBanner('Transcoding & segmenting video in background...');
+    }
   };
 
   const toggleJsonDrawer = (drawerKey: string) => {
@@ -246,109 +330,151 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     }));
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-      const file = e.target.files[0];
-      setSelectedFile(file);
-      setUploadStep('IDLE');
-      setLatestUploadedVideo(null);
-      setUploadError(null);
-
-      try {
-        const videoEl = document.createElement('video');
-        videoEl.preload = 'metadata';
-        const objectUrl = URL.createObjectURL(file);
-        videoEl.onloadedmetadata = () => {
-          URL.revokeObjectURL(objectUrl);
-          if (videoEl.duration && Number.isFinite(videoEl.duration)) {
-            setProbedDuration(Math.round(videoEl.duration));
-          }
-        };
-        videoEl.onerror = () => {
-          URL.revokeObjectURL(objectUrl);
-        };
-        videoEl.src = objectUrl;
-      } catch {
-        setProbedDuration(undefined);
-      }
+  const probeVideoDuration = (file: File) => {
+    try {
+      const videoEl = document.createElement('video');
+      videoEl.preload = 'metadata';
+      const objectUrl = URL.createObjectURL(file);
+      videoEl.onloadedmetadata = () => {
+        URL.revokeObjectURL(objectUrl);
+        if (videoEl.duration && Number.isFinite(videoEl.duration)) {
+          setProbedDuration(Math.round(videoEl.duration));
+        }
+      };
+      videoEl.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+      };
+      videoEl.src = objectUrl;
+    } catch {
+      setProbedDuration(undefined);
     }
   };
 
   /**
-   * Step 1 & 2: Upload raw video + FFmpeg container normalization ONLY.
-   * Persists `videos/{videoId}` in Firestore `(default)` with initial PENDING passes,
-   * immediately prepends `newVideo` to local `videos` state, selects it as active stream,
-   * and triggers `fetchVideos()` to synchronize with Firestore.
+   * Direct-to-GCS V4 Signed URL Upload & Chunked FFmpeg Normalization Flow:
+   * 1. Request signed URL: POST /api/videos/request-upload-url with file metadata.
+   * 2. Upload raw file directly to GCS via PUT to signedUrl.
+   * 3. Notify server to process 10-minute normalized chunks: POST /api/videos/finalize-upload.
+   * 4. Refresh video registry on success.
    */
-  const handleUploadVideo = async () => {
-    if (!selectedFile) return;
-
-    setUploadError(null);
-    setLatestUploadedVideo(null);
-    setUploadStep('UPLOADING');
-    setStatusBanner('Step 1/3: Uploading raw video stream to Cloud Storage...');
-
-    const stepTimer = setTimeout(() => {
-      setUploadStep((current) => (current === 'UPLOADING' ? 'TRANSCODING' : current));
-      setStatusBanner(
-        'Step 2/3: Running containerized FFmpeg normalization (H.264 CRF 17, 1080p, +faststart)...'
-      );
-    }, 650);
-
+  const uploadVideoFile = async (file: File) => {
     try {
-      const uploadRes: UploadVideoResponse = await apiService.uploadVideo(selectedFile, {
-        customerId: tenant.customerId,
-        databaseId: tenant.databaseId,
-        fileName: selectedFile.name,
-        durationSeconds: probedDuration,
+      setUploading(true);
+      const contentType = file.type || 'video/mp4';
+      setUploadProgress('Requesting signed GCS upload URL...');
+      console.log('[VideoManager] Starting direct-to-GCS upload for:', file.name, file.size);
+
+      setSelectedFile(file);
+      probeVideoDuration(file);
+      setUploadError(null);
+      setLatestUploadedVideo(null);
+      setUploadStep('UPLOADING');
+      setStatusBanner('Step 1/3: Requesting V4 Signed URL and uploading raw video directly to Cloud Storage...');
+
+      // 1. Request signed URL: POST /api/videos/request-upload-url
+      const urlRes = await fetch('/api/videos/request-upload-url', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          filename: file.name,
+          contentType,
+        }),
       });
 
-      clearTimeout(stepTimer);
-      setUploadStep('SAVED');
+      if (!urlRes.ok) {
+        const errJson = await urlRes.json().catch(() => ({}));
+        throw new Error(
+          errJson.error || `Failed to request upload URL (HTTP ${urlRes.status})`
+        );
+      }
 
-      const nowIso =
-        typeof uploadRes.uploadedAt === 'string'
-          ? uploadRes.uploadedAt
-          : new Date().toISOString();
-      const initialPasses = ensurePasses(uploadRes.passes || DEFAULT_VIDEO_PASSES);
-      const newVideo: VideoRecord = uploadRes.video || {
-        videoId: uploadRes.videoId,
-        originalName: uploadRes.originalName || selectedFile.name,
-        gcsBucket: uploadRes.gcsBucket || tenant.bucketName || DEFAULT_GCS_BUCKET,
-        rawPath: uploadRes.rawPath || `raw/${uploadRes.videoId}_${selectedFile.name}`,
-        normalizedPath: uploadRes.normalizedPath || `normalized/norm_${uploadRes.videoId}.mp4`,
-        rawGcsUri:
-          uploadRes.rawGcsUri ||
-          uploadRes.originalGcsUri ||
-          `gs://${tenant.bucketName || DEFAULT_GCS_BUCKET}/uploads/${uploadRes.videoId}.mp4`,
-        normalizedGcsUri: uploadRes.normalizedGcsUri,
-        durationSeconds: probedDuration ?? uploadRes.metadata?.durationSeconds,
-        fileSizeBytes: selectedFile.size,
-        status: uploadRes.status || 'READY_FOR_ANALYSIS',
-        passes: initialPasses,
-        organizationId: tenant.customerId,
-        uploadedBy: tenant.operatorInitials || 'RS',
-        uploadedAt: nowIso,
-        transcodedAt: nowIso,
-      };
+      const { videoId, signedUrl, rawGcsUri } = await urlRes.json();
 
-      setLatestUploadedVideo(newVideo);
-      setPassesByVideo((prev) => ({
-        ...prev,
-        [newVideo.videoId]: initialPasses,
-      }));
-      setVideos((prev) => [newVideo, ...prev.filter((v) => v.videoId !== newVideo.videoId)]);
-      await fetchVideos();
-      setActiveStream(newVideo.videoId, newVideo);
+      // 2. Upload raw file directly to GCS via PUT to V4 Signed URL
+      setUploadProgress('Uploading raw video directly to Google Cloud Storage...');
+      const putRes = await fetch(signedUrl, {
+        method: 'PUT',
+        body: file,
+        headers: {
+          'Content-Type': contentType,
+        },
+      });
 
-      setStatusBanner(
-        `Step 3/3: Video "${newVideo.originalName}" normalized and saved to Firestore videos/${newVideo.videoId}. Ready for step-by-step or full AI pass execution.`
-      );
+      if (!putRes.ok) {
+        throw new Error(`Direct GCS upload failed with HTTP status ${putRes.status}`);
+      }
+
+      // 3. Notify server to process chunks asynchronously: POST /api/videos/finalize-upload
+      setUploadStep('TRANSCODING');
+      setUploadProgress('Transcoding & segmenting video in background...');
+      setStatusBanner('Transcoding & segmenting video in background...');
+
+      const finalizeRes = await fetch('/api/videos/finalize-upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          videoId,
+          rawGcsUri,
+          originalName: file.name,
+        }),
+      });
+
+      // Handle HTTP 202 (or 200) from /api/videos/finalize-upload as successful initiation
+      if (!finalizeRes.ok && finalizeRes.status !== 202) {
+        const errJson = await finalizeRes.json().catch(() => ({}));
+        throw new Error(
+          errJson.error || `Finalize upload failed with HTTP status ${finalizeRes.status}`
+        );
+      }
+
+      const result = await finalizeRes.json();
+      console.log('[VideoManager] Async transcoding initiated (202 Accepted):', result);
+
+      const initiatedVideoId = result.videoId || videoId;
+      setTranscodingVideoId(initiatedVideoId);
+      setPollingStoppedForActive(false);
+
+      // Refresh registry so the initial TRANSCODING record is reflected immediately
+      await fetchVideos(false);
+
+      // Set active stream to the newly registered video ID returned by the backend
+      setActiveStream(initiatedVideoId);
+      setSelectedVideoId(initiatedVideoId);
     } catch (err: any) {
-      clearTimeout(stepTimer);
+      console.error('[VideoManager] Upload failed:', err);
       setUploadStep('ERROR');
-      setUploadError(err?.message || 'Failed to upload and transcode video');
+      setUploadError(err?.message || 'Upload failed');
       setStatusBanner(null);
+      setUploadProgress('');
+      alert(`Upload failed: ${err.message}`);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleFileUpload = uploadVideoFile;
+
+  const handleDragOver = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const file = e.dataTransfer.files?.[0];
+    if (file) {
+      uploadVideoFile(file);
+    }
+  };
+
+  const handleUploadVideo = async () => {
+    if (selectedFile) {
+      await uploadVideoFile(selectedFile);
     }
   };
 
@@ -359,7 +485,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
    * Does not mark COMPLETED until the backend request finishes.
    */
   const handleRunSinglePass = async (video: VideoRecord, passNum: 0 | 1 | 2 | 3) => {
-    const { videoId, normalizedGcsUri } = video;
+    const { videoId } = video;
+    const normalizedGcsUri = video.normalizedGcsUri || video.chunks?.[0]?.gcsUri;
     const passKey = `pass${passNum}` as keyof VideoPasses;
 
     setSelectedVideoId(videoId);
@@ -655,7 +782,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   };
 
   const isUploadingOrTranscoding =
-    uploadStep === 'UPLOADING' || uploadStep === 'TRANSCODING';
+    uploading || uploadStep === 'UPLOADING' || uploadStep === 'TRANSCODING';
 
   const selectedVideo =
     videos.find((v) => v.videoId === selectedVideoId) ||
@@ -733,12 +860,19 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         </div>
 
         {/* Drag & drop upload area */}
-        <label className="border-2 border-dashed border-slate-700 hover:border-cyan-500 rounded-2xl p-8 flex flex-col items-center justify-center cursor-pointer transition-colors bg-slate-950/60 hover:bg-slate-950 group">
+        <label
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
+          className="border-2 border-dashed border-slate-700 hover:border-cyan-500 rounded-2xl p-8 flex flex-col items-center justify-center cursor-pointer transition-colors bg-slate-950/60 hover:bg-slate-950 group"
+        >
           <input
             type="file"
             accept="video/*"
             className="hidden"
-            onChange={handleFileChange}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) uploadVideoFile(file);
+            }}
             disabled={isUploadingOrTranscoding}
           />
           <div className="w-14 h-14 rounded-full bg-slate-800 group-hover:bg-cyan-950 text-slate-400 group-hover:text-cyan-400 flex items-center justify-center transition-colors mb-3">
@@ -752,7 +886,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
               ? `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB${
                   probedDuration ? ` • Duration: ${formatDuration(probedDuration)}` : ''
                 }`
-              : 'Egocentric video recorded with head-mounted or benchtop camera'}
+              : 'Egocentric video recorded with head-mounted or benchtop camera (click or drag & drop)'}
           </span>
         </label>
 
@@ -777,7 +911,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                   <span>
                     {uploadStep === 'UPLOADING'
                       ? 'Uploading Raw Video...'
-                      : 'Transcoding / Normalizing (FFmpeg)...'}
+                      : 'Transcoding & segmenting video in background...'}
                   </span>
                 </>
               ) : (
@@ -827,7 +961,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 ) : (
                   <Clock className="w-4 h-4 text-slate-600 shrink-0" />
                 )}
-                <span>2. Transcoding / Normalizing (FFmpeg)</span>
+                <span>2. Transcoding & segmenting video in background...</span>
               </div>
 
               <div
@@ -881,7 +1015,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
           <button
             type="button"
-            onClick={fetchVideos}
+            onClick={() => { void fetchVideos(); }}
             disabled={isLoadingRegistry}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-mono border border-slate-700 transition-colors"
           >

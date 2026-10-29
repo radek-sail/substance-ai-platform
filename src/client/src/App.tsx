@@ -12,7 +12,7 @@ import {
   DEFAULT_REAGENTS,
   ReagentMapping,
 } from './components/archive/NotebookEditor';
-import { VideoManager } from './components/video/VideoManager';
+import { VideoManager } from './components/VideoManager';
 import { SignOffModal } from './components/review/SignOffModal';
 import {
   TenantConfig,

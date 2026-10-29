@@ -72,6 +72,7 @@ export const VideoStatusSchema = z.enum([
   'ANALYZING',
   'ANALYSIS_COMPLETE',
   'FAILED',
+  'ERROR',
 ]);
 export type VideoStatus = z.infer<typeof VideoStatusSchema>;
 
@@ -125,19 +126,29 @@ export const AnalyzePassRequestSchema = z.object({
 });
 export type AnalyzePassRequest = z.infer<typeof AnalyzePassRequestSchema>;
 
+export const VideoChunkSchema = z.object({
+  index: z.number(),
+  gcsUri: z.string(),
+});
+export type VideoChunk = z.infer<typeof VideoChunkSchema>;
+
 export const VideoRecordSchema = z.object({
   videoId: z.string(),
   originalName: z.string(),
+  bucketName: z.string().optional(),
   gcsBucket: z.string().optional(),
   rawPath: z.string().optional(),
   normalizedPath: z.string().optional(),
   rawGcsUri: z.string(),
-  normalizedGcsUri: z.string(),
+  normalizedGcsUri: z.string().optional(),
+  totalChunks: z.number().optional(),
+  chunks: z.array(VideoChunkSchema).optional(),
   geminiFileUri: z.string().optional(),
   geminiFileName: z.string().optional(),
   durationSeconds: z.number().optional(),
   fileSizeBytes: z.number().optional(),
   status: VideoStatusSchema,
+  errorMessage: z.string().optional(),
   passes: VideoPassesSchema.optional(),
   analysisId: z.string().optional(),
   organizationId: z.string().optional(),
@@ -152,15 +163,19 @@ export const VideoMetadataSchema = z.object({
   customerId: z.string().optional(),
   databaseId: z.string().optional(),
   originalName: z.string().optional(),
+  bucketName: z.string().optional(),
   gcsBucket: z.string().optional(),
   rawPath: z.string().optional(),
   normalizedPath: z.string().optional(),
   rawGcsUri: z.string().optional(),
-  originalGcsUri: z.string(),
-  normalizedGcsUri: z.string(),
+  originalGcsUri: z.string().optional(),
+  normalizedGcsUri: z.string().optional(),
+  totalChunks: z.number().optional(),
+  chunks: z.array(VideoChunkSchema).optional(),
   geminiFileUri: z.string().optional(),
   geminiFileName: z.string().optional(),
   status: z.string(),
+  errorMessage: z.string().optional(),
   passes: VideoPassesSchema.optional(),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
