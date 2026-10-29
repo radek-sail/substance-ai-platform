@@ -63,6 +63,101 @@ Raw / Normalized Video
 
 ---
 
+## Architecture & Video Ingestion
+
+The platform utilizes a decoupled, asynchronous video ingestion pipeline designed for high-resolution egocentric recordings (e.g., Meta Ray-Ban glasses capturing 10-bit HEVC variable-framerate footage up to 120fps) and large multi-gigabyte video files.
+
+```
+Browser Client                    Express Backend (Cloud Run)                 Google Cloud Storage (GCS)             Cloud Firestore
+      │                                       │                                           │                                │
+      │ 1. POST /api/videos/request-upload-url │                                           │                                │
+      ├──────────────────────────────────────►│                                           │                                │
+      │    Returns V4 Signed PUT URL          │                                           │                                │
+      │◄──────────────────────────────────────┤                                           │                                │
+      │                                       │                                           │                                │
+      │ 2. Direct HTTP PUT (raw video stream) │                                           │                                │
+      ├──────────────────────────────────────────────────────────────────────────────────►│ gs://<BUCKET>/raw/<videoId>/   │
+      │                                       │                                           │                                │
+      │ 3. POST /api/videos/finalize-upload   │                                           │                                │
+      ├──────────────────────────────────────►│ 4. Register status: 'TRANSCODING'         │                                │
+      │                                       ├───────────────────────────────────────────────────────────────────────────►│ videos/{videoId}
+      │    HTTP 202 Accepted                  │                                           │                                │
+      │◄──────────────────────────────────────┤ 5. Background download & FFmpeg transcode │                                │
+      │                                       │    - 8-bit format=yuv420p                 │                                │
+      │                                       │    - Cap framerate: -r 30                 │                                │
+      │                                       │    - Preset: ultrafast, CRF: 23           │                                │
+      │                                       │    - 10-min chunk segmentation            │                                │
+      │                                       │                                           │                                │
+      │                                       │ 6. Upload 10-minute normalized chunks     │                                │
+      │                                       ├──────────────────────────────────────────►│ normalized/<videoId>/chunk_*.mp4│
+      │                                       │                                           │                                │
+      │                                       │ 7. Update status: 'READY_FOR_ANALYSIS'    │                                │
+      │                                       ├───────────────────────────────────────────────────────────────────────────►│ videos/{videoId}
+```
+
+### Direct-to-GCS Presigned URLs
+- Client calls `POST /api/videos/request-upload-url` to receive a Google Cloud Storage V4 Signed URL.
+- Raw video files (including large >2GB files) stream directly from the browser to `gs://<BUCKET_NAME>/raw/<videoId>/`, completely bypassing Express server memory to eliminate Cloud Run Out-Of-Memory (OOM) crashes.
+
+### Asynchronous Containerized Transcoding
+- Client notifies the backend via `POST /api/videos/finalize-upload`.
+- The endpoint registers the video in Cloud Firestore `videos/{videoId}` with `status: 'TRANSCODING'` and immediately returns `HTTP 202 Accepted` to prevent HTTP 504 gateway timeouts.
+- The server downloads the raw file, executes containerized FFmpeg to normalize the video (forcing 8-bit `format=yuv420p`, capping framerate at 30fps with `-r 30`, and using `-preset ultrafast`), and splits the stream into 10-minute segments.
+- Segments are uploaded to `gs://<BUCKET_NAME>/normalized/<videoId>/chunk_%03d.mp4`, and the Firestore document status transitions to `READY_FOR_ANALYSIS`.
+
+---
+
+## Deployment & Cloud Run Configuration
+
+Cloud Run requires explicit runtime flags to prevent container execution from being throttled between requests and to supply adequate compute resources for containerized FFmpeg transcoding.
+
+### Deployment / Update Command
+```bash
+gcloud run services update sail-platform \
+  --region us-west1 \
+  --no-cpu-throttling \
+  --timeout=3600 \
+  --cpu=2 \
+  --memory=2Gi
+```
+
+### Runtime Flag Requirements
+- `--no-cpu-throttling`: Guarantees container CPU remains fully allocated after returning HTTP 202 so background FFmpeg transcoding runs continuously.
+- `--timeout=3600`: Increases request timeout threshold to 60 minutes.
+- `--cpu=2` and `--memory=2Gi`: Provides the necessary compute power and memory for FFmpeg decoding and chunking.
+
+---
+
+## Google Cloud Storage & IAM Prerequisites
+
+Browser uploads via presigned URLs and server-side V4 signing require specific bucket CORS configuration and IAM roles on Google Cloud.
+
+### Bucket CORS Configuration
+To apply bucket CORS for browser uploads:
+```bash
+gcloud storage buckets update gs://<BUCKET_NAME> --cors-file=config/gcs-cors.json
+```
+
+`config/gcs-cors.json` permits `GET`, `PUT`, `POST`, `HEAD`, `OPTIONS` from `*` with headers `Content-Type` and `x-goog-resumable`:
+```json
+[
+  {
+    "origin": ["*"],
+    "method": ["GET", "PUT", "POST", "HEAD", "OPTIONS"],
+    "responseHeader": ["Content-Type", "x-goog-resumable"],
+    "maxAgeSeconds": 3600
+  }
+]
+```
+
+### Required IAM Roles
+The Cloud Run runtime service account (`<PROJECT_NUMBER>-compute@developer.gserviceaccount.com`) requires the following IAM roles:
+- `roles/datastore.user` (Firestore native read/write)
+- `roles/storage.objectAdmin` (GCS bucket read/write)
+- `roles/iam.serviceAccountTokenCreator` (Required by the GCS SDK to generate V4 signed PUT URLs via `signBlob`)
+
+---
+
 ## 📁 Repository Layout
 
 ```text
@@ -70,7 +165,8 @@ substance-ai-platform/
 ├── config/                                  # Versioned multi-pass prompts & agent guidelines
 │   ├── classification-agent-guidelines.md   # Pass 0 classifier rules
 │   ├── inventory-agent-guidelines.md        # Cryo-inventory tracking rules
-│   └── archive-agent-guidelines.md          # Experiment mixing & seeding rules
+│   ├── archive-agent-guidelines.md          # Experiment mixing & seeding rules
+│   └── gcs-cors.json                        # GCS CORS policy for direct browser uploads
 ├── src/
 │   ├── client/                              # Vite + React 18+ SPA
 │   │   ├── components/                      # Common UI, Inventory, Archive, Timeline
