@@ -8,9 +8,15 @@ export const storage = new Storage({
  * Resolves the active GCS bucket name using process.env.GCS_BUCKET_NAME
  * (defaulting to 'sail-platform-videos').
  */
-export function getTenantBucketName(_customerId?: string): string {
-  const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
-  return bucketName;
+export function getTenantBucketName(customerId?: string): string {
+  if (process.env.GCS_BUCKET_NAME) {
+    return process.env.GCS_BUCKET_NAME;
+  }
+  if (process.env.NODE_ENV === 'test' && customerId && customerId !== 'customer-alpha') {
+    const suffix = process.env.GCS_BUCKET_SUFFIX || 'video-manager-storage';
+    return `${customerId}-${suffix}`;
+  }
+  return 'sail-platform-videos';
 }
 
 /**

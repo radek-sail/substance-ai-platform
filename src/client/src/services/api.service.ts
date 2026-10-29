@@ -8,8 +8,17 @@ import {
   type ArchiveSignOffPayload,
   ArchiveSignOffPayloadSchema,
   type VideoMetadata,
+  type VideoRecord,
+  type VideoStatus,
+  type VideoPasses,
+  type PassStepState,
+  type PassStatus,
+  DEFAULT_VIDEO_PASSES,
 } from '@sail/shared';
 import { auth } from '../firebase';
+
+export type { VideoRecord, VideoStatus, VideoPasses, PassStepState, PassStatus };
+export { DEFAULT_VIDEO_PASSES };
 
 export interface TenantConfig {
   customerId: string;
@@ -25,18 +34,49 @@ export interface ApiClientOptions {
 }
 
 export interface UploadVideoResponse {
+  success?: boolean;
+  video?: VideoRecord;
+  videoId: string;
+  status: VideoStatus;
+  originalName: string;
+  gcsBucket?: string;
+  rawPath?: string;
+  normalizedPath?: string;
+  uploadedAt?: string | number;
+  transcodedAt?: string | number;
+  passes?: VideoPasses;
+  rawGcsUri: string;
+  originalGcsUri?: string;
+  normalizedGcsUri: string;
+  customerId?: string;
+  databaseId?: string;
+  metadata?: VideoMetadata;
+}
+
+export interface RunPassResponse {
   success: boolean;
   videoId: string;
-  customerId: string;
-  databaseId: string;
-  originalGcsUri: string;
-  normalizedGcsUri: string;
-  metadata: VideoMetadata;
+  pass: 0 | 1 | 2 | 3 | 'all';
+  status: VideoStatus;
+  geminiFileUri?: string;
+  data: any;
+  passes: VideoPasses;
+  analysis?: VideoAnalysisDoc;
+}
+
+export interface VideoPassesResponse {
+  videoId: string;
+  status: VideoStatus;
+  geminiFileUri?: string;
+  passes: VideoPasses;
 }
 
 export interface TriggerAnalysisResponse {
   success: boolean;
   videoId: string;
+  analysisId?: string;
+  status?: VideoStatus;
+  passes?: VideoPasses;
   summary: {
     workflowType: string;
     actionCount: number;
@@ -349,15 +389,56 @@ export class ApiService {
   }
 
   /**
+   * GET all uploaded/transcoded videos from `/api/videos` ordered by `uploadedAt desc`.
+   */
+  public async fetchVideos(options?: { customerId?: string; databaseId?: string }): Promise<VideoRecord[]> {
+    const databaseId = options?.databaseId || this.tenant.databaseId;
+    const customerId = options?.customerId || this.tenant.customerId;
+
+    try {
+      const headers = await this.getHeaders({
+        'x-customer-id': customerId,
+        'x-database-id': databaseId,
+      });
+      const response = await fetch(`${this.baseUrl}/api/videos`, {
+        method: 'GET',
+        headers,
+      });
+
+      if (response.ok) {
+        const json = await response.json();
+        if (Array.isArray(json)) {
+          return json as VideoRecord[];
+        }
+        if (json && Array.isArray(json.videos)) {
+          return json.videos as VideoRecord[];
+        }
+      }
+    } catch (err) {
+      console.warn('[ApiService] Failed to fetch videos from /api/videos:', err);
+    }
+
+    return [];
+  }
+
+  /**
    * GET analysis document from `/databases/{databaseId}/documents/video_analyses/{videoId}`.
+   * For uploaded videos, fetches from Firestore `video_analyses/{videoId}` (or synthesizes from completed
+   * Pass 2 / Pass 3 outputs in `videos/{videoId}.passes`) without falling back to mock `vid_cryo_demo_01`.
    */
   public async fetchVideoAnalysis(
     videoId: string,
     options?: { customerId?: string; databaseId?: string }
   ): Promise<VideoAnalysisDoc> {
-    const databaseId = options?.databaseId || this.tenant.databaseId;
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
     const customerId = options?.customerId || this.tenant.customerId;
-    const url = `${this.baseUrl}/databases/${databaseId}/documents/video_analyses/${videoId}`;
+    const url = `${this.baseUrl}/databases/${encodeURIComponent(databaseId)}/documents/video_analyses/${encodeURIComponent(videoId)}`;
+
+    const isDemoStream =
+      videoId === 'vid_cryo_demo_01' ||
+      videoId === 'vid_archive_demo_01' ||
+      videoId === 'vid_archive_demo_02';
 
     try {
       const headers = await this.getHeaders({
@@ -377,23 +458,153 @@ export class ApiService {
         }
         return json as VideoAnalysisDoc;
       }
+
+      // If `video_analyses/{videoId}` is not yet written, check if Pass 2 or Pass 3 has completed in `videos/{videoId}.passes`
+      if (!isDemoStream) {
+        try {
+          const passesRes = await this.fetchVideoPasses(videoId, { customerId, databaseId });
+          const p = passesRes?.passes;
+          if (
+            p &&
+            (p.pass2?.status === 'COMPLETED' || p.pass3?.status === 'COMPLETED')
+          ) {
+            const classification = p.pass0?.data || {
+              workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+              transcribedAudio: '',
+            };
+            return {
+              videoId,
+              workflowClassification: classification,
+              workloadClassification: classification,
+              actions: Array.isArray(p.pass1?.data) ? p.pass1.data : [],
+              events: Array.isArray(p.pass2?.data) ? p.pass2.data : [],
+              refinements: Array.isArray(p.pass3?.data) ? p.pass3.data : [],
+              isSignedOff: p.hitl?.status === 'COMPLETED',
+              updatedAt: p.pass3?.completedAt || p.pass2?.completedAt || new Date().toISOString(),
+            };
+          }
+        } catch {
+          // Ignore pass fallback error
+        }
+
+        // Return an empty analysis record for the active uploaded video rather than mock vid_cryo_demo_01
+        return {
+          videoId,
+          actions: [],
+          events: [],
+          refinements: [],
+          isSignedOff: false,
+          updatedAt: new Date().toISOString(),
+        };
+      }
     } catch (err) {
+      if (!isDemoStream) {
+        console.warn(`[ApiService] Network fetch failed for ${url}:`, err);
+        return {
+          videoId,
+          actions: [],
+          events: [],
+          refinements: [],
+          isSignedOff: false,
+          updatedAt: new Date().toISOString(),
+        };
+      }
       console.warn(`[ApiService] Network fetch failed for ${url}, falling back to built-in sample`, err);
     }
 
-    // Built-in sample fallback for development and offline demo
-    if (videoId === 'vid_archive_demo_02' || videoId.includes('archive')) {
+    // Built-in sample fallback only for explicit demo streams
+    if (videoId === 'vid_archive_demo_02' || videoId === 'vid_archive_demo_01' || videoId.includes('archive')) {
       return { ...SAMPLE_ARCHIVE_ANALYSIS, videoId };
     }
     return { ...SAMPLE_INVENTORY_ANALYSIS, videoId };
   }
 
   /**
+   * GET current pass statuses and outputs from `/api/pipeline/passes/:videoId`.
+   */
+  public async fetchVideoPasses(
+    videoId: string,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<VideoPassesResponse> {
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
+    const customerId = options?.customerId || this.tenant.customerId;
+
+    const headers = await this.getHeaders({
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+    });
+    const response = await fetch(
+      `${this.baseUrl}/api/pipeline/passes/${encodeURIComponent(videoId)}`,
+      {
+        method: 'GET',
+        headers,
+      }
+    );
+
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to fetch passes for ${videoId} (${response.status})`);
+    }
+
+    return (await response.json()) as VideoPassesResponse;
+  }
+
+  /**
+   * POST to `/api/pipeline/analyze-pass`.
+   * Executes a single pass (`0 | 1 | 2 | 3`) or all passes sequentially (`"all"`).
+   * Does not mark completed until the backend request finishes.
+   */
+  public async runPipelinePass(
+    videoId: string,
+    pass: 0 | 1 | 2 | 3 | 'all',
+    options?: { customerId?: string; databaseId?: string; videoGcsUri?: string }
+  ): Promise<RunPassResponse> {
+    const customerId = options?.customerId || this.tenant.customerId;
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
+
+    const headers = await this.getHeaders({
+      'Content-Type': 'application/json',
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+    });
+
+    const response = await fetch(`${this.baseUrl}/api/pipeline/analyze-pass`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        videoId,
+        pass,
+        ...(options?.videoGcsUri ? { videoGcsUri: options.videoGcsUri } : {}),
+        customerId,
+        databaseId,
+      }),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => ({}));
+      throw new Error(
+        errBody.error || `Pass ${pass} execution failed (${response.status})`
+      );
+    }
+
+    return (await response.json()) as RunPassResponse;
+  }
+
+  /**
    * POST to `/api/videos/upload`.
+   * Decoupled ingestion: uploads raw video, runs FFmpeg normalization, persists `READY_FOR_ANALYSIS` in Firestore `videos/{videoId}`.
    */
   public async uploadVideo(
     file: File | Blob,
-    options?: { customerId?: string; databaseId?: string; videoId?: string; fileName?: string }
+    options?: {
+      customerId?: string;
+      databaseId?: string;
+      videoId?: string;
+      fileName?: string;
+      durationSeconds?: number;
+    }
   ): Promise<UploadVideoResponse> {
     const customerId = options?.customerId || this.tenant.customerId;
     const databaseId = options?.databaseId || this.tenant.databaseId;
@@ -402,6 +613,9 @@ export class ApiService {
     const formData = new FormData();
     const fileName = options?.fileName || (file as File).name || `video_${Date.now()}.mp4`;
     formData.append('file', file, fileName);
+    if (options?.durationSeconds !== undefined) {
+      formData.append('durationSeconds', String(options.durationSeconds));
+    }
 
     try {
       const headers = await this.getHeaders({
@@ -422,24 +636,37 @@ export class ApiService {
       throw new Error(`Upload failed (${response.status}): ${errText}`);
     } catch (err: any) {
       console.warn('[ApiService] Backend upload failed, generating simulated metadata:', err);
-      // Simulated response for decoupled frontend operations
+      const bucket = this.tenant.bucketName || DEFAULT_GCS_BUCKET;
+      const rawGcsUri = `gs://${bucket}/uploads/${videoId}.mp4`;
+      const normalizedGcsUri = `gs://${bucket}/normalized/norm_${videoId}.mp4`;
+      const nowIso = new Date().toISOString();
+
       const mockResult: UploadVideoResponse = {
         success: true,
         videoId,
+        status: 'READY_FOR_ANALYSIS',
+        originalName: fileName,
+        rawGcsUri,
+        originalGcsUri: rawGcsUri,
+        normalizedGcsUri,
         customerId,
         databaseId,
-        originalGcsUri: `gs://${this.tenant.bucketName || DEFAULT_GCS_BUCKET}/uploads/${videoId}.mp4`,
-        normalizedGcsUri: `gs://${this.tenant.bucketName || DEFAULT_GCS_BUCKET}/normalized/norm_${videoId}.mp4`,
         metadata: {
           videoId,
           customerId,
           databaseId,
-          originalGcsUri: `gs://${this.tenant.bucketName || DEFAULT_GCS_BUCKET}/uploads/${videoId}.mp4`,
-          normalizedGcsUri: `gs://${this.tenant.bucketName || DEFAULT_GCS_BUCKET}/normalized/norm_${videoId}.mp4`,
-          status: 'NORMALIZED',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
+          originalName: fileName,
+          rawGcsUri,
+          originalGcsUri: rawGcsUri,
+          normalizedGcsUri,
+          status: 'READY_FOR_ANALYSIS',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          uploadedAt: nowIso,
+          transcodedAt: nowIso,
           fileName,
+          fileSizeBytes: file.size,
+          durationSeconds: options?.durationSeconds,
         },
       };
       return mockResult;
@@ -447,52 +674,65 @@ export class ApiService {
   }
 
   /**
-   * POST to `/api/pipeline/analyze`.
+   * POST to `/api/pipeline/analyze-pass` with `pass: 'all'` (or `/api/pipeline/analyze`).
+   * Accepts `{ videoId }` (and optional `videoGcsUri`) to run the Gemini multi-pass analysis pipeline on demand.
    */
   public async triggerAnalysis(
     videoId: string,
-    videoGcsUri: string,
+    videoGcsUri?: string,
     options?: { customerId?: string; databaseId?: string }
   ): Promise<TriggerAnalysisResponse> {
     const customerId = options?.customerId || this.tenant.customerId;
-    const databaseId = options?.databaseId || this.tenant.databaseId;
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
 
-    try {
-      const headers = await this.getHeaders({
-        'Content-Type': 'application/json',
-        'x-customer-id': customerId,
-        'x-database-id': databaseId,
-      });
-      const response = await fetch(`${this.baseUrl}/api/pipeline/analyze`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          videoId,
-          videoGcsUri,
-          customerId,
-          databaseId,
-        }),
-      });
+    const headers = await this.getHeaders({
+      'Content-Type': 'application/json',
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+    });
+    const response = await fetch(`${this.baseUrl}/api/pipeline/analyze-pass`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        videoId,
+        pass: 'all',
+        ...(videoGcsUri ? { videoGcsUri } : {}),
+        customerId,
+        databaseId,
+      }),
+    });
 
-      if (response.ok) {
-        return (await response.json()) as TriggerAnalysisResponse;
-      }
-    } catch (err) {
-      console.warn('[ApiService] Analysis trigger network call failed, falling back to sample:', err);
+    if (response.ok) {
+      const json = await response.json();
+      const analysis = json.analysis || {
+        videoId,
+        workloadClassification: json.passes?.pass0?.data,
+        workflowClassification: json.passes?.pass0?.data,
+        actions: json.passes?.pass1?.data || [],
+        events: json.passes?.pass2?.data || [],
+        refinements: json.passes?.pass3?.data || [],
+        isSignedOff: false,
+      };
+      return {
+        success: true,
+        videoId,
+        analysisId: videoId,
+        status: json.status || 'ANALYSIS_COMPLETE',
+        passes: json.passes,
+        summary: json.summary || {
+          workflowType:
+            analysis.workloadClassification?.workflowType || 'INVENTORY_UPDATE_WORKFLOW',
+          actionCount: (analysis.actions || []).length,
+          eventCount: (analysis.events || []).length,
+          refinementCount: (analysis.refinements || []).length,
+        },
+        analysis,
+      };
     }
 
-    const sample = videoId.includes('archive') ? SAMPLE_ARCHIVE_ANALYSIS : SAMPLE_INVENTORY_ANALYSIS;
-    return {
-      success: true,
-      videoId,
-      summary: {
-        workflowType: sample.workloadClassification?.workflowType || 'INVENTORY_UPDATE_WORKFLOW',
-        actionCount: sample.actions.length,
-        eventCount: sample.events.length,
-        refinementCount: sample.refinements.length,
-      },
-      analysis: { ...sample, videoId },
-    };
+    const errBody = await response.json().catch(() => ({}));
+    throw new Error(errBody.error || `Pipeline analysis failed (${response.status})`);
   }
 
   /**
@@ -610,17 +850,35 @@ export class ApiService {
 // Export singleton instance and convenience functions
 export const apiService = new ApiService();
 
+export const fetchVideos = (options?: { customerId?: string; databaseId?: string }) =>
+  apiService.fetchVideos(options);
+
+export const fetchVideoPasses = (videoId: string, options?: { customerId?: string; databaseId?: string }) =>
+  apiService.fetchVideoPasses(videoId, options);
+
+export const runPipelinePass = (
+  videoId: string,
+  pass: 0 | 1 | 2 | 3 | 'all',
+  options?: { customerId?: string; databaseId?: string; videoGcsUri?: string }
+) => apiService.runPipelinePass(videoId, pass, options);
+
 export const fetchVideoAnalysis = (videoId: string, options?: { customerId?: string; databaseId?: string }) =>
   apiService.fetchVideoAnalysis(videoId, options);
 
 export const uploadVideo = (
   file: File | Blob,
-  options?: { customerId?: string; databaseId?: string; videoId?: string; fileName?: string }
+  options?: {
+    customerId?: string;
+    databaseId?: string;
+    videoId?: string;
+    fileName?: string;
+    durationSeconds?: number;
+  }
 ) => apiService.uploadVideo(file, options);
 
 export const triggerAnalysis = (
   videoId: string,
-  videoGcsUri: string,
+  videoGcsUri?: string,
   options?: { customerId?: string; databaseId?: string }
 ) => apiService.triggerAnalysis(videoId, videoGcsUri, options);
 
@@ -637,7 +895,6 @@ export const commitArchiveSignOff = (
   archiveId: string,
   markdownDoc: string
 ) => apiService.commitArchiveSignOff(databaseId, videoId, archiveId, markdownDoc);
-
 
 /**
  * Compiles a structured Experiment Notebook Markdown document (`## Description`, `## Reagents Used`, `## Experiment Steps`)
@@ -715,7 +972,7 @@ export function generateInventorySignOffPayload(
     inventoryId?: string;
     boxId?: string;
     operatorInitials?: string;
-  bucketName?: string;
+    bucketName?: string;
     signedOffAt?: string;
   } = {}
 ): InventorySignOffPayload {
@@ -802,7 +1059,7 @@ export function generateArchiveSignOffPayload(
     archiveId?: string;
     markdownDoc?: string;
     operatorInitials?: string;
-  bucketName?: string;
+    bucketName?: string;
     signedOffAt?: string;
   } = {}
 ): ArchiveSignOffPayload {

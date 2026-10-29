@@ -4,6 +4,7 @@ import { VideoPlayer } from './components/timeline/VideoPlayer';
 import { TimelineViewer } from './components/timeline/TimelineViewer';
 import { BoxGridView } from './components/inventory/BoxGridView';
 import { VialInspector, HumanEditedVialData } from './components/inventory/VialInspector';
+import { CryoInventory } from './components/inventory/CryoInventory';
 import { MicroplateView } from './components/archive/MicroplateView';
 import {
   NotebookEditor,
@@ -11,7 +12,7 @@ import {
   DEFAULT_REAGENTS,
   ReagentMapping,
 } from './components/archive/NotebookEditor';
-import { VideoManagerView } from './components/video/VideoManagerView';
+import { VideoManager } from './components/video/VideoManager';
 import { SignOffModal } from './components/review/SignOffModal';
 import {
   TenantConfig,
@@ -22,7 +23,7 @@ import {
   SAMPLE_ARCHIVE_ANALYSIS,
   compileArchiveMarkdownFromAnalysis,
 } from './services/api.service';
-import type { VideoAnalysisDoc } from '@sail/shared';
+import type { VideoAnalysisDoc, VideoRecord } from '@sail/shared';
 import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import { CheckCircle2, AlertCircle, Info, Lock, Loader2, LogOut } from 'lucide-react';
 import { auth } from './firebase';
@@ -137,45 +138,129 @@ export const App: React.FC = () => {
     }
   };
 
-  // Switch video stream when tab changes only if currently viewing a built-in demo stream
-  const handleSelectTab = (tab: WorkflowTab) => {
+  // Switch video stream when tab changes, or fetch analysis for selected active stream
+  const handleSelectTab = async (tab: WorkflowTab) => {
     setActiveTab(tab);
-    const isDemoStream =
-      activeVideoId === 'vid_cryo_demo_01' || activeVideoId === 'vid_archive_demo_02';
-    if (!isDemoStream) {
+    if (tab === 'videos') {
       return;
     }
-    if (tab === 'inventory' && activeVideoId !== 'vid_cryo_demo_01') {
-      applyAnalysisDocument('vid_cryo_demo_01', SAMPLE_INVENTORY_ANALYSIS, 'inventory');
-    } else if (tab === 'archive' && activeVideoId !== 'vid_archive_demo_02') {
-      applyAnalysisDocument('vid_archive_demo_02', SAMPLE_ARCHIVE_ANALYSIS, 'archive');
+
+    const isDemoStream =
+      activeVideoId === 'vid_cryo_demo_01' || activeVideoId === 'vid_archive_demo_02';
+    if (isDemoStream) {
+      if (tab === 'inventory' && activeVideoId !== 'vid_cryo_demo_01') {
+        applyAnalysisDocument('vid_cryo_demo_01', SAMPLE_INVENTORY_ANALYSIS, 'inventory');
+      } else if (tab === 'archive' && activeVideoId !== 'vid_archive_demo_02') {
+        applyAnalysisDocument('vid_archive_demo_02', SAMPLE_ARCHIVE_ANALYSIS, 'archive');
+      }
+      return;
+    }
+
+    // Ensure the active stream's analysis document from Firestore is loaded
+    if (!analysis || analysis.videoId !== activeVideoId) {
+      try {
+        const fetchedDoc = await apiService.fetchVideoAnalysis(activeVideoId, {
+          customerId: tenant.customerId,
+          databaseId: tenant.databaseId,
+        });
+        applyAnalysisDocument(activeVideoId, fetchedDoc, tab);
+      } catch {
+        // Stream may not have completed AI analysis yet
+      }
     }
   };
 
-  // Handle switching video from Video Manager (or upon analysis completion)
-  const handleSelectVideoFromManager = async (
-    videoId: string,
-    targetTab: 'inventory' | 'archive',
-    analysisDoc?: VideoAnalysisDoc
+  // Handle selecting any video from the registry as the global Active Stream
+  const handleSelectActiveStream = async (
+    video: VideoRecord,
+    cachedAnalysis?: VideoAnalysisDoc
   ) => {
+    const videoId = video.videoId;
     setActiveVideoId(videoId);
-    setActiveTab(targetTab);
 
-    if (analysisDoc) {
-      applyAnalysisDocument(videoId, analysisDoc, targetTab);
-      showToast('info', `Loaded stream ${videoId} into ${targetTab} manager`);
+    if (cachedAnalysis) {
+      applyAnalysisDocument(videoId, cachedAnalysis);
+      showToast('info', `Selected active stream: ${videoId}`);
       return;
     }
 
     if (videoId === 'vid_cryo_demo_01') {
       applyAnalysisDocument(videoId, SAMPLE_INVENTORY_ANALYSIS, 'inventory');
-      showToast('info', `Loaded stream ${videoId} into ${targetTab} manager`);
+      showToast('info', `Selected active stream: ${videoId}`);
       return;
     }
 
     if (videoId === 'vid_archive_demo_02') {
       applyAnalysisDocument(videoId, SAMPLE_ARCHIVE_ANALYSIS, 'archive');
-      showToast('info', `Loaded stream ${videoId} into ${targetTab} manager`);
+      showToast('info', `Selected active stream: ${videoId}`);
+      return;
+    }
+
+    const hasCompletedInventoryPasses =
+      video.status === 'ANALYSIS_COMPLETE' ||
+      Boolean(video.analysisId) ||
+      video.passes?.pass2?.status === 'COMPLETED' ||
+      video.passes?.pass3?.status === 'COMPLETED';
+
+    if (hasCompletedInventoryPasses) {
+      try {
+        const fetchedDoc = await apiService.fetchVideoAnalysis(videoId, {
+          customerId: tenant.customerId,
+          databaseId: tenant.databaseId,
+        });
+        applyAnalysisDocument(videoId, fetchedDoc);
+        showToast('info', `Selected active stream: ${videoId}`);
+      } catch {
+        setAnalysis(null);
+        showToast('info', `Selected active stream: ${videoId}`);
+      }
+    } else {
+      setAnalysis(null);
+      setIsSignedOff(false);
+      showToast('info', `Selected active stream: ${videoId} (awaiting AI analysis)`);
+    }
+  };
+
+  // Handle switching video from Video Manager (or upon analysis completion / HITL sign-off review)
+  const handleSelectVideoFromManager = async (
+    videoId: string,
+    targetTab: 'inventory' | 'archive' | 'hitl',
+    analysisDoc?: VideoAnalysisDoc
+  ) => {
+    const resolvedTab: WorkflowTab =
+      targetTab === 'hitl'
+        ? analysisDoc?.workflowClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+          analysisDoc?.workloadClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+          videoId.toLowerCase().includes('archive')
+          ? 'archive'
+          : 'inventory'
+        : targetTab;
+
+    setActiveVideoId(videoId);
+    setActiveTab(resolvedTab);
+
+    if (analysisDoc) {
+      applyAnalysisDocument(videoId, analysisDoc, resolvedTab);
+      if (targetTab === 'hitl') {
+        setIsSignOffModalOpen(true);
+        showToast('info', `Opened HITL Sign-Off review for ${videoId}`);
+      } else {
+        showToast('info', `Loaded stream ${videoId} into ${resolvedTab} manager`);
+      }
+      return;
+    }
+
+    if (videoId === 'vid_cryo_demo_01') {
+      applyAnalysisDocument(videoId, SAMPLE_INVENTORY_ANALYSIS, 'inventory');
+      if (targetTab === 'hitl') setIsSignOffModalOpen(true);
+      showToast('info', `Loaded stream ${videoId} into ${resolvedTab} manager`);
+      return;
+    }
+
+    if (videoId === 'vid_archive_demo_02') {
+      applyAnalysisDocument(videoId, SAMPLE_ARCHIVE_ANALYSIS, 'archive');
+      if (targetTab === 'hitl') setIsSignOffModalOpen(true);
+      showToast('info', `Loaded stream ${videoId} into ${resolvedTab} manager`);
       return;
     }
 
@@ -185,10 +270,19 @@ export const App: React.FC = () => {
         customerId: tenant.customerId,
         databaseId: tenant.databaseId,
       });
-      applyAnalysisDocument(videoId, fetchedDoc, targetTab);
-      showToast('info', `Loaded stream ${videoId} into ${targetTab} manager`);
+      applyAnalysisDocument(videoId, fetchedDoc, resolvedTab);
+      if (targetTab === 'hitl') {
+        setIsSignOffModalOpen(true);
+        showToast('info', `Opened HITL Sign-Off review for ${videoId}`);
+      } else {
+        showToast('info', `Loaded stream ${videoId} into ${resolvedTab} manager`);
+      }
     } catch {
-      showToast('error', `Failed to load analysis for ${videoId}`);
+      if (targetTab === 'hitl') {
+        setIsSignOffModalOpen(true);
+      } else {
+        showToast('error', `Failed to load analysis for ${videoId}`);
+      }
     }
   };
 
@@ -292,8 +386,25 @@ export const App: React.FC = () => {
           showToast('success', 'Tenant context updated');
         }}
         isSignedOff={isSignedOff}
-        onOpenSignOffModal={() => setIsSignOffModalOpen(true)}
-        videoTitle={activeVideoId.endsWith('.mp4') ? activeVideoId : `${activeVideoId}.mp4`}
+        onOpenSignOffModal={async () => {
+          if (
+            !analysis &&
+            activeVideoId !== 'vid_cryo_demo_01' &&
+            activeVideoId !== 'vid_archive_demo_02'
+          ) {
+            try {
+              const fetchedDoc = await apiService.fetchVideoAnalysis(activeVideoId, {
+                customerId: tenant.customerId,
+                databaseId: tenant.databaseId,
+              });
+              applyAnalysisDocument(activeVideoId, fetchedDoc);
+            } catch {
+              // Proceed to open sign-off modal with current state
+            }
+          }
+          setIsSignOffModalOpen(true);
+        }}
+        videoTitle={activeVideoId}
         userEmail={user.email}
         onSignOut={handleSignOut}
         authControls={
@@ -359,8 +470,10 @@ export const App: React.FC = () => {
 
         {/* View Mode Switching */}
         {activeTab === 'videos' ? (
-          <VideoManagerView
+          <VideoManager
             tenant={tenant}
+            activeStreamId={activeVideoId}
+            onSelectActiveStream={handleSelectActiveStream}
             onSelectVideoForReview={handleSelectVideoFromManager}
           />
         ) : !analysis ? (
@@ -420,43 +533,34 @@ export const App: React.FC = () => {
 
             {/* Bottom Workspace: Domain Specific Panels */}
             {activeTab === 'inventory' ? (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-                {/* Cryo-Box N x M Interactive Grid View */}
-                <div className="lg:col-span-6">
-                  <BoxGridView
-                    rows={9}
-                    cols={9}
-                    boxId="CryoBox_Tower02_B03"
-                    targetRow={targetRow}
-                    targetCol={targetCol}
-                    differencedRow={rawTargetRow}
-                    differencedCol={rawTargetCol}
-                    onSelectSlot={handleSelectGridSlot}
-                    readOnly={isSignedOff}
-                  />
-                </div>
-
-                {/* Multi-Pass Extraction Vial Inspector */}
-                <div className="lg:col-span-6">
-                  <VialInspector
-                    action={selectedAction}
-                    events={safeEvents}
-                    refinements={safeRefinements}
-                    editedData={editedInventoryData}
-                    rawAiData={rawAiInventoryData}
-                    onChange={(field, val) =>
-                      setEditedInventoryData((prev) => ({ ...prev, [field]: val }))
-                    }
-                    onResetField={(field) =>
-                      setEditedInventoryData((prev) => ({
-                        ...prev,
-                        [field]: rawAiInventoryData[field],
-                      }))
-                    }
-                    readOnly={isSignedOff}
-                  />
-                </div>
-              </div>
+              <CryoInventory
+                activeStream={activeVideoId}
+                tenant={tenant}
+                analysis={analysis}
+                selectedAction={selectedAction}
+                events={safeEvents}
+                refinements={safeRefinements}
+                targetRow={targetRow}
+                targetCol={targetCol}
+                rawTargetRow={rawTargetRow}
+                rawTargetCol={rawTargetCol}
+                editedInventoryData={editedInventoryData}
+                rawAiInventoryData={rawAiInventoryData}
+                isSignedOff={isSignedOff}
+                onSelectGridSlot={handleSelectGridSlot}
+                onChangeField={(field, val) =>
+                  setEditedInventoryData((prev) => ({ ...prev, [field]: val }))
+                }
+                onResetField={(field) =>
+                  setEditedInventoryData((prev) => ({
+                    ...prev,
+                    [field]: rawAiInventoryData[field],
+                  }))
+                }
+                onAnalysisLoaded={(loadedVideoId, doc) =>
+                  applyAnalysisDocument(loadedVideoId, doc, 'inventory')
+                }
+              />
             ) : (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
                 {/* 96-Well Microplate View with 8-Channel Multichannel Pipette Confirmation */}

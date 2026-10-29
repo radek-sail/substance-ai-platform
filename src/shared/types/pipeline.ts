@@ -65,18 +65,115 @@ export const RefinementSchema = z.object({
 });
 export type Refinement = z.infer<typeof RefinementSchema>;
 
+export const VideoStatusSchema = z.enum([
+  'UPLOADING',
+  'TRANSCODING',
+  'READY_FOR_ANALYSIS',
+  'ANALYZING',
+  'ANALYSIS_COMPLETE',
+  'FAILED',
+]);
+export type VideoStatus = z.infer<typeof VideoStatusSchema>;
+
+export const PassStatusSchema = z.enum(['PENDING', 'RUNNING', 'COMPLETED', 'ERROR']);
+export type PassStatus = z.infer<typeof PassStatusSchema>;
+
+export const PassStepStateSchema = z.object({
+  status: PassStatusSchema.default('PENDING'),
+  data: z.any().optional(),
+  error: z.string().optional(),
+  startedAt: z.any().optional(),
+  completedAt: z.any().optional(),
+  updatedAt: z.any().optional(),
+});
+export type PassStepState = z.infer<typeof PassStepStateSchema>;
+
+export const VideoPassesSchema = z.object({
+  pass0: PassStepStateSchema.default({ status: 'PENDING' }),
+  pass1: PassStepStateSchema.default({ status: 'PENDING' }),
+  pass2: PassStepStateSchema.default({ status: 'PENDING' }),
+  pass3: PassStepStateSchema.default({ status: 'PENDING' }),
+  hitl: PassStepStateSchema.default({ status: 'PENDING' }),
+});
+export type VideoPasses = z.infer<typeof VideoPassesSchema>;
+
+export const DEFAULT_VIDEO_PASSES: VideoPasses = {
+  pass0: { status: 'PENDING' },
+  pass1: { status: 'PENDING' },
+  pass2: { status: 'PENDING' },
+  pass3: { status: 'PENDING' },
+  hitl: { status: 'PENDING' },
+};
+
+export const AnalyzePassRequestSchema = z.object({
+  videoId: z.string(),
+  pass: z.union([
+    z.literal(0),
+    z.literal(1),
+    z.literal(2),
+    z.literal(3),
+    z.literal('all'),
+    z.literal('0'),
+    z.literal('1'),
+    z.literal('2'),
+    z.literal('3'),
+  ]),
+  videoGcsUri: z.string().optional(),
+  localFilePath: z.string().optional(),
+  customerId: z.string().optional(),
+  databaseId: z.string().optional(),
+});
+export type AnalyzePassRequest = z.infer<typeof AnalyzePassRequestSchema>;
+
+export const VideoRecordSchema = z.object({
+  videoId: z.string(),
+  originalName: z.string(),
+  gcsBucket: z.string().optional(),
+  rawPath: z.string().optional(),
+  normalizedPath: z.string().optional(),
+  rawGcsUri: z.string(),
+  normalizedGcsUri: z.string(),
+  geminiFileUri: z.string().optional(),
+  geminiFileName: z.string().optional(),
+  durationSeconds: z.number().optional(),
+  fileSizeBytes: z.number().optional(),
+  status: VideoStatusSchema,
+  passes: VideoPassesSchema.optional(),
+  analysisId: z.string().optional(),
+  organizationId: z.string().optional(),
+  uploadedBy: z.string().optional(),
+  uploadedAt: z.any(),
+  transcodedAt: z.any().optional(),
+});
+export type VideoRecord = z.infer<typeof VideoRecordSchema>;
+
 export const VideoMetadataSchema = z.object({
   videoId: z.string(),
-  customerId: z.string(),
-  databaseId: z.string(),
+  customerId: z.string().optional(),
+  databaseId: z.string().optional(),
+  originalName: z.string().optional(),
+  gcsBucket: z.string().optional(),
+  rawPath: z.string().optional(),
+  normalizedPath: z.string().optional(),
+  rawGcsUri: z.string().optional(),
   originalGcsUri: z.string(),
   normalizedGcsUri: z.string(),
+  geminiFileUri: z.string().optional(),
+  geminiFileName: z.string().optional(),
   status: z.string(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  passes: VideoPassesSchema.optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional(),
   fileName: z.string().optional(),
   fileSize: z.number().optional(),
+  fileSizeBytes: z.number().optional(),
   durationSec: z.number().optional(),
+  durationSeconds: z.number().optional(),
+  analysisId: z.string().optional(),
+  organizationId: z.string().optional(),
+  uploadedBy: z.string().optional(),
+  uploadedAt: z.any().optional(),
+  transcodedAt: z.any().optional(),
   metadata: z.record(z.any()).optional(),
 });
 export type VideoMetadata = z.infer<typeof VideoMetadataSchema>;

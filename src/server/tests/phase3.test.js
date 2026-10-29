@@ -288,6 +288,40 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       assert.ok(passedModel.includes('flash'), 'Pass 0 must utilize Gemini Flash');
     });
 
+    it('Pass 0: should retry with exponential backoff on HTTP 503 / 429 transient errors', async () => {
+      let attempts = 0;
+
+      const mockClient = {
+        models: {
+          generateContent: async () => {
+            attempts++;
+            if (attempts === 1) {
+              const err = new Error('503 Service Unavailable: The model is overloaded.');
+              err.status = 503;
+              throw err;
+            }
+            return {
+              text: JSON.stringify({
+                workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+                inventoryName: 'Tank-Retry',
+                transcribedAudio: 'Recovered from 503 on attempt 2',
+              }),
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const result = await runPass0WorkflowClassification({
+        videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_retry.mp4',
+      });
+
+      assert.strictEqual(attempts, 2, 'Should have retried after 503 error');
+      assert.strictEqual(result.workflowType, 'INVENTORY_UPDATE_WORKFLOW');
+      assert.strictEqual(result.inventoryName, 'Tank-Retry');
+    });
+
     it('Pass 1: should select inventory guidelines for INVENTORY_UPDATE_WORKFLOW and return ActionSchema array', async () => {
       let passedSystemInstruction = null;
 

@@ -452,6 +452,43 @@ describe('Phase 2: Multi-Tenant Data & Media Engine', () => {
         server.close();
       }
     });
+
+    it('should persist uploaded video to Firestore and return { videos } from GET /api/videos', async () => {
+      const firestoreService = require('../dist/services/firestore.service');
+      const nowIso = new Date().toISOString();
+      await firestoreService.saveVideoMetadata('(default)', 'vid_registry_test_01', {
+        videoId: 'vid_registry_test_01',
+        originalName: '20260828_115859_c5d6b3be.mp4',
+        gcsBucket: 'sail-platform-videos',
+        normalizedGcsUri: 'gs://sail-platform-videos/normalized/norm_vid_registry_test_01.mp4',
+        status: 'READY_FOR_ANALYSIS',
+        uploadedAt: nowIso,
+        passes: {
+          pass0: { status: 'PENDING' },
+          pass1: { status: 'PENDING' },
+          pass2: { status: 'PENDING' },
+          pass3: { status: 'PENDING' },
+          hitl: { status: 'PENDING' },
+        },
+      });
+
+      const server = app.listen(0);
+      const port = server.address().port;
+
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/videos`);
+        assert.strictEqual(res.status, 200);
+        const payload = await res.json();
+        assert.ok(Array.isArray(payload.videos), 'GET /api/videos should return { videos: [...] }');
+        const found = payload.videos.find((v) => v.videoId === 'vid_registry_test_01');
+        assert.ok(found, 'Uploaded video must be present in GET /api/videos response');
+        assert.strictEqual(found.originalName, '20260828_115859_c5d6b3be.mp4');
+        assert.strictEqual(found.status, 'READY_FOR_ANALYSIS');
+        assert.strictEqual(found.passes.pass0.status, 'PENDING');
+      } finally {
+        server.close();
+      }
+    });
   });
 });
 

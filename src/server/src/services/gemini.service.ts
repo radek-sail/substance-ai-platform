@@ -94,15 +94,25 @@ export async function uploadAndWaitForActiveFile(params: {
   let downloadedTempPath: string | null = null;
 
   if (!localFilePath || !fs.existsSync(localFilePath)) {
-    if (!params.videoGcsUri.startsWith('gs://') && fs.existsSync(params.videoGcsUri)) {
+    const safeVideoId = (params.videoId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const cachedCandidates = safeVideoId
+      ? [
+          path.join('/tmp', 'sail_normalized_cache', `norm_${safeVideoId}.mp4`),
+          path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${safeVideoId}.mp4`),
+        ]
+      : [];
+    const foundCached = cachedCandidates.find((p) => fs.existsSync(p));
+    if (foundCached) {
+      localFilePath = foundCached;
+    } else if (!params.videoGcsUri.startsWith('gs://') && fs.existsSync(params.videoGcsUri)) {
       localFilePath = params.videoGcsUri;
     } else if (params.videoGcsUri.startsWith('gs://')) {
       const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
       const normalizedGcsUri = params.videoGcsUri.replace(/^gs:\/\/[^/]+\//, `gs://${bucketName}/`);
-      const safeVideoId = (params.videoId || `vid_${Date.now()}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const tempId = safeVideoId || `vid_${Date.now()}`;
       downloadedTempPath = path.join(
         os.tmpdir(),
-        `sail_gemini_${safeVideoId}_${Date.now()}.mp4`
+        `sail_gemini_${tempId}_${Date.now()}.mp4`
       );
       await downloadFromGcsUri(normalizedGcsUri, downloadedTempPath);
       localFilePath = downloadedTempPath;
@@ -121,17 +131,21 @@ export async function uploadAndWaitForActiveFile(params: {
   } as any);
 
   // Poll until file state transitions from PROCESSING to ACTIVE
-  let fileRecord = await ai.files.get({ name: uploadResult.name });
-  while (fileRecord.state === 'PROCESSING') {
+  let file = await ai.files.get({ name: uploadResult.name });
+  while (file.state === 'PROCESSING') {
     await new Promise((resolve) => setTimeout(resolve, 2000));
-    fileRecord = await ai.files.get({ name: uploadResult.name });
+    file = await ai.files.get({ name: uploadResult.name });
   }
 
-  if (fileRecord.state && fileRecord.state !== 'ACTIVE') {
+  if (file.state && file.state !== 'ACTIVE') {
     throw new Error(
-      `Gemini file registration failed for ${uploadResult.name} with state: ${fileRecord.state}`
+      `Gemini file registration failed for ${uploadResult.name} with state: ${file.state}`
     );
   }
+  if (file.state && !(file.state === 'ACTIVE')) {
+    throw new Error(`Gemini file is not ACTIVE: ${file.state}`);
+  }
+  const fileRecord = file;
 
   const registeredUri = fileRecord.uri || uploadResult.uri;
   const registeredName = fileRecord.name || uploadResult.name;
@@ -158,6 +172,106 @@ export async function uploadAndWaitForActiveFile(params: {
     fileUri: registeredUri,
     localVideoPath: localFilePath,
     cleanup,
+  };
+}
+
+/**
+ * Ensures the normalized video is registered with the Gemini Files API (`ai.files.upload`),
+ * waits until `state === 'ACTIVE'`, and returns `{ geminiFileUri, geminiFileName, localVideoPath }`
+ * without deleting the remote file so that subsequent individual passes can reuse `geminiFileUri`.
+ */
+export async function ensureGeminiFileRegistered(params: {
+  videoId: string;
+  videoGcsUri: string;
+  localVideoPath?: string;
+  existingGeminiFileUri?: string;
+  existingGeminiFileName?: string;
+}): Promise<{
+  geminiFileUri: string;
+  geminiFileName?: string;
+  localVideoPath?: string;
+}> {
+  const safeVideoId = (params.videoId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const cachedCandidates = safeVideoId
+    ? [
+        path.join('/tmp', 'sail_normalized_cache', `norm_${safeVideoId}.mp4`),
+        path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${safeVideoId}.mp4`),
+      ]
+    : [];
+  const resolvedLocalPath =
+    (params.localVideoPath && fs.existsSync(params.localVideoPath)
+      ? params.localVideoPath
+      : undefined) || cachedCandidates.find((p) => fs.existsSync(p));
+
+  if (params.existingGeminiFileUri) {
+    return {
+      geminiFileUri: params.existingGeminiFileUri,
+      geminiFileName: params.existingGeminiFileName,
+      localVideoPath: resolvedLocalPath,
+    };
+  }
+
+  const ai = getGenAIClient();
+  if (
+    !ai?.files ||
+    typeof ai.files.upload !== 'function' ||
+    !params.videoGcsUri ||
+    params.videoGcsUri.startsWith('https://generativelanguage.googleapis.com/') ||
+    params.videoGcsUri.startsWith('files/')
+  ) {
+    return {
+      geminiFileUri: params.videoGcsUri,
+      localVideoPath: resolvedLocalPath,
+    };
+  }
+
+  let localFilePath = resolvedLocalPath;
+  if (!localFilePath || !fs.existsSync(localFilePath)) {
+    if (!params.videoGcsUri.startsWith('gs://') && fs.existsSync(params.videoGcsUri)) {
+      localFilePath = params.videoGcsUri;
+    } else if (params.videoGcsUri.startsWith('gs://')) {
+      const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos';
+      const normalizedGcsUri = params.videoGcsUri.replace(/^gs:\/\/[^/]+\//, `gs://${bucketName}/`);
+      const cacheDir = path.join(os.tmpdir(), 'sail_normalized_cache');
+      if (!fs.existsSync(cacheDir)) {
+        fs.mkdirSync(cacheDir, { recursive: true });
+      }
+      const targetPath = path.join(cacheDir, `norm_${safeVideoId || Date.now()}.mp4`);
+      await downloadFromGcsUri(normalizedGcsUri, targetPath);
+      localFilePath = targetPath;
+    } else {
+      throw new Error(`Video file not found locally or in GCS: ${params.videoGcsUri}`);
+    }
+  }
+
+  const uploadResult = await ai.files.upload({
+    file: localFilePath,
+    mimeType: 'video/mp4',
+    config: {
+      mimeType: 'video/mp4',
+    },
+  } as any);
+
+  let file = await ai.files.get({ name: uploadResult.name });
+  while (file.state === 'PROCESSING') {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    file = await ai.files.get({ name: uploadResult.name });
+  }
+
+  if (file.state && file.state !== 'ACTIVE') {
+    throw new Error(
+      `Gemini file registration failed for ${uploadResult.name} with state: ${file.state}`
+    );
+  }
+  if (file.state && !(file.state === 'ACTIVE')) {
+    throw new Error(`Gemini file is not ACTIVE: ${file.state}`);
+  }
+  const fileRecord = file;
+
+  return {
+    geminiFileUri: fileRecord.uri || uploadResult.uri,
+    geminiFileName: fileRecord.name || uploadResult.name,
+    localVideoPath: localFilePath,
   };
 }
 
@@ -309,6 +423,32 @@ export function calculateSpatialDistance(
 export const DEFAULT_FLASH_MODEL = process.env.GEMINI_FLASH_MODEL || 'gemini-3.8-flash';
 export const DEFAULT_PRO_MODEL = process.env.GEMINI_PRO_MODEL || 'gemini-4-argon';
 
+/**
+ * Executes `ai.models.generateContent` with automatic exponential backoff retry
+ * on transient HTTP 503 / 429 / overloaded errors.
+ */
+export async function generateContentWithRetry(ai: any, params: any, maxRetries = 3) {
+  let delay = 2000;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (err: any) {
+      const isTransient =
+        err.status === 503 ||
+        err.status === 429 ||
+        err.message?.includes('503') ||
+        err.message?.includes('overloaded');
+      if (isTransient && attempt < maxRetries) {
+        console.warn(`[GeminiService] Attempt ${attempt} failed with ${err.status || err.message}. Retrying in ${delay}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        delay *= 2;
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 export interface PipelineExecutionParams {
   customerId: string;
   databaseId: string;
@@ -361,7 +501,7 @@ Return a valid JSON object matching WorkflowClassificationSchema.`;
     }
     contents.push(userPrompt);
 
-    const response = await client.models.generateContent({
+    const response = await generateContentWithRetry(client, {
       model: DEFAULT_FLASH_MODEL,
       contents,
       config: {
@@ -435,7 +575,7 @@ Return a JSON array of Action objects conforming to ActionSchema.`;
     }
     contents.push(userPrompt);
 
-    const response = await client.models.generateContent({
+    const response = await generateContentWithRetry(client, {
       model: DEFAULT_PRO_MODEL,
       contents,
       config: {
@@ -519,7 +659,7 @@ Return a JSON array of Event objects conforming to EventSchema.`;
       }
       contents.push(userPrompt);
 
-      const response = await client.models.generateContent({
+      const response = await generateContentWithRetry(client, {
         model: DEFAULT_FLASH_MODEL,
         contents,
         config: {
@@ -617,15 +757,7 @@ export async function runPass3AnalysisRefinement(params: {
   registeredFileUri?: string;
 }): Promise<Refinement[]> {
   const client = getGenAIClient();
-  const systemInstruction = `You are the Pass 3 Analysis Refinement Engine for Substance AI Labs (SAIL).
-Execute high-resolution modal tasks:
-1. Multi-frame OCR conflation across best-shot frame URLs for specimen and reagent labels.
-2. Spatial coordinate differencing relative to top-left origin:
-   - Rows: letters A through Z (row 0 = A, row 1 = B, etc.)
-   - Columns: numbers 1 through N (1-based index)
-3. Speech confirmation for volumes (µL, mL), cell densities, and passage numbers.
-
-Return a JSON array of Refinement objects conforming strictly to RefinementSchema.`;
+  const systemInstruction = loadGuideline('refinement-agent-guidelines.md');
 
   const needsRegistration = !params.registeredFileUri && params.videoGcsUri?.startsWith('gs://');
   const registered = needsRegistration
@@ -665,7 +797,7 @@ Output a JSON array of Refinement objects conforming to RefinementSchema.`;
     }
     contents.push(userPrompt);
 
-    const response = await client.models.generateContent({
+    const response = await generateContentWithRetry(client, {
       model: DEFAULT_PRO_MODEL,
       contents,
       config: {

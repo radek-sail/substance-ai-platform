@@ -4,9 +4,15 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import videoRoutes from './routes/video.routes';
 import pipelineRoutes from './routes/pipeline.routes';
-import { uploadMiddleware, uploadVideoHandler } from './controllers/video.controller';
+import {
+  uploadMiddleware,
+  uploadVideoHandler,
+  listVideosHandler,
+} from './controllers/video.controller';
 import {
   analyzePipelineHandler,
+  analyzePassHandler,
+  getVideoPassesHandler,
   inventorySignOffHandler,
   archiveSignOffHandler,
   getVideoAnalysisHandler,
@@ -39,22 +45,22 @@ app.get('/api/health', (_req: Request, res: Response) => {
   });
 });
 
-// Video routes via router
+// Video routes via router (GET /api/videos, POST /api/videos/upload)
 app.use('/api/videos', videoRoutes);
 
-// Direct route registration for POST /api/videos/upload
+// Direct route registrations for video endpoints
+app.get('/api/videos', listVideosHandler);
 app.post('/api/videos/upload', uploadMiddleware, uploadVideoHandler);
 
 // Pipeline analysis routes
 app.use('/api/pipeline', pipelineRoutes);
 app.post('/api/pipeline/analyze', analyzePipelineHandler);
+app.post('/api/pipeline/analyze-pass', analyzePassHandler);
+app.get('/api/pipeline/passes/:videoId', getVideoPassesHandler);
 
 // Atomic Sign-Off endpoints
 app.post('/api/signoff/inventory', inventorySignOffHandler);
 app.post('/api/signoff/archive', archiveSignOffHandler);
-
-// Multi-tenant document lookup endpoint
-app.get('/databases/:databaseId/documents/video_analyses/:videoId', getVideoAnalysisHandler);
 
 // Multi-tenant document lookup endpoint
 app.get('/databases/:databaseId/documents/video_analyses/:videoId', getVideoAnalysisHandler);
@@ -68,7 +74,7 @@ const clientDistPath = path.resolve(__dirname, '../../client/dist');
 app.use(express.static(clientDistPath));
 
 // For all non-API GET requests, return index.html for React SPA client-side routing
-app.get('*', (req: Request, res: Response) => {
+app.get('*', (_req: Request, res: Response) => {
   res.sendFile(path.join(clientDistPath, 'index.html'));
 });
 
