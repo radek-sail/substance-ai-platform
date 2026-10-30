@@ -6,8 +6,8 @@ export const WorkflowClassificationSchema = z.object({
     'EXPERIMENT_NOTEBOOK_WORKFLOW',
     'UNCLASSIFIED_WORKFLOW',
   ]),
-  inventoryName: z.string().optional(),
-  archiveName: z.string().optional(),
+  inventoryName: z.string().nullable().optional(),
+  archiveName: z.string().nullable().optional(),
   transcribedAudio: z.string(),
 });
 export type WorkflowClassification = z.infer<typeof WorkflowClassificationSchema>;

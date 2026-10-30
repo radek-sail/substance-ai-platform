@@ -186,6 +186,25 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       assert.strictEqual(parsed.inventoryName, 'CryoTank-Alpha');
     });
 
+    it('should validate WorkflowClassificationSchema when archiveName is null, undefined, or empty', () => {
+      const withNull = {
+        workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+        archiveName: null,
+        transcribedAudio: 'Testing protocol without explicit archive name',
+      };
+      const parsedNull = WorkflowClassificationSchema.parse(withNull);
+      assert.strictEqual(parsedNull.workflowType, 'EXPERIMENT_NOTEBOOK_WORKFLOW');
+      assert.strictEqual(parsedNull.archiveName, null);
+
+      const withUndefined = {
+        workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+        transcribedAudio: 'Testing protocol without archive name field',
+      };
+      const parsedUndefined = WorkflowClassificationSchema.parse(withUndefined);
+      assert.strictEqual(parsedUndefined.workflowType, 'EXPERIMENT_NOTEBOOK_WORKFLOW');
+      assert.strictEqual(parsedUndefined.archiveName, undefined);
+    });
+
     it('should reject invalid workflowType in WorkflowClassificationSchema', () => {
       const invalid = {
         workflowType: 'INVALID_WORKFLOW_TYPE',
@@ -320,6 +339,59 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       assert.strictEqual(attempts, 2, 'Should have retried after 503 error');
       assert.strictEqual(result.workflowType, 'INVENTORY_UPDATE_WORKFLOW');
       assert.strictEqual(result.inventoryName, 'Tank-Retry');
+    });
+
+    it('Pass 0: should sanitize null or empty archiveName using videoRecord metadata', async () => {
+      const mockClient = {
+        models: {
+          generateContent: async () => ({
+            text: JSON.stringify({
+              workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+              archiveName: null,
+              inventoryName: null,
+              transcribedAudio: 'Seeding 96-well plate with HEK293T cells',
+            }),
+          }),
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const result = await runPass0WorkflowClassification({
+        videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_archive_01.mp4',
+        videoId: 'vid_archive_01',
+        videoRecord: {
+          videoId: 'vid_archive_01',
+          originalName: 'CellSeeding_Run1.mp4',
+        },
+      });
+
+      assert.strictEqual(result.workflowType, 'EXPERIMENT_NOTEBOOK_WORKFLOW');
+      assert.strictEqual(result.archiveName, 'CellSeeding_Run1.mp4');
+    });
+
+    it('Pass 0: should fallback to videoId or default_archive when videoRecord has no originalName', async () => {
+      const mockClient = {
+        models: {
+          generateContent: async () => ({
+            text: JSON.stringify({
+              workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+              archiveName: null,
+              transcribedAudio: 'Running experiment procedure',
+            }),
+          }),
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const result = await runPass0WorkflowClassification({
+        videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_archive_02.mp4',
+        videoId: 'vid_archive_02',
+      });
+
+      assert.strictEqual(result.workflowType, 'EXPERIMENT_NOTEBOOK_WORKFLOW');
+      assert.strictEqual(result.archiveName, 'vid_archive_02');
     });
 
     it('Pass 1: should select inventory guidelines for INVENTORY_UPDATE_WORKFLOW and return ActionSchema array', async () => {
@@ -798,6 +870,63 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
         assert.strictEqual(savedDoc.data.events.length, 1);
         assert.strictEqual(savedDoc.data.refinements.length, 1);
         assert.ok(savedDoc.data.updatedAt, 'Must include updatedAt timestamp');
+      } finally {
+        server.close();
+      }
+    });
+
+    it('should execute Pass 0 independently and persist status COMPLETED and validated data to Firestore videos/{videoId}.passes.pass0', async () => {
+      const mockClient = {
+        models: {
+          generateContent: async () => ({
+            text: JSON.stringify({
+              workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+              archiveName: null,
+              inventoryName: null,
+              transcribedAudio: 'Beginning pipetting into 96-well plate',
+            }),
+          }),
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const server = app.listen(0);
+      const port = server.address().port;
+
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/pipeline/analyze-pass`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-customer-id': 'cust-ph3',
+            'x-database-id': 'tenant-db-prod',
+          },
+          body: JSON.stringify({
+            videoId: 'vid-pass0-standalone',
+            pass: 0,
+            videoGcsUri: 'gs://cust-ph3-video-manager-storage/normalized/norm_vid-pass0-standalone.mp4',
+          }),
+        });
+
+        assert.strictEqual(response.status, 200);
+        const data = await response.json();
+
+        assert.strictEqual(data.success, true);
+        assert.strictEqual(data.videoId, 'vid-pass0-standalone');
+        assert.strictEqual(data.passes.pass0.status, 'COMPLETED');
+        assert.ok(data.passes.pass0.data, 'Pass 0 data must be present');
+        assert.strictEqual(data.passes.pass0.data.workflowType, 'EXPERIMENT_NOTEBOOK_WORKFLOW');
+        assert.strictEqual(data.passes.pass0.data.archiveName, 'vid-pass0-standalone');
+
+        // Check Firestore record directly
+        const db = getTenantFirestore('tenant-db-prod');
+        const docSnap = await db.collection('videos').doc('vid-pass0-standalone').get();
+        assert.ok(docSnap.exists);
+        const videoData = docSnap.data();
+        assert.strictEqual(videoData.passes.pass0.status, 'COMPLETED');
+        assert.strictEqual(videoData.passes.pass0.data.workflowType, 'EXPERIMENT_NOTEBOOK_WORKFLOW');
+        assert.strictEqual(videoData.passes.pass0.data.archiveName, 'vid-pass0-standalone');
       } finally {
         server.close();
       }

@@ -12,7 +12,6 @@ import {
 } from '@sail/shared';
 import {
   executeHierarchicalPipeline,
-  ensureGeminiFileRegistered,
   runPass0WorkflowClassification,
   runPass1ActionDetection,
   runPass2EventDetection,
@@ -29,7 +28,6 @@ import {
   commitInventorySignOff,
   commitArchiveSignOff,
 } from '../services/firestore.service';
-import { downloadFromGcsUri } from '../services/storage.service';
 
 /**
  * Persists a pass JSON artifact to disk (`workflowClassification.json`, `workloadClassification.json`,
@@ -60,8 +58,7 @@ async function writePassArtifactJson(videoId: string, filename: string, data: an
  * Orchestrates Pass 0 -> Pass 1 -> Pass 2 -> Pass 3 on demand for any transcoded video:
  * 1. Accepts `{ videoId }` (and optional `videoGcsUri`).
  * 2. Sets video status in `videos/{videoId}` to `ANALYZING`.
- * 3. Retrieves the normalized video from GCS, registers it with the Gemini Files API (`ai.files.upload`),
- *    waits for `ACTIVE` state, and executes Pass 0 through Pass 3.
+ * 3. Passes the Google Cloud Storage URI directly into Vertex AI mode passes without local disk downloading.
  * 4. Writes analysis payload to `video_analyses/{videoId}`.
  * 5. Updates video status in `videos/{videoId}` to `ANALYSIS_COMPLETE` (or `FAILED` if error occurs)
  *    and links `analysisId`.
@@ -89,7 +86,7 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
 
   const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
 
-  // Resolve normalized file path from request body or from Firestore videos/{videoId}
+  // Resolve normalized file path or GCS URI from request body or from Firestore videos/{videoId}
   let candidateGcsUri: string | undefined = videoGcsUri;
   let extractedPath: string | undefined;
   try {
@@ -110,24 +107,15 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
     // Ignore lookup errors on mocked Firestore instances
   }
 
-  if (!extractedPath && candidateGcsUri && typeof candidateGcsUri === 'string') {
-    if (candidateGcsUri.startsWith('gs://')) {
-      const withoutScheme = candidateGcsUri.replace(/^gs:\/\//, '');
-      const firstSlash = withoutScheme.indexOf('/');
-      if (firstSlash !== -1) {
-        extractedPath = withoutScheme.substring(firstSlash + 1);
-      }
-    } else {
-      extractedPath = candidateGcsUri;
+  if (!candidateGcsUri) {
+    if (!extractedPath) {
+      extractedPath = `normalized/norm_${videoId}.mp4`;
     }
+    extractedPath = extractedPath.replace(/^\/+/, '');
+    candidateGcsUri = `gs://${bucketName}/${extractedPath}`;
   }
 
-  if (!extractedPath) {
-    extractedPath = `normalized/norm_${videoId}.mp4`;
-  }
-  extractedPath = extractedPath.replace(/^\/+/, '');
-
-  const resolvedVideoGcsUri = `gs://${bucketName}/${extractedPath}`;
+  const resolvedVideoGcsUri = candidateGcsUri;
 
   // Set video status in videos/{videoId} to ANALYZING
   await updateVideoRecord('(default)', videoId, {
@@ -230,8 +218,7 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
  *
  * Executes a single pass (`0 | 1 | 2 | 3`) or all passes sequentially (`"all"`):
  * - Retrieves video metadata from `videos/{videoId}`.
- * - If not already registered, registers the normalized video with the Gemini Files API (`ai.files.upload`),
- *   waits until `state === 'ACTIVE'`, and caches `geminiFileUri` in the `videos` record.
+ * - Passes GCS URI directly to Vertex AI mode without local disk downloading or Files API polling.
  * - Pass 0 (Workflow Classification): Executes Gemini Flash @ 1 fps prompt. Writes result to
  *   `workflowClassification.json` and updates `videos/{videoId}.passes.pass0 = { status: "COMPLETED", data: result, completedAt }`.
  * - Pass 1 (Action Detection): Executes Gemini Pro @ 1 fps using Pass 0 context. Writes `action_detection_pass.json`
@@ -273,72 +260,21 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
     (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null) ||
     {};
 
-  // Extract relative file path from video metadata or candidate URI (e.g. normalized/norm_vid_...mp4)
-  // in case the Firestore video document contains an outdated GCS URI referencing a non-existent bucket.
-  let extractedPath = videoDoc.normalizedPath;
-  const firstChunkUri =
-    Array.isArray(videoDoc.chunks) && videoDoc.chunks.length > 0
-      ? videoDoc.chunks[0]?.gcsUri
-      : undefined;
-  const candidateUri =
+  let candidateGcsUri: string | undefined =
     videoGcsUri ||
     videoDoc.normalizedGcsUri ||
-    firstChunkUri ||
+    (Array.isArray(videoDoc.chunks) && videoDoc.chunks.length > 0 ? videoDoc.chunks[0]?.gcsUri : undefined) ||
     videoDoc.rawGcsUri ||
     videoDoc.originalGcsUri;
 
-  if (!extractedPath && candidateUri && typeof candidateUri === 'string') {
-    if (candidateUri.startsWith('gs://')) {
-      const withoutScheme = candidateUri.replace(/^gs:\/\//, '');
-      const firstSlash = withoutScheme.indexOf('/');
-      if (firstSlash !== -1) {
-        extractedPath = withoutScheme.substring(firstSlash + 1);
-      }
-    } else {
-      extractedPath = candidateUri;
-    }
+  if (!candidateGcsUri) {
+    let extractedPath = videoDoc.normalizedPath || videoDoc.rawPath || `normalized/norm_${videoId}.mp4`;
+    extractedPath = extractedPath.replace(/^\/+/, '');
+    candidateGcsUri = `gs://${bucketName}/${extractedPath}`;
   }
 
-  if (!extractedPath && videoDoc.rawPath) {
-    extractedPath = videoDoc.rawPath;
-  }
-
-  if (!extractedPath) {
-    extractedPath = `normalized/norm_${videoId}.mp4`;
-  }
-  extractedPath = extractedPath.replace(/^\/+/, '');
-
-  // Ensure Cloud Storage URI points to bucketName
-  const resolvedVideoGcsUri = `gs://${bucketName}/${extractedPath}`;
-
-  // If local video file is not already provided or on disk, download it from bucketName
-  let effectiveLocalVideoPath = localFilePath;
-  if (!effectiveLocalVideoPath || !fs.existsSync(effectiveLocalVideoPath)) {
-    const safeVideoId = (videoId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
-    const cachedCandidates = safeVideoId
-      ? [
-          path.join('/tmp', 'sail_normalized_cache', `norm_${safeVideoId}.mp4`),
-          path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${safeVideoId}.mp4`),
-        ]
-      : [];
-    const foundCached = cachedCandidates.find((p) => fs.existsSync(p));
-    if (foundCached) {
-      effectiveLocalVideoPath = foundCached;
-    } else {
-      try {
-        const cacheDir = path.join(os.tmpdir(), 'sail_normalized_cache');
-        if (!fs.existsSync(cacheDir)) {
-          fs.mkdirSync(cacheDir, { recursive: true });
-        }
-        const targetDownloadedPath = path.join(cacheDir, `norm_${safeVideoId || Date.now()}.mp4`);
-        console.log(`[PipelineController] Pass 0: downloading video from GCS bucket "${bucketName}" (path: ${extractedPath}) to ${targetDownloadedPath}`);
-        await downloadFromGcsUri(resolvedVideoGcsUri, targetDownloadedPath);
-        effectiveLocalVideoPath = targetDownloadedPath;
-      } catch (dlErr) {
-        console.warn(`[PipelineController] Pass 0: could not pre-download from GCS bucket "${bucketName}":`, dlErr);
-      }
-    }
-  }
+  const resolvedVideoGcsUri = candidateGcsUri;
+  const effectiveLocalVideoPath = localFilePath;
 
   let currentPasses: VideoPasses = {
     pass0: videoDoc.passes?.pass0 || { status: 'PENDING' },
@@ -352,29 +288,14 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
     pass === 'all' ? 'pass0' : (`pass${pass}` as keyof VideoPasses);
 
   try {
-    // 2. Register normalized video with Gemini Files API if not already cached
-    const registration = await ensureGeminiFileRegistered({
-      videoId,
-      videoGcsUri: resolvedVideoGcsUri,
-      localVideoPath: effectiveLocalVideoPath,
-      existingGeminiFileUri: videoDoc.geminiFileUri,
-      existingGeminiFileName: videoDoc.geminiFileName,
-    });
-
-    const geminiFileUri = registration.geminiFileUri;
-    effectiveLocalVideoPath = registration.localVideoPath || effectiveLocalVideoPath;
+    const geminiFileUri = resolvedVideoGcsUri;
 
     // Cache geminiFileUri on videos/{videoId}
     const metaUpdates: Record<string, any> = {
       status: 'ANALYZING',
       updatedAt: new Date().toISOString(),
+      geminiFileUri,
     };
-    if (geminiFileUri) {
-      metaUpdates.geminiFileUri = geminiFileUri;
-    }
-    if (registration.geminiFileName) {
-      metaUpdates.geminiFileName = registration.geminiFileName;
-    }
 
     await updateVideoRecord(databaseId, videoId, metaUpdates);
     if (databaseId !== '(default)') {
@@ -406,6 +327,8 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         customerId,
         videoId,
         registeredFileUri: geminiFileUri,
+        videoRecord: videoDoc,
+        databaseId,
       });
       await writePassArtifactJson(videoId, 'workflowClassification.json', classification);
       await writePassArtifactJson(videoId, 'workloadClassification.json', classification);
@@ -619,13 +542,13 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
     let passResultData: any = null;
     let aggregatedAnalysis: Record<string, any> | undefined;
 
-    if (pass === 0) {
+    if (pass === 0 || pass === '0') {
       passResultData = await runStep0();
-    } else if (pass === 1) {
+    } else if (pass === 1 || pass === '1') {
       passResultData = await runStep1();
-    } else if (pass === 2) {
+    } else if (pass === 2 || pass === '2') {
       passResultData = await runStep2();
-    } else if (pass === 3) {
+    } else if (pass === 3 || pass === '3') {
       const res3 = await runStep3();
       passResultData = res3.refinements;
       aggregatedAnalysis = res3.analysisPayload;

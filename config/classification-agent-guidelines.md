@@ -21,16 +21,16 @@ Classify the procedure into exactly one of the following classes:
 
 ## Extraction Directives
 - **transcribedAudio**: Accurately transcribe all audible operator speech verbatim.
-- **inventoryName**: If the workflow is `INVENTORY_UPDATE_WORKFLOW` and a storage unit or inventory name is spoken or visible (e.g., "Tank Alpha", "Cryo-Tank 2", "Main LN2 Freezer"), extract it.
-- **archiveName**: If the workflow is `EXPERIMENT_NOTEBOOK_WORKFLOW` and an experiment name, protocol title, or archive notebook ID is spoken or visible (e.g., "Experiment-402", "Cell Seeding Protocol B"), extract it.
+- **inventoryName**: If the workflow is `INVENTORY_UPDATE_WORKFLOW` and a storage unit or inventory name is spoken or visible (e.g., "Tank Alpha", "Cryo-Tank 2", "Main LN2 Freezer"), extract it. If no specific inventory target is identified, return null or an empty string.
+- **archiveName**: If the workflow is `EXPERIMENT_NOTEBOOK_WORKFLOW` and an experiment name, protocol title, or archive notebook ID is spoken or visible (e.g., "Experiment-402", "Cell Seeding Protocol B"), extract it. If no specific archive target is identified, return null or an empty string.
 
 ## Output Format
 Return a single JSON object conforming strictly to `WorkflowClassificationSchema`:
 ```json
 {
   "workflowType": "INVENTORY_UPDATE_WORKFLOW" | "EXPERIMENT_NOTEBOOK_WORKFLOW" | "UNCLASSIFIED_WORKFLOW",
-  "inventoryName": "string (optional)",
-  "archiveName": "string (optional)",
+  "inventoryName": "string or null (optional)",
+  "archiveName": "string or null (optional)",
   "transcribedAudio": "string"
 }
 ```
