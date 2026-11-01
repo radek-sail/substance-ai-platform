@@ -22,12 +22,14 @@ const {
   runPass2EventDetection,
   runPass3AnalysisRefinement,
   executeHierarchicalPipeline,
+  DEFAULT_PRO_MODEL,
 } = require('../dist/services/gemini.service');
 
 const {
   getTenantFirestore,
   saveVideoAnalysis,
   getVideoAnalysis,
+  getVideoPasses,
   clearDatabaseCache,
 } = require('../dist/services/firestore.service');
 
@@ -481,6 +483,464 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       );
     });
 
+    it('Pass 1: should enforce generation config (temperature 0.2, maxOutputTokens 16384) and brevity constraints', async () => {
+      let passedConfig = null;
+      let passedPrompt = null;
+
+      const mockClient = {
+        models: {
+          generateContent: async (params) => {
+            passedConfig = params.config;
+            passedPrompt = params.contents?.[0]?.parts?.find((p) => p.text)?.text;
+            return {
+              text: JSON.stringify({
+                actions: [
+                  {
+                    actionId: 'act_001',
+                    actionType: 'VIAL_INSERTION',
+                    actionClass: 'VIAL_INSERTION_ACTION',
+                    description: 'Operator places vial in slot A1',
+                    startTime: '00:10',
+                    endTime: '00:15',
+                    startTimestampSeconds: 10.0,
+                    endTimestampSeconds: 15.0,
+                    confidenceScore: 0.98,
+                    targetLocation: {
+                      tower: 'Tower-A',
+                      box: 'CryoBox-A1',
+                      coordinate: 'A1',
+                    },
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const actions = await runPass1ActionDetection({
+        videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_123.mp4',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          transcribedAudio: 'Inserting into A1',
+        },
+      });
+
+      assert.strictEqual(actions.length, 1);
+      assert.strictEqual(passedConfig.temperature, 0.2);
+      assert.strictEqual(passedConfig.maxOutputTokens, 16384);
+      assert.strictEqual(passedConfig.responseMimeType, 'application/json');
+      assert.deepStrictEqual(passedConfig.thinkingConfig, { thinkingLevel: 'MEDIUM' });
+      assert.ok(passedPrompt.includes('CRITICAL TEMPORAL SCANNING INSTRUCTIONS:'));
+      assert.ok(passedPrompt.includes('IMPORTANT - MULTI-ACTION TEMPORAL EXTRACTION:'));
+      assert.ok(passedPrompt.includes('CRITICAL CONSTRAINTS:'));
+      assert.ok(passedPrompt.includes('Explicitly forbidden: Repeating hierarchical taxonomy strings'));
+      assert.ok(passedPrompt.includes('max 20 words'));
+    });
+
+    it('Pass 1: should retrieve durationSeconds from Firestore videoDoc and incorporate into temporal scanning instructions', async () => {
+      let passedPrompt = '';
+      let passedSystemInstruction = '';
+      const mockClient = {
+        models: {
+          generateContent: async (params) => {
+            passedPrompt = params.contents?.[0]?.parts?.find((p) => p.text)?.text || '';
+            passedSystemInstruction = params.config?.systemInstruction || '';
+            return {
+              text: JSON.stringify({
+                videoId: 'vid_duration_test',
+                actions: [
+                  {
+                    actionId: 'act_001',
+                    actionType: 'VIAL_INSERTION',
+                    description: 'Operator places vial in slot A1',
+                    startTime: '00:05',
+                    endTime: '00:10',
+                    startTimestampSeconds: 5.0,
+                    endTimestampSeconds: 10.0,
+                    confidenceScore: 0.95,
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const actions = await runPass1ActionDetection({
+        videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_duration_test.mp4',
+        videoId: 'vid_duration_test',
+        videoRecord: {
+          durationSeconds: 240,
+        },
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          transcribedAudio: 'Four vials. Four vials.',
+        },
+      });
+
+      assert.strictEqual(actions.length, 1);
+      assert.ok(passedPrompt.includes('240s'));
+      assert.ok(passedPrompt.includes('IGNORE verbal count cues from the audio transcript'));
+      assert.ok(passedPrompt.includes('FIRST HALF and the SECOND HALF'));
+      assert.ok(passedSystemInstruction.includes('240s'));
+      assert.ok(passedSystemInstruction.includes('CRITICAL TEMPORAL SCANNING INSTRUCTIONS:'));
+    });
+
+    it('Pass 1: should warn on MAX_TOKENS finishReason and repair truncated JSON response', async () => {
+      const warnedMessages = [];
+      const originalWarn = console.warn;
+      console.warn = (...args) => {
+        warnedMessages.push(args.join(' '));
+        originalWarn(...args);
+      };
+
+      try {
+        const mockClient = {
+          models: {
+            generateContent: async () => {
+              return {
+                candidates: [
+                  {
+                    finishReason: 'MAX_TOKENS',
+                  },
+                ],
+                text: '{\n  "videoId": "vid_test",\n  "actions": [\n    {\n      "actionId": "act_001",\n      "actionType": "VIAL_INSERTION",\n      "actionClass": "VIAL_INSERTION_ACTION",\n      "description": "Operator inserts vial into slot A1",\n      "startTime": "00:05",\n      "endTime": "00:10",\n      "startTimestampSeconds": 5.0,\n      "endTimestampSeconds": 10.0,\n      "confidenceScore": 0.95,\n      "targetLocation": { "tower": "Tower-A", "box": "CryoBox-A1", "coordinate": "A1" }\n    },\n    {\n      "actionId": "act_002",\n      "actionType": "VIAL_INSERTION",\n      "description": "Operator inserting into B',
+              };
+            },
+          },
+        };
+
+        setGenAIClient(mockClient);
+
+        const actions = await runPass1ActionDetection({
+          videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_123.mp4',
+          classification: {
+            workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+            transcribedAudio: 'Inserting vials',
+          },
+        });
+
+        assert.strictEqual(actions.length, 1);
+        assert.strictEqual(actions[0].actionId, 'act_001');
+        assert.ok(warnedMessages.some((m) => m.includes('MAX_TOKENS')));
+      } finally {
+        console.warn = originalWarn;
+      }
+    });
+
+    it('Pass 1: should throw descriptive error logging first 500 characters when unrepairable', async () => {
+      const mockClient = {
+        models: {
+          generateContent: async () => {
+            return {
+              text: 'Not a valid JSON at all: ' + 'x'.repeat(600),
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      await assert.rejects(
+        async () => {
+          await runPass1ActionDetection({
+            videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_123.mp4',
+            classification: {
+              workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+              transcribedAudio: 'Testing invalid output',
+            },
+          });
+        },
+        (err) => {
+          assert.ok(err.message.includes('[Pass 1] Failed to parse model JSON response'));
+          assert.ok(err.message.includes('Payload preview:'));
+          return true;
+        }
+      );
+    });
+
+    it('Pass 1: should support simplified targetCoordinate and reset passes.pass1.error to null', async () => {
+      let passedSchema = null;
+      const mockClient = {
+        models: {
+          generateContent: async (params) => {
+            passedSchema = params.config?.responseSchema;
+            return {
+              text: JSON.stringify({
+                workflowContext: 'INVENTORY_UPDATE_WORKFLOW',
+                totalActionsDetected: 1,
+                actions: [
+                  {
+                    actionId: 'act_001',
+                    actionType: 'VIAL_INSERTION',
+                    description: 'Operator transfers cryovial into slot A1',
+                    startTime: '00:05',
+                    endTime: '00:10',
+                    startTimestampSeconds: 5.0,
+                    endTimestampSeconds: 10.0,
+                    confidenceScore: 0.98,
+                    targetCoordinate: 'A1',
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const actions = await runPass1ActionDetection({
+        videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_coord_test.mp4',
+        videoId: 'vid_coord_test',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          transcribedAudio: 'Inserting into A1',
+        },
+      });
+
+      assert.strictEqual(actions.length, 1);
+      assert.strictEqual(actions[0].targetCoordinate, 'A1');
+      assert.strictEqual(actions[0].targetLocation?.coordinate, 'A1');
+      assert.strictEqual(actions[0].boxRowId, 'A');
+      assert.strictEqual(actions[0].boxColId, 1);
+      assert.strictEqual(passedSchema?.properties?.actions?.items?.properties?.targetCoordinate?.type, 'STRING');
+      assert.strictEqual(passedSchema?.properties?.actions?.items?.properties?.targetLocation, undefined);
+    });
+
+    it('Pass 1: should enforce strict scope restriction (VIAL_INSERTION & VIAL_REMOVAL) and include modelUsed metadata', async () => {
+      let passedSchema = null;
+      let passedPrompt = '';
+      const mockClient = {
+        models: {
+          generateContent: async (params) => {
+            passedSchema = params.config?.responseSchema;
+            passedPrompt = params.contents?.[0]?.parts?.find((p) => p.text)?.text || '';
+            return {
+              text: JSON.stringify({
+                workflowContext: 'INVENTORY_UPDATE_WORKFLOW',
+                totalActionsDetected: 2,
+                actions: [
+                  {
+                    actionId: 'act_001',
+                    actionType: 'VIAL_INSERTION',
+                    description: 'Operator inserts vial into slot A1',
+                    startTime: '00:05',
+                    endTime: '00:10',
+                    startTimestampSeconds: 5.0,
+                    endTimestampSeconds: 10.0,
+                    confidenceScore: 0.98,
+                    targetCoordinate: 'A1',
+                  },
+                  {
+                    actionId: 'act_002',
+                    actionType: 'VIAL_REMOVAL',
+                    description: 'Operator removes vial from slot B2',
+                    startTime: '00:15',
+                    endTime: '00:20',
+                    startTimestampSeconds: 15.0,
+                    endTimestampSeconds: 20.0,
+                    confidenceScore: 0.95,
+                    targetCoordinate: 'B2',
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const actions = await runPass1ActionDetection({
+        videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_scope_test.mp4',
+        videoId: 'vid_scope_test',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          transcribedAudio: 'Placing vial A1, removing vial B2',
+        },
+      });
+
+      assert.strictEqual(actions.length, 2);
+      assert.strictEqual(actions[0].actionType, 'VIAL_INSERTION');
+      assert.strictEqual(actions[1].actionType, 'VIAL_REMOVAL');
+      assert.strictEqual(actions.modelUsed, DEFAULT_PRO_MODEL);
+      const pass1Json = actions.toJSON();
+      assert.strictEqual(pass1Json.modelUsed, DEFAULT_PRO_MODEL);
+
+      // Verify schema restrictions
+      assert.deepStrictEqual(
+        passedSchema?.properties?.actions?.items?.properties?.actionType?.enum,
+        ['VIAL_INSERTION', 'VIAL_REMOVAL']
+      );
+      assert.strictEqual(passedSchema?.properties?.modelUsed?.type, 'STRING');
+
+      // Verify prompt critical scope restriction
+      assert.ok(passedPrompt.includes('CRITICAL SCOPE RESTRICTION:'));
+      assert.ok(passedPrompt.includes("You MUST ONLY detect 'VIAL_INSERTION' (placing a vial into a slot) and 'VIAL_REMOVAL' (taking a vial out of a slot)."));
+      assert.ok(passedPrompt.includes('Do NOT detect box removals, cap opening/closing, or box lid adjustments.'));
+      assert.ok(passedPrompt.includes('Every single vial placed into or removed from the grid must be emitted as an independent action.'));
+    });
+
+    it('Pass 1: should eliminate count bias, unanchor schema minItems, exclude audio cues, and persist executionAudit', async () => {
+      let passedSchema = null;
+      let passedPrompt = '';
+      const mockClient = {
+        models: {
+          generateContent: async (params) => {
+            passedSchema = params.config?.responseSchema;
+            passedPrompt = params.contents?.[0]?.parts?.find((p) => p.text)?.text || '';
+            return {
+              candidates: [
+                {
+                  finishReason: 'STOP',
+                },
+              ],
+              usageMetadata: {
+                promptTokenCount: 120,
+                candidatesTokenCount: 45,
+                totalTokenCount: 165,
+              },
+              text: JSON.stringify({
+                workflowContext: 'INVENTORY_UPDATE_WORKFLOW',
+                totalActionsDetected: 1,
+                actions: [
+                  {
+                    actionId: 'act_001',
+                    actionType: 'VIAL_INSERTION',
+                    description: 'Operator inserts vial into slot A1',
+                    startTime: '00:05',
+                    endTime: '00:10',
+                    startTimestampSeconds: 5.0,
+                    endTimestampSeconds: 10.0,
+                    confidenceScore: 0.98,
+                    targetCoordinate: 'A1',
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const actions = await runPass1ActionDetection({
+        videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_audit_test.mp4',
+        videoId: 'vid_audit_test',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          transcribedAudio: 'Four vials placed here, wait maybe five',
+        },
+      });
+
+      // 1. Schema assertions: minItems undefined, description verified
+      assert.strictEqual(passedSchema?.properties?.actions?.minItems, undefined);
+      assert.strictEqual(
+        passedSchema?.properties?.actions?.description,
+        'Exhaustive chronological array of all vial insertion and removal actions observed in the video.'
+      );
+
+      // 2. Prompt assertions: contains ground truth rules, no audio bias
+      assert.ok(passedPrompt.includes('TASK: Detect EVERY distinct vial insertion into or removal from a cryo-rack or box.'));
+      assert.ok(passedPrompt.includes('CRITICAL GROUND-TRUTH RULES:'));
+      assert.strictEqual(passedPrompt.includes('Audible Context:'), false);
+      assert.strictEqual(passedPrompt.includes('Four vials'), false);
+
+      // 3. ExecutionAudit assertions on actions result object and JSON
+      assert.ok(actions.executionAudit, 'actions object should have executionAudit');
+      assert.strictEqual(actions.executionAudit.model, DEFAULT_PRO_MODEL);
+      assert.ok(actions.executionAudit.promptText.includes('CRITICAL GROUND-TRUTH RULES:'));
+      assert.deepStrictEqual(actions.executionAudit.generationConfig, {
+        temperature: 0.2,
+        maxOutputTokens: 16384,
+        responseMimeType: 'application/json',
+        responseSchema: passedSchema,
+        thinkingConfig: { thinkingLevel: 'MEDIUM' },
+      });
+      assert.deepStrictEqual(actions.executionAudit.modelDiagnostics, {
+        finishReason: 'STOP',
+        usageMetadata: {
+          promptTokenCount: 120,
+          candidatesTokenCount: 45,
+          totalTokenCount: 165,
+        },
+        thoughtsTokenCount: 0,
+      });
+      assert.ok(actions.executionAudit.videoMetadata.uri.includes('vid_audit_test.mp4'));
+
+      // Check toJSON output
+      const pass1Json = actions.toJSON();
+      assert.ok(pass1Json.executionAudit, 'toJSON should include executionAudit');
+      assert.strictEqual(pass1Json.executionAudit.model, DEFAULT_PRO_MODEL);
+
+      // 4. Verify Firestore pass state contains executionAudit
+      const videoPasses = await getVideoPasses('(default)', 'vid_audit_test');
+      assert.ok(videoPasses?.passes?.pass1?.executionAudit, 'Firestore pass1 must contain executionAudit');
+      assert.strictEqual(videoPasses.passes.pass1.executionAudit.model, DEFAULT_PRO_MODEL);
+      assert.strictEqual(videoPasses.passes.pass1.status, 'COMPLETED');
+    });
+
+    it('Pass 1: should gracefully fallback to next candidate model when DEFAULT_PRO_MODEL returns 404 NOT_FOUND', async () => {
+      let attempts = 0;
+      const requestedModels = [];
+
+      const mockClient = {
+        models: {
+          generateContent: async (params) => {
+            attempts++;
+            requestedModels.push(params.model);
+            if (params.model === DEFAULT_PRO_MODEL) {
+              const err = new Error('Publisher model not found: 404 NOT_FOUND');
+              err.status = 404;
+              throw err;
+            }
+            return {
+              text: JSON.stringify({
+                totalActionsDetected: 1,
+                actions: [
+                  {
+                    actionId: 'act_fallback_01',
+                    actionType: 'VIAL_INSERTION',
+                    description: 'Vial inserted into A1',
+                    startTime: '00:01',
+                    endTime: '00:05',
+                    startTimestampSeconds: 1,
+                    endTimestampSeconds: 5,
+                    confidenceScore: 0.95,
+                    targetCoordinate: 'A1',
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const actions = await runPass1ActionDetection({
+        videoGcsUri: 'gs://customer-video-manager-storage/normalized/vid_fallback.mp4',
+        videoId: 'vid_fallback',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          transcribedAudio: 'Inserting vial A1',
+        },
+      });
+
+      assert.strictEqual(attempts, 2);
+      assert.deepStrictEqual(requestedModels, [DEFAULT_PRO_MODEL, 'gemini-1.5-pro-002']);
+      assert.strictEqual(actions.length, 1);
+      assert.strictEqual(actions.modelUsed, DEFAULT_PRO_MODEL);
+      assert.strictEqual(actions.executionAudit.model, DEFAULT_PRO_MODEL);
+      assert.strictEqual(actions.executionAudit.modelUsed, DEFAULT_PRO_MODEL);
+    });
+
     it('Pass 2: should extract sub-events, call frame extraction, and upload best-shot frames to GCS', async () => {
       const mockClient = {
         models: {
@@ -602,7 +1062,16 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       let savedData = null;
 
       db.collection = (colName) => {
-        assert.strictEqual(colName, 'video_analyses');
+        if (colName !== 'video_analyses') {
+          return {
+            doc: () => ({
+              set: async () => ({ writeTime: new Date() }),
+              update: async () => ({ writeTime: new Date() }),
+              get: async () => ({ exists: false, data: () => ({}) }),
+            }),
+            get: async () => ({ empty: true, docs: [] }),
+          };
+        }
         return {
           doc: (docId) => {
             savedDocId = docId;
@@ -824,7 +1293,16 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       const db = getTenantFirestore('tenant-db-prod');
       let savedDoc = null;
       db.collection = (colName) => {
-        assert.strictEqual(colName, 'video_analyses');
+        if (colName !== 'video_analyses') {
+          return {
+            doc: () => ({
+              set: async () => ({ writeTime: new Date() }),
+              update: async () => ({ writeTime: new Date() }),
+              get: async () => ({ exists: false, data: () => ({}) }),
+            }),
+            get: async () => ({ empty: true, docs: [] }),
+          };
+        }
         return {
           doc: (docId) => ({
             set: async (data) => {

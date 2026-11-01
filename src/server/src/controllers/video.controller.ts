@@ -720,3 +720,82 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
     }
   })();
 };
+
+/**
+ * POST /api/videos/:videoId/associate-inventory
+ * Manually associates a video record with an existing inventory.
+ * Body: { inventoryId: string }
+ */
+export const associateInventoryHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const videoId = req.params.videoId || req.body?.videoId;
+  if (!videoId) {
+    return res.status(400).json({ error: 'Missing required parameter: videoId' });
+  }
+
+  const { inventoryId } = req.body || {};
+  if (!inventoryId || typeof inventoryId !== 'string') {
+    return res.status(400).json({ error: 'Missing required field: inventoryId' });
+  }
+
+  const rawCustomerId = (req.headers['x-customer-id'] || req.body?.customerId) as string | undefined;
+  const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
+
+  try {
+    // 1. Validate that inventoryId exists in Firestore inventories
+    const dbTarget = firestoreService.getTenantFirestore(databaseId);
+    let invDoc: any = null;
+    try {
+      const snap = await dbTarget.collection('inventories').doc(inventoryId).get();
+      if (snap && snap.exists) {
+        invDoc = snap.data();
+      } else if (db && db !== dbTarget) {
+        const fallbackSnap = await db.collection('inventories').doc(inventoryId).get();
+        if (fallbackSnap && fallbackSnap.exists) {
+          invDoc = fallbackSnap.data();
+        }
+      }
+    } catch {
+      if (db) {
+        const fallbackSnap = await db.collection('inventories').doc(inventoryId).get();
+        if (fallbackSnap && fallbackSnap.exists) {
+          invDoc = fallbackSnap.data();
+        }
+      }
+    }
+
+    if (!invDoc) {
+      return res.status(404).json({ error: `Inventory with ID '${inventoryId}' not found` });
+    }
+
+    const inventoryName = invDoc.name || inventoryId;
+    const nowIso = new Date().toISOString();
+
+    const updatePayload = {
+      inventoryId,
+      inventoryName,
+      inventoryAssociationType: 'MANUAL' as const,
+      associatedAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    await firestoreService.updateVideoRecord(databaseId, videoId, updatePayload);
+    if (databaseId !== '(default)') {
+      await firestoreService.updateVideoRecord('(default)', videoId, updatePayload);
+    }
+
+    const updatedVideo =
+      (await firestoreService.getVideoMetadata(databaseId, videoId)) ||
+      (await firestoreService.getVideoMetadata('(default)', videoId));
+
+    return res.status(200).json({
+      success: true,
+      message: `Video ${videoId} successfully associated with inventory '${inventoryName}' (${inventoryId}).`,
+      video: updatedVideo,
+      ...updatePayload,
+    });
+  } catch (error: any) {
+    console.error(`[VideoController] Error associating inventory with video ${videoId}:`, error);
+    return res.status(500).json({ error: error?.message || 'Failed to associate inventory' });
+  }
+};

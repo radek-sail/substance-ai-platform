@@ -34,3 +34,14 @@ Return a single JSON object conforming strictly to `WorkflowClassificationSchema
   "transcribedAudio": "string"
 }
 ```
+
+## Inventory Reconciliation & Downstream Anchoring
+When Pass 0 classifies a procedure as `INVENTORY_UPDATE_WORKFLOW` and extracts an `inventoryName`:
+1. **Automated Database Reconciliation**:
+   - The platform reconciles `inventoryName` against existing records in the Firestore `inventories` collection using case-insensitive exact matching and fuzzy token matching.
+   - Upon a match, `videos/{videoId}` is automatically linked with `inventoryId`, `inventoryName`, and `inventoryAssociationType: 'AUTOMATIC'`.
+2. **Human-in-the-Loop (HITL) Manual Fallback**:
+   - If no matching inventory is found, the video is flagged with `inventoryAssociationType: 'UNMATCHED'` and `unmatchedInventoryName`.
+   - Operators can manually select and assign an existing inventory via the Video Manager registry or Pass 0 stepper dropdown, which updates the video document via `POST /api/videos/:videoId/associate-inventory`.
+3. **Pass 1–3 Execution Anchoring**:
+   - Downstream perception passes (Pass 1 coarse action detection, Pass 2 sub-event detection, and Pass 3 high-resolution OCR & spatial grid differencing) rely on the associated `inventoryId` to anchor grid-cell mutations and cryo-box spatial slot actions.

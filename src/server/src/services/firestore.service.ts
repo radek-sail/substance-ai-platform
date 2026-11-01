@@ -126,6 +126,25 @@ function serializeTimestampField(val: any, fallbackIso?: string): string {
   return fallbackIso || new Date().toISOString();
 }
 
+function applyDotNotationUpdates(target: Record<string, any>, updates: Record<string, any>): Record<string, any> {
+  const result = { ...target };
+  for (const [key, val] of Object.entries(updates)) {
+    if (key.includes('.')) {
+      const parts = key.split('.');
+      let current = result;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const part = parts[i];
+        current[part] = current[part] ? { ...current[part] } : {};
+        current = current[part];
+      }
+      current[parts[parts.length - 1]] = val;
+    } else {
+      result[key] = val;
+    }
+  }
+  return result;
+}
+
 function createInMemoryCollectionFactory(dbId: string) {
   const store = getTenantMemoryStore(dbId);
 
@@ -195,13 +214,13 @@ function createInMemoryCollectionFactory(dbId: string) {
           },
           update: async (data: Record<string, any>) => {
             const existing = store.get(fullDocPath) || {};
+            const applied = applyDotNotationUpdates(existing, data);
             const mergedPasses =
-              existing.passes || data.passes
-                ? { ...(existing.passes || {}), ...(data.passes || {}) }
+              existing.passes || applied.passes
+                ? { ...(existing.passes || {}), ...(applied.passes || {}) }
                 : undefined;
             store.set(fullDocPath, {
-              ...existing,
-              ...data,
+              ...applied,
               ...(mergedPasses ? { passes: mergedPasses } : {}),
             });
             return { writeTime: new Date() } as unknown as WriteResult;
@@ -433,9 +452,15 @@ export async function updateVideoPass(
         // Ignore read error before merge
       }
     }
+    const existingPass = existingPasses[passKey] || {};
+    const cleanPassState: PassStepState = {
+      ...(passState.status === 'COMPLETED' ? { error: null } : {}),
+      ...(existingPass.executionAudit ? { executionAudit: existingPass.executionAudit } : {}),
+      ...passState,
+    };
     const updatedPasses: VideoPasses = {
       ...existingPasses,
-      [passKey]: stripUndefinedFields(passState),
+      [passKey]: stripUndefinedFields(cleanPassState),
     };
     const payload = stripUndefinedFields({
       videoId,
@@ -516,8 +541,12 @@ function formatVideoDocument(id: string, data: Record<string, any>): Record<stri
     ? serializeTimestampField(data.transcodedAt, data.updatedAt || uploadedAtIso)
     : undefined;
 
+  const pass0 = data.passes?.pass0 ? { ...data.passes.pass0 } : { status: 'PENDING' };
+  if (pass0.status === 'COMPLETED') {
+    pass0.error = null;
+  }
   const passes: VideoPasses = {
-    pass0: data.passes?.pass0 || { status: 'PENDING' },
+    pass0,
     pass1: data.passes?.pass1 || { status: 'PENDING' },
     pass2: data.passes?.pass2 || { status: 'PENDING' },
     pass3: data.passes?.pass3 || { status: 'PENDING' },
@@ -538,6 +567,11 @@ function formatVideoDocument(id: string, data: Record<string, any>): Record<stri
     rawGcsUri: data.rawGcsUri || data.originalGcsUri || '',
     normalizedGcsUri: data.normalizedGcsUri || firstChunkUri || '',
     status: data.status || 'READY_FOR_ANALYSIS',
+    inventoryId: data.inventoryId !== undefined ? data.inventoryId : null,
+    inventoryName: data.inventoryName !== undefined ? data.inventoryName : null,
+    unmatchedInventoryName: data.unmatchedInventoryName !== undefined ? data.unmatchedInventoryName : null,
+    inventoryAssociationType: data.inventoryAssociationType !== undefined ? data.inventoryAssociationType : null,
+    associatedAt: data.associatedAt !== undefined ? data.associatedAt : null,
     passes,
     uploadedAt: uploadedAtIso,
     ...(transcodedAtIso ? { transcodedAt: transcodedAtIso } : {}),

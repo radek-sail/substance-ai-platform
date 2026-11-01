@@ -60,6 +60,7 @@ export const App: React.FC = () => {
 
   // Navigation tab state
   const [activeTab, setActiveTab] = useState<WorkflowTab>('inventory');
+  const [selectedInventoryId, setSelectedInventoryId] = useState<string | null>(null);
 
   // Multi-tenant configuration
   const [tenant, setTenant] = useState<TenantConfig>(DEFAULT_TENANT_CONFIG);
@@ -286,11 +287,34 @@ export const App: React.FC = () => {
     }
   };
 
+  // Handle direct navigation to inventory tab with pre-selected inventory ID
+  const handleNavigateToInventory = (inventoryId?: string, videoId?: string) => {
+    if (inventoryId) {
+      setSelectedInventoryId(inventoryId);
+    }
+    if (videoId) {
+      setActiveVideoId(videoId);
+    }
+    setActiveTab('inventory');
+    showToast('info', `Navigated to Cryo-Inventory${inventoryId ? ` (${inventoryId})` : ''}`);
+  };
+
   // Handle seeking from timeline
   const handleTimelineSeek = (time: number) => {
     setCurrentTime(time);
     setSeekTarget(time);
   };
+
+  // Listen for cross-component seek events
+  useEffect(() => {
+    const handleSeekEvent = (e: any) => {
+      if (typeof e.detail?.seconds === 'number') {
+        handleTimelineSeek(e.detail.seconds);
+      }
+    };
+    window.addEventListener('sail:seek-video', handleSeekEvent);
+    return () => window.removeEventListener('sail:seek-video', handleSeekEvent);
+  }, []);
 
   // Handle selecting action from timeline
   const handleSelectAction = (actionId: string) => {
@@ -475,6 +499,9 @@ export const App: React.FC = () => {
             activeStreamId={activeVideoId}
             onSelectActiveStream={handleSelectActiveStream}
             onSelectVideoForReview={handleSelectVideoFromManager}
+            onNavigateToInventory={handleNavigateToInventory}
+            onSeekVideo={handleTimelineSeek}
+            currentTime={currentTime}
           />
         ) : !analysis ? (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center space-y-4 shadow-xl">
@@ -499,41 +526,9 @@ export const App: React.FC = () => {
           </div>
         ) : (
           <div className="space-y-6">
-            {/* Top Workspace: Synchronized Video & Timeline Scrubber */}
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-              {/* HTML5 Programmatic Video Player */}
-              <div className="lg:col-span-5">
-                <VideoPlayer
-                  currentTime={currentTime}
-                  duration={duration}
-                  isPlaying={isPlaying}
-                  onTimeUpdate={setCurrentTime}
-                  onDurationChange={setDuration}
-                  onPlayPause={setIsPlaying}
-                  seekTarget={seekTarget}
-                  onSeekHandled={() => setSeekTarget(null)}
-                />
-              </div>
-
-              {/* Synchronized Recharts Audio Waveform & Multi-Track Timeline */}
-              <div className="lg:col-span-7">
-                <TimelineViewer
-                  duration={duration}
-                  currentTime={currentTime}
-                  actions={safeActions}
-                  events={safeEvents}
-                  selectedActionId={selectedActionId}
-                  selectedEventId={selectedEventId}
-                  onSeek={handleTimelineSeek}
-                  onSelectAction={handleSelectAction}
-                  onSelectEvent={handleSelectEvent}
-                />
-              </div>
-            </div>
-
-            {/* Bottom Workspace: Domain Specific Panels */}
             {activeTab === 'inventory' ? (
               <CryoInventory
+                initialInventoryId={selectedInventoryId}
                 activeStream={activeVideoId}
                 tenant={tenant}
                 analysis={analysis}
@@ -560,27 +555,71 @@ export const App: React.FC = () => {
                 onAnalysisLoaded={(loadedVideoId, doc) =>
                   applyAnalysisDocument(loadedVideoId, doc, 'inventory')
                 }
+                duration={duration}
+                currentTime={currentTime}
+                safeActions={safeActions}
+                safeEvents={safeEvents}
+                selectedActionId={selectedActionId}
+                selectedEventId={selectedEventId}
+                onSeek={handleTimelineSeek}
+                onSelectAction={handleSelectAction}
+                onSelectEvent={handleSelectEvent}
               />
             ) : (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-                {/* 96-Well Microplate View with 8-Channel Multichannel Pipette Confirmation */}
-                <div className="lg:col-span-6">
-                  <MicroplateView
-                    seededColumns={seededColumns}
-                    volumePerWellUls={100}
-                    onToggleColumn={handleTogglePlateColumn}
-                    readOnly={isSignedOff}
-                  />
+              <div className="space-y-6">
+                {/* Top Workspace: Synchronized Video & Timeline Scrubber */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                  {/* HTML5 Programmatic Video Player */}
+                  <div className="lg:col-span-5">
+                    <VideoPlayer
+                      currentTime={currentTime}
+                      duration={duration}
+                      isPlaying={isPlaying}
+                      onTimeUpdate={setCurrentTime}
+                      onDurationChange={setDuration}
+                      onPlayPause={setIsPlaying}
+                      seekTarget={seekTarget}
+                      onSeekHandled={() => setSeekTarget(null)}
+                    />
+                  </div>
+
+                  {/* Synchronized Recharts Audio Waveform & Multi-Track Timeline */}
+                  <div className="lg:col-span-7">
+                    <TimelineViewer
+                      duration={duration}
+                      currentTime={currentTime}
+                      actions={safeActions}
+                      events={safeEvents}
+                      selectedActionId={selectedActionId}
+                      selectedEventId={selectedEventId}
+                      onSeek={handleTimelineSeek}
+                      onSelectAction={handleSelectAction}
+                      onSelectEvent={handleSelectEvent}
+                    />
+                  </div>
                 </div>
 
-                {/* ELN Markdown Editor & Reagent Acronym Resolver */}
-                <div className="lg:col-span-6">
-                  <NotebookEditor
-                    markdownDoc={markdownDoc}
-                    onChangeMarkdown={setMarkdownDoc}
-                    reagentMappings={reagentMappings}
-                    readOnly={isSignedOff}
-                  />
+                {/* Bottom Workspace: Domain Specific Panels */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                  {/* 96-Well Microplate View with 8-Channel Multichannel Pipette Confirmation */}
+                  <div className="lg:col-span-6">
+                    <MicroplateView
+                      seededColumns={seededColumns}
+                      volumePerWellUls={100}
+                      onToggleColumn={handleTogglePlateColumn}
+                      readOnly={isSignedOff}
+                    />
+                  </div>
+
+                  {/* ELN Markdown Editor & Reagent Acronym Resolver */}
+                  <div className="lg:col-span-6">
+                    <NotebookEditor
+                      markdownDoc={markdownDoc}
+                      onChangeMarkdown={setMarkdownDoc}
+                      reagentMappings={reagentMappings}
+                      readOnly={isSignedOff}
+                    />
+                  </div>
                 </div>
               </div>
             )}

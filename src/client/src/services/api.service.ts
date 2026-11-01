@@ -13,11 +13,16 @@ import {
   type VideoPasses,
   type PassStepState,
   type PassStatus,
+  type InventoryRecord,
+  type InventoryBox,
+  type InventoryCell,
+  type CreateInventoryInput,
   DEFAULT_VIDEO_PASSES,
 } from '@sail/shared';
 import { auth } from '../firebase';
 
 export type { VideoRecord, VideoStatus, VideoPasses, PassStepState, PassStatus };
+export type { InventoryRecord, InventoryBox, InventoryCell, CreateInventoryInput };
 export { DEFAULT_VIDEO_PASSES };
 
 export interface TenantConfig {
@@ -422,6 +427,144 @@ export class ApiService {
   }
 
   /**
+   * GET all inventories from `/api/inventories`.
+   */
+  public async fetchInventories(options?: { customerId?: string; databaseId?: string }): Promise<InventoryRecord[]> {
+    try {
+      const headers = await this.getHeaders({
+        'x-customer-id': options?.customerId || this.tenant.customerId,
+        'x-database-id': options?.databaseId || this.tenant.databaseId,
+      });
+      const res = await fetch(`${this.baseUrl}/api/inventories`, {
+        method: 'GET',
+        headers,
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json)) return json as InventoryRecord[];
+        if (json && Array.isArray(json.inventories)) return json.inventories as InventoryRecord[];
+      }
+    } catch (err) {
+      console.warn('[ApiService] Failed to fetch inventories from /api/inventories:', err);
+    }
+    return [];
+  }
+
+  /**
+   * GET single inventory from `/api/inventories/:id`.
+   */
+  public async fetchInventoryById(
+    id: string,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<InventoryRecord | null> {
+    try {
+      const headers = await this.getHeaders({
+        'x-customer-id': options?.customerId || this.tenant.customerId,
+        'x-database-id': options?.databaseId || this.tenant.databaseId,
+      });
+      const res = await fetch(`${this.baseUrl}/api/inventories/${encodeURIComponent(id)}`, {
+        method: 'GET',
+        headers,
+      });
+      if (res.ok) {
+        return (await res.json()) as InventoryRecord;
+      }
+    } catch (err) {
+      console.warn(`[ApiService] Failed to fetch inventory ${id}:`, err);
+    }
+    return null;
+  }
+
+  /**
+   * POST new inventory to `/api/inventories`.
+   */
+  public async createInventory(
+    payload: CreateInventoryInput,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<InventoryRecord> {
+    const headers = await this.getHeaders({
+      'Content-Type': 'application/json',
+      'x-customer-id': options?.customerId || this.tenant.customerId,
+      'x-database-id': options?.databaseId || this.tenant.databaseId,
+    });
+    const res = await fetch(`${this.baseUrl}/api/inventories`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to create inventory: status ${res.status}`);
+    }
+    return (await res.json()) as InventoryRecord;
+  }
+
+  /**
+   * PATCH cell in inventory `/api/inventories/:id/cells`.
+   */
+  public async updateInventoryCell(
+    id: string,
+    payload: {
+      boxId: string;
+      cellCoordinate: string;
+      occupied: boolean;
+      vial?: {
+        cellLineIdentifier?: string;
+        lotNumber?: string;
+        passageNumber?: number | string;
+        notes?: string;
+      };
+    }
+  ): Promise<any> {
+    const headers = await this.getHeaders({
+      'Content-Type': 'application/json',
+    });
+    const res = await fetch(`${this.baseUrl}/api/inventories/${encodeURIComponent(id)}/cells`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to update cell: status ${res.status}`);
+    }
+    return await res.json();
+  }
+
+  /**
+   * POST /api/videos/:videoId/associate-inventory
+   * Manually associates an uploaded video with an inventory record.
+   */
+  public async associateVideoInventory(
+    videoId: string,
+    inventoryId: string,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<{ success: boolean; video: VideoRecord; inventoryId: string; inventoryName: string }> {
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
+    const customerId = options?.customerId || this.tenant.customerId;
+
+    const headers = await this.getHeaders({
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+      'Content-Type': 'application/json',
+    });
+
+    const res = await fetch(`${this.baseUrl}/api/videos/${encodeURIComponent(videoId)}/associate-inventory`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ inventoryId }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to associate inventory: status ${res.status}`);
+    }
+
+    return await res.json();
+  }
+
+  /**
    * GET analysis document from `/databases/{databaseId}/documents/video_analyses/{videoId}`.
    * For uploaded videos, fetches from Firestore `video_analyses/{videoId}` (or synthesizes from completed
    * Pass 2 / Pass 3 outputs in `videos/{videoId}.passes`) without falling back to mock `vid_cryo_demo_01`.
@@ -558,7 +701,13 @@ export class ApiService {
   public async runPipelinePass(
     videoId: string,
     pass: 0 | 1 | 2 | 3 | 'all',
-    options?: { customerId?: string; databaseId?: string; videoGcsUri?: string }
+    options?: {
+      customerId?: string;
+      databaseId?: string;
+      videoGcsUri?: string;
+      model?: string;
+      thinkingLevel?: string;
+    }
   ): Promise<RunPassResponse> {
     const customerId = options?.customerId || this.tenant.customerId;
     const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
@@ -577,6 +726,8 @@ export class ApiService {
         videoId,
         pass,
         ...(options?.videoGcsUri ? { videoGcsUri: options.videoGcsUri } : {}),
+        ...(options?.model ? { model: options.model } : {}),
+        ...(options?.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
         customerId,
         databaseId,
       }),
@@ -821,7 +972,13 @@ export const fetchVideoPasses = (videoId: string, options?: { customerId?: strin
 export const runPipelinePass = (
   videoId: string,
   pass: 0 | 1 | 2 | 3 | 'all',
-  options?: { customerId?: string; databaseId?: string; videoGcsUri?: string }
+  options?: {
+    customerId?: string;
+    databaseId?: string;
+    videoGcsUri?: string;
+    model?: string;
+    thinkingLevel?: string;
+  }
 ) => apiService.runPipelinePass(videoId, pass, options);
 
 export const fetchVideoAnalysis = (videoId: string, options?: { customerId?: string; databaseId?: string }) =>

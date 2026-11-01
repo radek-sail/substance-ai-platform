@@ -5,6 +5,7 @@ import {
   listVideosHandler,
   requestUploadUrlHandler,
   finalizeUploadHandler,
+  associateInventoryHandler,
 } from '../controllers/video.controller';
 
 const router: Router = Router();
@@ -20,5 +21,8 @@ router.post('/finalize-upload', finalizeUploadHandler);
 
 // Decoupled ingestion & FFmpeg normalization route: POST /api/videos/upload
 router.post('/upload', uploadMiddleware, uploadVideoHandler);
+
+// Manually associate video with an inventory: POST /api/videos/:videoId/associate-inventory
+router.post('/:videoId/associate-inventory', associateInventoryHandler);
 
 export default router;

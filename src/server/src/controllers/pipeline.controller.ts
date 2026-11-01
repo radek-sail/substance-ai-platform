@@ -18,6 +18,8 @@ import {
   runPass3AnalysisRefinement,
 } from '../services/gemini.service';
 import {
+  db,
+  getTenantFirestore,
   normalizeDatabaseId,
   getVideoMetadata,
   updateVideoRecord,
@@ -28,6 +30,100 @@ import {
   commitInventorySignOff,
   commitArchiveSignOff,
 } from '../services/firestore.service';
+
+/**
+ * Automatically reconciles video inventory association against Firestore inventories.
+ */
+export async function reconcileVideoInventoryAssociation(
+  databaseId: string,
+  videoId: string,
+  classification: WorkflowClassification
+): Promise<{
+  matched: boolean;
+  inventoryId: string | null;
+  inventoryName?: string | null;
+  unmatchedInventoryName?: string | null;
+  inventoryAssociationType?: 'AUTOMATIC' | 'UNMATCHED';
+}> {
+  if (
+    classification.workflowType === 'INVENTORY_UPDATE_WORKFLOW' &&
+    classification.inventoryName &&
+    classification.inventoryName.trim().length > 0
+  ) {
+    const rawTargetName = classification.inventoryName.trim().toLowerCase();
+    const dbTarget = getTenantFirestore(databaseId);
+    let snapshot: any;
+    try {
+      snapshot = await dbTarget.collection('inventories').get();
+      if ((!snapshot || snapshot.empty) && db && db !== dbTarget) {
+        snapshot = await db.collection('inventories').get();
+      }
+    } catch {
+      try {
+        snapshot = await db.collection('inventories').get();
+      } catch (err) {
+        console.warn('[PipelineController] Could not fetch inventories for reconciliation:', err);
+      }
+    }
+
+    let matchedDoc: any = null;
+    if (snapshot && !snapshot.empty && Array.isArray(snapshot.docs)) {
+      // 1. Exact match on name.trim().toLowerCase()
+      matchedDoc = snapshot.docs.find((d: any) => {
+        const invName = d.data()?.name;
+        return typeof invName === 'string' && invName.trim().toLowerCase() === rawTargetName;
+      });
+
+      // 2. Fuzzy match if exact match not found
+      if (!matchedDoc) {
+        matchedDoc = snapshot.docs.find((d: any) => {
+          const invName = d.data()?.name;
+          if (typeof invName !== 'string') return false;
+          const lower = invName.trim().toLowerCase();
+          return lower.includes(rawTargetName) || rawTargetName.includes(lower);
+        });
+      }
+    }
+
+    if (matchedDoc) {
+      const matchedData = matchedDoc.data() || {};
+      const matchedName = matchedData.name || matchedDoc.id;
+      const updatePayload = {
+        inventoryId: matchedDoc.id,
+        inventoryName: matchedName,
+        inventoryAssociationType: 'AUTOMATIC' as const,
+        associatedAt: new Date().toISOString(),
+      };
+      await updateVideoRecord(databaseId, videoId, updatePayload);
+      if (databaseId !== '(default)') {
+        await updateVideoRecord('(default)', videoId, updatePayload);
+      }
+      return {
+        matched: true,
+        inventoryId: matchedDoc.id,
+        inventoryName: matchedName,
+        inventoryAssociationType: 'AUTOMATIC',
+      };
+    } else {
+      const unmatchedPayload = {
+        inventoryId: null,
+        unmatchedInventoryName: classification.inventoryName,
+        inventoryAssociationType: 'UNMATCHED' as const,
+      };
+      await updateVideoRecord(databaseId, videoId, unmatchedPayload);
+      if (databaseId !== '(default)') {
+        await updateVideoRecord('(default)', videoId, unmatchedPayload);
+      }
+      return {
+        matched: false,
+        inventoryId: null,
+        unmatchedInventoryName: classification.inventoryName,
+        inventoryAssociationType: 'UNMATCHED',
+      };
+    }
+  }
+  return { matched: false, inventoryId: null };
+}
 
 /**
  * Persists a pass JSON artifact to disk (`workflowClassification.json`, `workloadClassification.json`,
@@ -153,11 +249,26 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
     // Persist into Firestore default database (or specified tenant database) under video_analyses/{videoId}
     await saveVideoAnalysis(databaseId, videoId, analysisPayload);
 
+    const actionsPayload = (actions as any).toJSON ? (actions as any).toJSON() : actions;
+    await writePassArtifactJson(videoId, 'action_detection_pass.json', actionsPayload);
+
     const completedPasses: VideoPasses = {
-      pass0: { status: 'COMPLETED', data: workloadClassification, completedAt: nowIso },
-      pass1: { status: 'COMPLETED', data: actions, completedAt: nowIso },
-      pass2: { status: 'COMPLETED', data: events, completedAt: nowIso },
-      pass3: { status: 'COMPLETED', data: refinements, completedAt: nowIso },
+      pass0: {
+        status: 'COMPLETED',
+        data: workloadClassification,
+        executionAudit: (workloadClassification as any)?.executionAudit,
+        error: null,
+        completedAt: nowIso,
+      },
+      pass1: {
+        status: 'COMPLETED',
+        data: actionsPayload,
+        executionAudit: (actions as any)?.executionAudit || (actionsPayload as any)?.executionAudit,
+        error: null,
+        completedAt: nowIso,
+      },
+      pass2: { status: 'COMPLETED', data: events, error: null, completedAt: nowIso },
+      pass3: { status: 'COMPLETED', data: refinements, error: null, completedAt: nowIso },
       hitl: { status: 'PENDING' },
     };
 
@@ -176,6 +287,38 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
         updatedAt: nowIso,
       });
     }
+
+    try {
+      await db.collection('videos').doc(videoId).update({
+        'passes.pass0.status': 'COMPLETED',
+        'passes.pass0.error': null,
+        'passes.pass0.data': workloadClassification,
+        'passes.pass0.executionAudit': (workloadClassification as any)?.executionAudit,
+        'passes.pass1.status': 'COMPLETED',
+        'passes.pass1.error': null,
+        'passes.pass1.data': actionsPayload,
+        'passes.pass1.executionAudit': (actions as any)?.executionAudit || (actionsPayload as any)?.executionAudit,
+        updatedAt: nowIso,
+      });
+      if (databaseId !== '(default)') {
+        await getTenantFirestore(databaseId).collection('videos').doc(videoId).update({
+          'passes.pass0.status': 'COMPLETED',
+          'passes.pass0.error': null,
+          'passes.pass0.data': workloadClassification,
+          'passes.pass0.executionAudit': (workloadClassification as any)?.executionAudit,
+          'passes.pass1.status': 'COMPLETED',
+          'passes.pass1.error': null,
+          'passes.pass1.data': actionsPayload,
+          'passes.pass1.executionAudit': (actions as any)?.executionAudit || (actionsPayload as any)?.executionAudit,
+          updatedAt: nowIso,
+        });
+      }
+    } catch {
+      // Ignore direct update fallback error
+    }
+
+    // Reconcile automatic inventory matching
+    await reconcileVideoInventoryAssociation(databaseId, videoId, workloadClassification);
 
     return res.status(200).json({
       success: true,
@@ -243,6 +386,8 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
     localFilePath: req.body?.localFilePath,
     customerId,
     databaseId,
+    model: req.body?.model,
+    thinkingLevel: req.body?.thinkingLevel,
   });
 
   if (!parsedReq.success) {
@@ -251,7 +396,7 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
     });
   }
 
-  const { videoId, pass, videoGcsUri, localFilePath } = parsedReq.data;
+  const { videoId, pass, videoGcsUri, localFilePath, model, thinkingLevel } = parsedReq.data;
   const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
 
   // 1. Retrieve video metadata from videos/{videoId}
@@ -329,16 +474,45 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         registeredFileUri: geminiFileUri,
         videoRecord: videoDoc,
         databaseId,
+        model,
       });
       await writePassArtifactJson(videoId, 'workflowClassification.json', classification);
       await writePassArtifactJson(videoId, 'workloadClassification.json', classification);
       const completedAt = new Date().toISOString();
+      const pass0Audit = (classification as any)?.executionAudit;
       await syncPassState('pass0', {
         status: 'COMPLETED',
         data: classification,
+        executionAudit: pass0Audit,
+        error: null,
         startedAt,
         completedAt,
       });
+
+      // Explicitly clear stale error in Firestore on success
+      try {
+        await db.collection('videos').doc(videoId).update({
+          'passes.pass0.status': 'COMPLETED',
+          'passes.pass0.error': null,
+          'passes.pass0.data': classification,
+          'passes.pass0.executionAudit': pass0Audit,
+          updatedAt: completedAt,
+        });
+        if (databaseId !== '(default)') {
+          await getTenantFirestore(databaseId).collection('videos').doc(videoId).update({
+            'passes.pass0.status': 'COMPLETED',
+            'passes.pass0.error': null,
+            'passes.pass0.data': classification,
+            'passes.pass0.executionAudit': pass0Audit,
+            updatedAt: completedAt,
+          });
+        }
+      } catch (directUpdErr) {
+        console.warn('[PipelineController] Could not directly update pass0 status/error:', directUpdErr);
+      }
+
+      // Reconcile automatic inventory matching
+      await reconcileVideoInventoryAssociation(databaseId, videoId, classification);
       return classification;
     };
 
@@ -358,15 +532,35 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         customerId,
         videoId,
         registeredFileUri: geminiFileUri,
+        databaseId,
+        videoRecord: videoDoc,
+        model,
+        thinkingLevel,
       });
-      await writePassArtifactJson(videoId, 'action_detection_pass.json', actions);
+      const pass1Payload = (actions as any).toJSON ? (actions as any).toJSON() : actions;
+      const pass1Audit = (actions as any)?.executionAudit || (pass1Payload as any)?.executionAudit;
+      await writePassArtifactJson(videoId, 'action_detection_pass.json', pass1Payload);
       const completedAt = new Date().toISOString();
       await syncPassState('pass1', {
         status: 'COMPLETED',
-        data: actions,
+        data: pass1Payload,
+        executionAudit: pass1Audit,
+        error: null,
         startedAt,
         completedAt,
       });
+
+      // Explicitly clear stale error in Firestore on success
+      try {
+        await db.collection('videos').doc(videoId).update({
+          'passes.pass1.status': 'COMPLETED',
+          'passes.pass1.error': null,
+          'passes.pass1.data': pass1Payload,
+          'passes.pass1.executionAudit': pass1Audit,
+        });
+      } catch (err) {
+        console.warn(`[PipelineController] Could not clear pass1 error directly on doc:`, err);
+      }
       return actions;
     };
 
@@ -379,10 +573,15 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         classificationInput ||
         currentPasses.pass0?.data ||
         (await runStep0());
-      const actions: Action[] =
+      const rawActionsData =
         actionsInput ||
         currentPasses.pass1?.data ||
         (await runStep1(classification));
+      const actions: Action[] = Array.isArray(rawActionsData)
+        ? rawActionsData
+        : Array.isArray((rawActionsData as any)?.actions)
+        ? (rawActionsData as any).actions
+        : [];
       activePassKey = 'pass2';
       const startedAt = new Date().toISOString();
       await syncPassState('pass2', { status: 'RUNNING', startedAt });
@@ -394,15 +593,38 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         customerId,
         videoId,
         registeredFileUri: geminiFileUri,
+        databaseId,
+        model,
       });
       await writePassArtifactJson(videoId, 'event_detection_pass.json', events);
       const completedAt = new Date().toISOString();
       await syncPassState('pass2', {
         status: 'COMPLETED',
         data: events,
+        error: null,
         startedAt,
         completedAt,
       });
+
+      // Explicitly clear stale error in Firestore on success
+      try {
+        await db.collection('videos').doc(videoId).update({
+          'passes.pass2.status': 'COMPLETED',
+          'passes.pass2.error': null,
+          'passes.pass2.data': events,
+          updatedAt: completedAt,
+        });
+        if (databaseId !== '(default)') {
+          await getTenantFirestore(databaseId).collection('videos').doc(videoId).update({
+            'passes.pass2.status': 'COMPLETED',
+            'passes.pass2.error': null,
+            'passes.pass2.data': events,
+            updatedAt: completedAt,
+          });
+        }
+      } catch (directUpdErr) {
+        console.warn('[PipelineController] Could not directly update pass2 status/error:', directUpdErr);
+      }
 
       // Also persist intermediate analysis to video_analyses/{videoId} so CryoInventory can load after Pass 2
       const partialAnalysis = {
@@ -439,10 +661,15 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         classificationInput ||
         currentPasses.pass0?.data ||
         (await runStep0());
-      const actions: Action[] =
+      const rawActionsData =
         actionsInput ||
         currentPasses.pass1?.data ||
         (await runStep1(classification));
+      const actions: Action[] = Array.isArray(rawActionsData)
+        ? rawActionsData
+        : Array.isArray((rawActionsData as any)?.actions)
+        ? (rawActionsData as any).actions
+        : [];
       const events: Event[] =
         eventsInput ||
         currentPasses.pass2?.data ||
@@ -459,6 +686,8 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         customerId,
         videoId,
         registeredFileUri: geminiFileUri,
+        databaseId,
+        model,
       });
 
       // Link refinementIds back onto corresponding parent events
@@ -492,10 +721,12 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
       currentPasses.pass1 = {
         ...currentPasses.pass1,
         data: enrichedActions,
+        error: null,
       };
       currentPasses.pass2 = {
         ...currentPasses.pass2,
         data: enrichedEvents,
+        error: null,
       };
 
       const analysisPayload = {
@@ -520,6 +751,7 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         {
           status: 'COMPLETED',
           data: refinements,
+          error: null,
           startedAt,
           completedAt,
         },

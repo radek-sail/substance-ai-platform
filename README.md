@@ -56,7 +56,7 @@ Raw / Normalized Video
 └────────────────────────────────────────┘
 ```
 
-- **Pass 0 (Workflow Classifier)**: Scans initial operator speech against `config/classification-agent-guidelines.md` to classify streams (`INVENTORY_UPDATE_WORKFLOW`, `EXPERIMENT_NOTEBOOK_WORKFLOW`, or `UNCLASSIFIED_WORKFLOW`).
+- **Pass 0 (Workflow Classifier)**: Scans initial operator speech against `config/classification-agent-guidelines.md` to classify streams (`INVENTORY_UPDATE_WORKFLOW`, `EXPERIMENT_NOTEBOOK_WORKFLOW`, or `UNCLASSIFIED_WORKFLOW`). For `INVENTORY_UPDATE_WORKFLOW`, extracts `inventoryName` and automatically reconciles against existing Firestore `inventories` records (with Human-in-the-Loop fallback manual association if unmatched) to anchor downstream Passes 1–3 box actions.
 - **Pass 1 (Action Detection)**: Detects high-level compound actions over wide temporal spans (`VIAL_INSERTION_ACTION`, `REAGENT_MIXING_ACTION`, `REAGENT_SEEDING_ACTION`).
 - **Pass 2 (Event Detection)**: Extracts fine-grained sub-events (label presentations, pre/post-action states), timestamps, and candidate best-shot frame image URLs.
 - **Pass 3 (Refinement)**: Executes targeted perceptual reasoning: multi-frame OCR conflation, spatial coordinate differencing from the top-left origin (lettered rows, numbered columns), and spoken parameter verification.

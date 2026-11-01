@@ -4,10 +4,12 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import videoRoutes from './routes/video.routes';
 import pipelineRoutes from './routes/pipeline.routes';
+import inventoryRoutes from './routes/inventory.routes';
 import {
   uploadMiddleware,
   uploadVideoHandler,
   listVideosHandler,
+  associateInventoryHandler,
 } from './controllers/video.controller';
 import {
   analyzePipelineHandler,
@@ -17,6 +19,11 @@ import {
   archiveSignOffHandler,
   getVideoAnalysisHandler,
 } from './controllers/pipeline.controller';
+import {
+  listInventoriesHandler,
+  createInventoryHandler,
+  getInventoryHandler,
+} from './controllers/inventory.controller';
 
 // Load environment variables
 dotenv.config();
@@ -51,6 +58,7 @@ app.use('/api/videos', videoRoutes);
 // Direct route registrations for video endpoints
 app.get('/api/videos', listVideosHandler);
 app.post('/api/videos/upload', uploadMiddleware, uploadVideoHandler);
+app.post('/api/videos/:videoId/associate-inventory', associateInventoryHandler);
 
 // Pipeline analysis routes
 app.use('/api/pipeline', pipelineRoutes);
@@ -64,6 +72,12 @@ app.post('/api/signoff/archive', archiveSignOffHandler);
 
 // Multi-tenant document lookup endpoint
 app.get('/databases/:databaseId/documents/video_analyses/:videoId', getVideoAnalysisHandler);
+
+// Multi-inventory management routes
+app.use('/api/inventories', inventoryRoutes);
+app.get('/api/inventories', listInventoriesHandler);
+app.post('/api/inventories', createInventoryHandler);
+app.get('/api/inventories/:id', getInventoryHandler);
 
 // ----------------------------------------------------
 // Serve Vite frontend static assets

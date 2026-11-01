@@ -1,5 +1,34 @@
 import { z } from 'zod';
 
+export const ExecutionAuditSchema = z
+  .object({
+    model: z.string().optional(),
+    modelUsed: z.string().optional(),
+    thinkingLevel: z.string().optional(),
+    endpoint: z.string().optional(),
+    calledAt: z.string().optional(),
+    promptText: z.string().optional(),
+    systemInstruction: z.string().nullable().optional(),
+    generationConfig: z.record(z.any()).optional(),
+    schema: z.record(z.any()).nullable().optional(),
+    videoMetadata: z
+      .object({
+        durationSeconds: z.number().optional(),
+        uri: z.string().optional(),
+      })
+      .optional(),
+    modelDiagnostics: z
+      .object({
+        finishReason: z.string().optional(),
+        usageMetadata: z.record(z.any()).nullable().optional(),
+        thoughtsTokenCount: z.number().optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+export type ExecutionAudit = z.infer<typeof ExecutionAuditSchema>;
+
 export const WorkflowClassificationSchema = z.object({
   workflowType: z.enum([
     'INVENTORY_UPDATE_WORKFLOW',
@@ -9,8 +38,51 @@ export const WorkflowClassificationSchema = z.object({
   inventoryName: z.string().nullable().optional(),
   archiveName: z.string().nullable().optional(),
   transcribedAudio: z.string(),
+  modelUsed: z.string().optional(),
+  executionAudit: ExecutionAuditSchema.optional(),
 });
 export type WorkflowClassification = z.infer<typeof WorkflowClassificationSchema>;
+
+export const ActionIntervalSchema = z.object({
+  actionId: z.string(),
+  actionType: z.string(), // "VIAL_INSERTION" | "VIAL_REMOVAL" | "CAP_REMOVAL" | "BOX_MANIPULATION" | string
+  description: z.string(),
+  startTime: z.string(),
+  endTime: z.string(),
+  startTimestampSeconds: z.number(),
+  endTimestampSeconds: z.number(),
+  confidenceScore: z.number(),
+  targetLocation: z
+    .object({
+      tower: z.string().optional(),
+      box: z.string().optional(),
+      coordinate: z.string().optional(),
+    })
+    .optional(),
+  targetCoordinate: z.string().optional(),
+  actionClass: z.string().optional(),
+  inventoryId: z.string().optional(),
+  archiveId: z.string().optional(),
+  cellLineName: z.string().optional(),
+  cellLineInfo: z.record(z.any()).optional(),
+  towerId: z.string().optional(),
+  boxRowId: z.string().optional(),
+  boxColId: z.number().optional(),
+  eventList: z.array(z.string()).optional(),
+});
+export type ActionInterval = z.infer<typeof ActionIntervalSchema>;
+
+export const ActionDetectionPassResultSchema = z.object({
+  videoId: z.string(),
+  totalActionsDetected: z.number(),
+  workflowContext: z.string().optional(),
+  actions: z.array(ActionIntervalSchema),
+  generatedAt: z.string(),
+  modelUsed: z.string().optional(),
+  thinkingLevel: z.string().optional(),
+  executionAudit: ExecutionAuditSchema.optional(),
+});
+export type ActionDetectionPassResult = z.infer<typeof ActionDetectionPassResultSchema>;
 
 export const ActionSchema = z.object({
   actionId: z.string(),
@@ -20,6 +92,21 @@ export const ActionSchema = z.object({
     'REAGENT_MIXING_ACTION',
     'REAGENT_SEEDING_ACTION',
   ]),
+  actionType: z.string().optional(),
+  description: z.string().optional(),
+  startTime: z.string().optional(),
+  endTime: z.string().optional(),
+  startTimestampSeconds: z.number().optional(),
+  endTimestampSeconds: z.number().optional(),
+  confidenceScore: z.number().optional(),
+  targetLocation: z
+    .object({
+      tower: z.string().optional(),
+      box: z.string().optional(),
+      coordinate: z.string().optional(),
+    })
+    .optional(),
+  targetCoordinate: z.string().optional(),
   inventoryId: z.string().optional(),
   archiveId: z.string().optional(),
   cellLineName: z.string().optional(),
@@ -31,18 +118,36 @@ export const ActionSchema = z.object({
 });
 export type Action = z.infer<typeof ActionSchema>;
 
+export const timeField = z.union([
+  z.number(),
+  z.string().transform((val) => {
+    if (val.includes(':')) {
+      const parts = val.split(':').map(Number);
+      if (parts.length === 2) return parts[0] * 60 + parts[1];
+      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+    const num = Number(val);
+    return isNaN(num) ? 0 : num;
+  }),
+]);
+
 export const EventSchema = z.object({
   eventId: z.string(),
   actionId: z.string(),
-  eventClass: z.string(),
-  eventTrack: z.enum(['video', 'audio']),
-  startTime: z.number(),
-  endTime: z.number(),
-  bestShotUrls: z.array(z.string()),
-  bestShotTimes: z.array(z.number()),
-  refinementList: z.array(z.string()),
+  eventClass: z.string().optional().default('VIAL_INSERTION'),
+  eventTrack: z.enum(['video', 'audio']).default('video'),
+  startTime: timeField,
+  endTime: timeField,
+  bestShotUrls: z.array(z.string()).default([]),
+  bestShotTimes: z.array(z.number()).default([]),
+  refinementList: z.array(z.string()).default([]),
 });
 export type Event = z.infer<typeof EventSchema>;
+
+export const EventDetectionSchema = z.object({
+  events: z.array(EventSchema),
+});
+export type EventDetection = z.infer<typeof EventDetectionSchema>;
 
 export const RefinementSchema = z.object({
   refinementId: z.string(),
@@ -82,7 +187,10 @@ export type PassStatus = z.infer<typeof PassStatusSchema>;
 export const PassStepStateSchema = z.object({
   status: PassStatusSchema.default('PENDING'),
   data: z.any().optional(),
-  error: z.string().optional(),
+  executionAudit: ExecutionAuditSchema.optional(),
+  modelUsed: z.string().optional(),
+  thinkingLevel: z.string().optional(),
+  error: z.string().nullable().optional(),
   startedAt: z.any().optional(),
   completedAt: z.any().optional(),
   updatedAt: z.any().optional(),
@@ -123,6 +231,8 @@ export const AnalyzePassRequestSchema = z.object({
   localFilePath: z.string().optional(),
   customerId: z.string().optional(),
   databaseId: z.string().optional(),
+  model: z.string().optional(),
+  thinkingLevel: z.string().optional(),
 });
 export type AnalyzePassRequest = z.infer<typeof AnalyzePassRequestSchema>;
 
@@ -152,6 +262,11 @@ export const VideoRecordSchema = z.object({
   passes: VideoPassesSchema.optional(),
   analysisId: z.string().optional(),
   organizationId: z.string().optional(),
+  inventoryId: z.string().nullable().optional(),
+  inventoryName: z.string().nullable().optional(),
+  unmatchedInventoryName: z.string().nullable().optional(),
+  inventoryAssociationType: z.enum(['AUTOMATIC', 'MANUAL', 'UNMATCHED']).nullable().optional(),
+  associatedAt: z.string().nullable().optional(),
   uploadedBy: z.string().optional(),
   uploadedAt: z.any(),
   transcodedAt: z.any().optional(),
@@ -162,6 +277,8 @@ export const VideoMetadataSchema = z.object({
   videoId: z.string(),
   customerId: z.string().optional(),
   databaseId: z.string().optional(),
+  model: z.string().optional(),
+  thinkingLevel: z.string().optional(),
   originalName: z.string().optional(),
   bucketName: z.string().optional(),
   gcsBucket: z.string().optional(),
@@ -186,6 +303,11 @@ export const VideoMetadataSchema = z.object({
   durationSeconds: z.number().optional(),
   analysisId: z.string().optional(),
   organizationId: z.string().optional(),
+  inventoryId: z.string().nullable().optional(),
+  inventoryName: z.string().nullable().optional(),
+  unmatchedInventoryName: z.string().nullable().optional(),
+  inventoryAssociationType: z.enum(['AUTOMATIC', 'MANUAL', 'UNMATCHED']).nullable().optional(),
+  associatedAt: z.string().nullable().optional(),
   uploadedBy: z.string().optional(),
   uploadedAt: z.any().optional(),
   transcodedAt: z.any().optional(),
