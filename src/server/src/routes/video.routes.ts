@@ -6,6 +6,7 @@ import {
   requestUploadUrlHandler,
   finalizeUploadHandler,
   associateInventoryHandler,
+  getVideoFrameHandler,
 } from '../controllers/video.controller';
 
 const router: Router = Router();
@@ -24,5 +25,8 @@ router.post('/upload', uploadMiddleware, uploadVideoHandler);
 
 // Manually associate video with an inventory: POST /api/videos/:videoId/associate-inventory
 router.post('/:videoId/associate-inventory', associateInventoryHandler);
+
+// Serve extracted Pass 2 best-shot frame: GET /api/videos/:videoId/frames/:filename
+router.get('/:videoId/frames/:filename', getVideoFrameHandler);
 
 export default router;

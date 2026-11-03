@@ -172,12 +172,14 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   } | null>(null);
   const [copiedPrompt, setCopiedPrompt] = useState<boolean>(false);
 
-  // Model & Thinking Level Selectors (Default: Pass 0 -> gemini-3.8-flash, Passes 1-3 -> gemini-1.5-pro, Pass 1 Thinking -> MEDIUM)
+  // Model & Thinking Level Selectors (Default: Pass 0 -> gemini-3.8-flash, Passes 1-3 -> gemini-1.5-pro, Passes 1-3 Thinking -> MEDIUM)
   const [pass0Model, setPass0Model] = useState<string>('gemini-3.8-flash');
   const [pass1Model, setPass1Model] = useState<string>('gemini-1.5-pro');
   const [pass1Thinking, setPass1Thinking] = useState<string>('MEDIUM');
   const [pass2Model, setPass2Model] = useState<string>('gemini-1.5-pro');
+  const [pass2Thinking, setPass2Thinking] = useState<string>('MEDIUM');
   const [pass3Model, setPass3Model] = useState<string>('gemini-1.5-pro');
+  const [pass3Thinking, setPass3Thinking] = useState<string>('MEDIUM');
 
   const handleSeekToInterval = (seconds: number, actionId?: string, label?: string) => {
     if (actionId) {
@@ -640,8 +642,10 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       selectedThinking = pass1Thinking;
     } else if (passNum === 2) {
       selectedModel = pass2Model;
+      selectedThinking = pass2Thinking;
     } else if (passNum === 3) {
       selectedModel = pass3Model;
+      selectedThinking = pass3Thinking;
     }
 
     try {
@@ -1044,16 +1048,18 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     {
       passNumber: 1,
       passKey: 'pass1',
-      title: 'Pass 1: Action Detection (Pro @ 1 fps)',
-      subtitle: 'Coarse temporal action span detection using Pass 0 workflow context',
+      title: 'Pass 1: Action & Label Event Detection (Pro @ 1 fps)',
+      subtitle:
+        'Coarse temporal action span detection + box/vial label presentation events & action associations at 1 fps',
       buttonLabel: 'Run Pass 1',
       artifactFilename: 'action_detection_pass.json',
     },
     {
       passNumber: 2,
       passKey: 'pass2',
-      title: 'Pass 2: Event Detection (Temporal 4 fps)',
-      subtitle: 'Fine-grained sub-event extraction & candidate frame extraction at 4 fps',
+      title: 'Pass 2: Best Frames & Boundary Refinement (Temporal 4 fps)',
+      subtitle:
+        'Targeted 4 fps dual best-frame selection (highest contrast & minimal blur) & [start-1s, end+1s] action boundary refinement',
       buttonLabel: 'Run Pass 2',
       artifactFilename: 'event_detection_pass.json',
     },
@@ -1500,30 +1506,56 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                           </>
                         )}
                         {step.passKey === 'pass2' && (
-                          <select
-                            value={pass2Model}
-                            onChange={(e) => setPass2Model(e.target.value)}
-                            disabled={isPassRunning}
-                            className="px-2 py-0.5 text-xs font-mono rounded bg-slate-900 text-purple-300 border border-purple-700/50 focus:outline-none focus:border-purple-500 cursor-pointer disabled:opacity-50"
-                          >
-                            <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
-                            <option value="gemini-1.5-pro-002">Gemini 1.5 Pro (002)</option>
-                            <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
-                            <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
-                          </select>
+                          <>
+                            <select
+                              value={pass2Model}
+                              onChange={(e) => setPass2Model(e.target.value)}
+                              disabled={isPassRunning}
+                              className="px-2 py-0.5 text-xs font-mono rounded bg-slate-900 text-purple-300 border border-purple-700/50 focus:outline-none focus:border-purple-500 cursor-pointer disabled:opacity-50"
+                            >
+                              <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
+                              <option value="gemini-1.5-pro-002">Gemini 1.5 Pro (002)</option>
+                              <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
+                              <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                            </select>
+                            <select
+                              value={pass2Thinking}
+                              onChange={(e) => setPass2Thinking(e.target.value)}
+                              disabled={isPassRunning}
+                              className="px-2 py-0.5 text-xs font-mono rounded bg-slate-900 text-indigo-300 border border-indigo-700/50 focus:outline-none focus:border-indigo-500 cursor-pointer disabled:opacity-50"
+                            >
+                              <option value="MEDIUM">Thinking: Medium</option>
+                              <option value="HIGH">Thinking: High</option>
+                              <option value="LOW">Thinking: Low</option>
+                              <option value="OFF">Thinking: Off</option>
+                            </select>
+                          </>
                         )}
                         {step.passKey === 'pass3' && (
-                          <select
-                            value={pass3Model}
-                            onChange={(e) => setPass3Model(e.target.value)}
-                            disabled={isPassRunning}
-                            className="px-2 py-0.5 text-xs font-mono rounded bg-slate-900 text-purple-300 border border-purple-700/50 focus:outline-none focus:border-purple-500 cursor-pointer disabled:opacity-50"
-                          >
-                            <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
-                            <option value="gemini-1.5-pro-002">Gemini 1.5 Pro (002)</option>
-                            <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
-                            <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
-                          </select>
+                          <>
+                            <select
+                              value={pass3Model}
+                              onChange={(e) => setPass3Model(e.target.value)}
+                              disabled={isPassRunning}
+                              className="px-2 py-0.5 text-xs font-mono rounded bg-slate-900 text-purple-300 border border-purple-700/50 focus:outline-none focus:border-purple-500 cursor-pointer disabled:opacity-50"
+                            >
+                              <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
+                              <option value="gemini-1.5-pro-002">Gemini 1.5 Pro (002)</option>
+                              <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
+                              <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                            </select>
+                            <select
+                              value={pass3Thinking}
+                              onChange={(e) => setPass3Thinking(e.target.value)}
+                              disabled={isPassRunning}
+                              className="px-2 py-0.5 text-xs font-mono rounded bg-slate-900 text-indigo-300 border border-indigo-700/50 focus:outline-none focus:border-indigo-500 cursor-pointer disabled:opacity-50"
+                            >
+                              <option value="MEDIUM">Thinking: Medium</option>
+                              <option value="HIGH">Thinking: High</option>
+                              <option value="LOW">Thinking: Low</option>
+                              <option value="OFF">Thinking: Off</option>
+                            </select>
+                          </>
                         )}
                       </div>
                       <p className="text-xs text-slate-400 font-mono">{step.subtitle}</p>
@@ -1555,55 +1587,118 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                       </button>
 
                       {/* Prompt & Parameters Inspection Button */}
-                      {(step.passKey === 'pass1' || step.passKey === 'pass0') && (hasJsonData || Boolean(passState.executionAudit)) && (
+                      {(step.passKey === 'pass1' || step.passKey === 'pass0' || step.passKey === 'pass2' || step.passKey === 'pass3') && (hasJsonData || Boolean(passState.executionAudit)) && (
                         <button
                           type="button"
                           className="px-2.5 py-1 text-xs rounded border border-cyan-800 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/60 transition-colors flex items-center gap-1.5"
                           onClick={() => {
-                            const auditData: ExecutionAudit =
+                            const rawAudit: ExecutionAudit | undefined =
                               passState.executionAudit ||
-                              passState.data?.executionAudit || {
-                                model:
-                                  passState.data?.modelUsed ||
-                                  (step.passKey === 'pass1' ? 'gemini-1.5-pro' : 'gemini-3.8-flash'),
-                                thinkingLevel:
-                                  passState.data?.thinkingLevel ||
-                                  (step.passKey === 'pass1' ? 'MEDIUM' : undefined),
-                                endpoint: 'us',
-                                calledAt: passState.completedAt || new Date().toISOString(),
-                                promptText:
-                                  step.passKey === 'pass1'
-                                    ? 'Pass 1 Action Detection Prompt'
-                                    : 'Pass 0 Workflow Classification Prompt',
-                                systemInstruction: null,
-                                generationConfig:
-                                  step.passKey === 'pass1'
-                                    ? {
-                                        temperature: 0.2,
-                                        maxOutputTokens: 16384,
-                                        responseMimeType: 'application/json',
-                                        thinkingConfig: {
-                                          thinkingLevel: 'MEDIUM',
-                                        },
-                                      }
-                                    : {
-                                        temperature: 0.1,
-                                        maxOutputTokens: 8192,
-                                        responseMimeType: 'application/json',
+                              passState.data?.executionAudit;
+                            const fallbackModel =
+                              step.passKey === 'pass0'
+                                ? 'gemini-3.8-flash'
+                                : step.passKey === 'pass1'
+                                ? pass1Model || 'gemini-1.5-pro'
+                                : step.passKey === 'pass2'
+                                ? pass2Model || 'gemini-1.5-pro'
+                                : pass3Model || 'gemini-1.5-pro';
+                            const fallbackThinking =
+                              step.passKey === 'pass0'
+                                ? 'OFF'
+                                : step.passKey === 'pass1'
+                                ? pass1Thinking || 'MEDIUM'
+                                : step.passKey === 'pass2'
+                                ? pass2Thinking || 'MEDIUM'
+                                : pass3Thinking || 'MEDIUM';
+                            const rawModel =
+                              rawAudit?.model ||
+                              (rawAudit as any)?.modelUsed ||
+                              (passState as any).modelUsed ||
+                              passState.data?.modelUsed ||
+                              fallbackModel;
+                            const normalizedModel =
+                              rawModel === 'gemini-4-argon' ? 'gemini-1.5-pro' : rawModel;
+                            const resolvedThinking =
+                              rawAudit?.thinkingLevel ||
+                              (rawAudit?.generationConfig as any)?.thinkingConfig?.thinkingLevel ||
+                              (passState as any).thinkingLevel ||
+                              passState.data?.thinkingLevel ||
+                              fallbackThinking;
+                            const baseAudit: ExecutionAudit = rawAudit || {
+                              model: normalizedModel,
+                              thinkingLevel: resolvedThinking,
+                              endpoint: 'us',
+                              calledAt: passState.completedAt || new Date().toISOString(),
+                              promptText:
+                                step.passKey === 'pass1'
+                                  ? 'Pass 1 Action Detection Prompt'
+                                  : step.passKey === 'pass2'
+                                  ? 'Pass 2 Event Detection & Boundary Refinement Prompt'
+                                  : step.passKey === 'pass3'
+                                  ? 'Pass 3 Analysis Refinement Prompt'
+                                  : 'Pass 0 Workflow Classification Prompt',
+                              systemInstruction: null,
+                              generationConfig:
+                                step.passKey === 'pass1'
+                                  ? {
+                                      temperature: 0.2,
+                                      maxOutputTokens: 16384,
+                                      responseMimeType: 'application/json',
+                                      thinkingConfig: {
+                                        thinkingLevel: resolvedThinking,
                                       },
-                                videoMetadata: {
-                                  durationSeconds:
-                                    selectedVideo.durationSeconds || (selectedVideo as any).durationSec || 120,
-                                  uri: selectedVideo.normalizedGcsUri || selectedVideo.rawGcsUri,
-                                },
-                                modelDiagnostics: {
-                                  finishReason: 'STOP',
-                                  thoughtsTokenCount:
-                                    (passState as any).executionAudit?.modelDiagnostics?.thoughtsTokenCount ??
-                                    (passState.data as any)?.executionAudit?.modelDiagnostics?.thoughtsTokenCount ??
-                                    (step.passKey === 'pass1' ? 0 : undefined),
-                                },
-                              };
+                                    }
+                                  : step.passKey === 'pass2'
+                                  ? {
+                                      temperature: 0.1,
+                                      fps: 4,
+                                      responseMimeType: 'application/json',
+                                      thinkingConfig: {
+                                        thinkingLevel: resolvedThinking,
+                                      },
+                                    }
+                                  : step.passKey === 'pass3'
+                                  ? {
+                                      responseMimeType: 'application/json',
+                                      thinkingConfig: {
+                                        thinkingLevel: resolvedThinking,
+                                      },
+                                    }
+                                  : {
+                                      temperature: 0.1,
+                                      maxOutputTokens: 8192,
+                                      responseMimeType: 'application/json',
+                                    },
+                              videoMetadata: {
+                                durationSeconds:
+                                  selectedVideo.durationSeconds || (selectedVideo as any).durationSec || 120,
+                                uri: selectedVideo.normalizedGcsUri || selectedVideo.rawGcsUri,
+                              },
+                              modelDiagnostics: {
+                                finishReason: 'STOP',
+                                thoughtsTokenCount:
+                                  (passState as any).executionAudit?.modelDiagnostics?.thoughtsTokenCount ??
+                                  (passState.data as any)?.executionAudit?.modelDiagnostics?.thoughtsTokenCount ??
+                                  (step.passKey !== 'pass0' ? 0 : undefined),
+                              },
+                            };
+                            const auditData: ExecutionAudit = {
+                              ...baseAudit,
+                              model: normalizedModel,
+                              thinkingLevel: resolvedThinking,
+                              generationConfig: {
+                                ...(baseAudit.generationConfig || {}),
+                                ...(resolvedThinking && resolvedThinking !== 'OFF'
+                                  ? {
+                                      thinkingConfig: {
+                                        ...((baseAudit.generationConfig as any)?.thinkingConfig || {}),
+                                        thinkingLevel: resolvedThinking,
+                                      },
+                                    }
+                                  : {}),
+                              },
+                            };
                             setInspectionModal({ audit: auditData, title: step.title });
                             setCopiedPrompt(false);
                           }}
@@ -1644,8 +1739,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                           )}
                         </div>
 
-                        {/* Pass 1 specific toggle between interval cards and raw JSON */}
-                        {step.passKey === 'pass1' && hasJsonData && (
+                        {/* Pass 1 & Pass 2 toggle between structured cards and raw JSON */}
+                        {(step.passKey === 'pass1' || step.passKey === 'pass2') && hasJsonData && (
                           <div className="flex items-center gap-1 bg-slate-900 border border-slate-700/80 rounded-lg p-0.5">
                             <button
                               type="button"
@@ -1661,7 +1756,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                   : 'text-slate-400 hover:text-slate-200'
                               }`}
                             >
-                              Interval Cards
+                              {step.passKey === 'pass2' ? 'Events & Best Frames' : 'Interval Cards'}
                             </button>
                             <button
                               type="button"
@@ -1700,10 +1795,13 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             : Array.isArray(pass1Data?.actions)
                             ? pass1Data.actions
                             : [];
+                          const pass1Events: any[] = Array.isArray(pass1Data?.events)
+                            ? pass1Data.events
+                            : [];
                           const totalDetected = pass1Data?.totalActionsDetected ?? rawActions.length;
                           const workflowCtx = pass1Data?.workflowContext;
 
-                          if (rawActions.length === 0) {
+                          if (rawActions.length === 0 && pass1Events.length === 0) {
                             return (
                               <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 text-center text-xs text-slate-400 font-mono">
                                 No action intervals detected in this pass.
@@ -1716,7 +1814,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                               <div className="flex items-center justify-between text-xs font-mono px-1">
                                 <span className="text-indigo-300 font-semibold flex items-center gap-1.5">
                                   <Sparkles className="w-3.5 h-3.5" />
-                                  Total Actions Detected: {totalDetected} ({rawActions.filter((a: any) => (a.actionType || a.actionClass || '').includes('INSERTION')).length} Insertions, {rawActions.filter((a: any) => (a.actionType || a.actionClass || '').includes('REMOVAL')).length} Removals)
+                                  Total Actions Detected: {totalDetected} ({rawActions.filter((a: any) => (a.actionType || a.actionClass || '').includes('INSERTION')).length} Insertions, {rawActions.filter((a: any) => (a.actionType || a.actionClass || '').includes('REMOVAL')).length} Removals) • Label Events: {pass1Events.length}
                                 </span>
                                 <div className="flex items-center gap-2">
                                   {pass1Data?.modelUsed && (
@@ -1807,6 +1905,34 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                         {actionItem.description || `${actType} action detected`}
                                       </p>
 
+                                      {Array.isArray(actionItem.eventList) && actionItem.eventList.length > 0 && (
+                                        <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-mono">
+                                          <span className="text-slate-400">Associated Label Events:</span>
+                                          {actionItem.eventList.map((evtId: string) => (
+                                            <span
+                                              key={evtId}
+                                              className="px-1.5 py-0.5 rounded bg-indigo-950/70 text-indigo-300 border border-indigo-700/60"
+                                            >
+                                              {evtId}
+                                            </span>
+                                          ))}
+                                        </div>
+                                      )}
+
+                                      {typeof actionItem.refinedStartTimestampSeconds === 'number' &&
+                                        typeof actionItem.pass1StartTimestampSeconds === 'number' && (
+                                          <div className="text-[10px] font-mono text-purple-300 bg-purple-950/40 border border-purple-800/50 rounded px-2 py-1 flex items-center justify-between">
+                                            <span>
+                                              Pass 1 (1fps): {actionItem.pass1StartTimestampSeconds.toFixed(2)}s–
+                                              {(actionItem.pass1EndTimestampSeconds ?? endSec).toFixed(2)}s
+                                            </span>
+                                            <span>
+                                              Pass 2 (4fps): {actionItem.refinedStartTimestampSeconds.toFixed(2)}s–
+                                              {(actionItem.refinedEndTimestampSeconds ?? endSec).toFixed(2)}s
+                                            </span>
+                                          </div>
+                                        )}
+
                                       {/* Bottom Row: Metadata Chips + Seek Button */}
                                       <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-800/60 text-xs">
                                         <div className="flex flex-wrap items-center gap-2">
@@ -1854,6 +1980,406 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                   );
                                 })}
                               </div>
+
+                              {/* Pass 1 Label Presentation Events & Action Associations */}
+                              {pass1Events.length > 0 && (
+                                <div className="rounded-xl bg-slate-950/90 border border-slate-800 p-3.5 space-y-2.5">
+                                  <div className="flex items-center justify-between text-xs font-mono">
+                                    <span className="font-semibold text-cyan-300">
+                                      Pass 1 Label Presentation Events & Action Associations (1 fps)
+                                    </span>
+                                    <span className="text-[11px] text-slate-400">
+                                      Best frames extracted at 4 fps in Pass 2
+                                    </span>
+                                  </div>
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                                    {pass1Events.map((evt: any, eIdx: number) => {
+                                      const evtId = evt.eventId || `evt_${eIdx + 1}`;
+                                      const isBoxEvt = String(evt.eventClass || '').includes('BOX_LABEL');
+                                      const assocIds: string[] =
+                                        Array.isArray(evt.actionIds) && evt.actionIds.length > 0
+                                          ? evt.actionIds
+                                          : evt.actionId
+                                          ? [evt.actionId]
+                                          : [];
+                                      const evtStart = typeof evt.startTime === 'number' ? evt.startTime : 0;
+                                      const evtEnd = typeof evt.endTime === 'number' ? evt.endTime : evtStart;
+
+                                      return (
+                                        <div
+                                          key={evtId}
+                                          className="rounded-lg bg-slate-900/90 border border-slate-800 p-3 space-y-2 text-xs font-mono"
+                                        >
+                                          <div className="flex items-center justify-between gap-2">
+                                            <span
+                                              className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
+                                                isBoxEvt
+                                                  ? 'bg-cyan-950/80 text-cyan-300 border-cyan-700/60'
+                                                  : 'bg-emerald-950/80 text-emerald-300 border-emerald-700/60'
+                                              }`}
+                                            >
+                                              {isBoxEvt
+                                                ? 'BOX_LABEL_PRESENTATION'
+                                                : 'VIAL_LABEL_PRESENTATION'}
+                                            </span>
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                handleSeekToInterval(
+                                                  evtStart,
+                                                  evtId,
+                                                  `${evtStart.toFixed(1)}s`
+                                                )
+                                              }
+                                              className="text-[11px] text-cyan-300 hover:text-cyan-200 flex items-center gap-1"
+                                            >
+                                              <Clock className="w-3 h-3" />
+                                              <span>
+                                                {evtStart.toFixed(1)}s–{evtEnd.toFixed(1)}s
+                                              </span>
+                                            </button>
+                                          </div>
+                                          {evt.description && (
+                                            <p className="text-[11px] text-slate-300 font-sans">
+                                              {evt.description}
+                                            </p>
+                                          )}
+                                          <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                                            <span className="text-slate-400">
+                                              Associated Actions ({assocIds.length}):
+                                            </span>
+                                            {assocIds.map((aid) => (
+                                              <span
+                                                key={aid}
+                                                className="px-1.5 py-0.5 rounded bg-indigo-950/70 text-indigo-200 border border-indigo-700/50"
+                                              >
+                                                {aid}
+                                              </span>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()
+                      ) : step.passKey === 'pass2' && hasJsonData && !showRawJsonMap[drawerKey] ? (
+                        (() => {
+                          const pass2Data = passState.data;
+                          const rawEvents: any[] = Array.isArray(pass2Data)
+                            ? pass2Data
+                            : Array.isArray(pass2Data?.events)
+                            ? pass2Data.events
+                            : [];
+                          const pass1Raw = selectedPasses.pass1?.data;
+                          const pass1Actions: any[] = Array.isArray(pass1Raw)
+                            ? pass1Raw
+                            : Array.isArray(pass1Raw?.actions)
+                            ? pass1Raw.actions
+                            : [];
+                          const refinedActions: any[] =
+                            Array.isArray((pass2Data as any)?.refinedActions) &&
+                            (pass2Data as any).refinedActions.length > 0
+                              ? (pass2Data as any).refinedActions
+                              : pass1Actions.filter(
+                                  (a: any) =>
+                                    typeof a.beforeActionTimestampSeconds === 'number' ||
+                                    typeof a.refinedStartTimestampSeconds === 'number' ||
+                                    typeof a.startTimestampSeconds === 'number'
+                                );
+
+                          return (
+                            <div className="space-y-4">
+                              {/* Summary Header */}
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono px-1">
+                                <span className="text-purple-300 font-semibold flex items-center gap-1.5">
+                                  <Sparkles className="w-3.5 h-3.5" />
+                                  Detected Presentation Events: {rawEvents.length} (Box Labels &amp; Vial Labels)
+                                </span>
+                                <span className="px-2 py-0.5 text-[11px] rounded bg-cyan-950/60 text-cyan-300 border border-cyan-700/50">
+                                  4 FPS Action Boundary Refinement Window: [Pass1 Start - 1s, Pass1 End + 1s]
+                                </span>
+                              </div>
+
+                              {/* 1. Box & Vial Label Presentation Events + 2 Best Frames */}
+                              {rawEvents.length === 0 ? (
+                                <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 text-center text-xs text-slate-400 font-mono">
+                                  No label presentation events detected in Pass 2.
+                                </div>
+                              ) : (
+                                <div className="space-y-3">
+                                  {rawEvents.map((evt: any, idx: number) => {
+                                    const evtId = evt.eventId || `evt_${idx + 1}`;
+                                    const evtClass = String(evt.eventClass || 'VIAL_LABEL_PRESENTATION');
+                                    const isBoxLabel = evtClass.toUpperCase().includes('BOX_LABEL');
+                                    const startSec = Number(evt.startTime || 0);
+                                    const endSec = Number(evt.endTime || startSec);
+                                    const associatedActionIds: string[] =
+                                      Array.isArray(evt.actionIds) && evt.actionIds.length > 0
+                                        ? evt.actionIds
+                                        : evt.actionId
+                                        ? [evt.actionId]
+                                        : [];
+
+                                    const bestFrames: any[] =
+                                      Array.isArray(evt.bestFrames) && evt.bestFrames.length > 0
+                                        ? evt.bestFrames
+                                        : (evt.bestShotUrls || []).map((u: string, bIdx: number) => ({
+                                            frameType: bIdx === 0 ? 'HIGHEST_CONTRAST' : 'MINIMAL_BLUR',
+                                            label: bIdx === 0 ? 'Highest Contrast' : 'Minimal Blur',
+                                            timestampSeconds: evt.bestShotTimes?.[bIdx] ?? startSec,
+                                            gcsUri: u,
+                                            url: u.startsWith('gs://')
+                                              ? `/api/videos/${encodeURIComponent(
+                                                  selectedVideo.videoId
+                                                )}/frames/${encodeURIComponent(u.split('/').pop() || 'frame.jpg')}`
+                                              : u,
+                                          }));
+
+                                    return (
+                                      <div
+                                        key={evtId}
+                                        className="rounded-xl p-4 bg-slate-900/95 border border-slate-800 space-y-3"
+                                      >
+                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                          <div className="flex flex-wrap items-center gap-2">
+                                            <span
+                                              className={`text-[11px] font-mono px-2.5 py-0.5 rounded border font-semibold ${
+                                                isBoxLabel
+                                                  ? 'bg-amber-950/80 text-amber-300 border-amber-700/80'
+                                                  : 'bg-purple-950/80 text-purple-300 border-purple-700/80'
+                                              }`}
+                                            >
+                                              {isBoxLabel ? '📦 BOX LABEL PRESENTATION' : '🧪 VIAL LABEL PRESENTATION'}
+                                            </span>
+                                            <span className="text-xs font-mono text-cyan-300 bg-cyan-950/60 px-2 py-0.5 rounded border border-cyan-800/60">
+                                              {startSec.toFixed(2)}s – {endSec.toFixed(2)}s
+                                            </span>
+                                            <span className="text-[11px] font-mono text-slate-400">
+                                              ID: {evtId}
+                                            </span>
+                                          </div>
+
+                                          <button
+                                            type="button"
+                                            onClick={() =>
+                                              handleSeekToInterval(
+                                                startSec,
+                                                evtId,
+                                                `${startSec.toFixed(1)}s`
+                                              )
+                                            }
+                                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-mono font-medium bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border border-cyan-800/70 transition-colors"
+                                          >
+                                            <Play className="w-3 h-3 fill-current" />
+                                            <span>Seek Event</span>
+                                          </button>
+                                        </div>
+
+                                        {/* Associated Actions & Spoken Context */}
+                                        <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                                          <span className="text-slate-400">Associated Pass 1 Actions:</span>
+                                          {associatedActionIds.map((aid) => (
+                                            <span
+                                              key={aid}
+                                              className="px-2 py-0.5 rounded bg-indigo-950/80 text-indigo-200 border border-indigo-700/70 text-[11px] font-semibold"
+                                            >
+                                              {aid}
+                                            </span>
+                                          ))}
+                                          {evt.spokenContext && (
+                                            <span className="px-2 py-0.5 rounded bg-emerald-950/70 text-emerald-300 border border-emerald-700/60 text-[11px]">
+                                              🗣 Spoken: &ldquo;{evt.spokenContext}&rdquo;
+                                            </span>
+                                          )}
+                                        </div>
+
+                                        {evt.associationReason && (
+                                          <p className="text-[11px] text-slate-400 font-mono">
+                                            {evt.associationReason}
+                                          </p>
+                                        )}
+
+                                        {/* 2 Best Frames: Highest Contrast & Minimal Blur */}
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                                          {bestFrames.map((frame: any, fIdx: number) => {
+                                            const isContrast = frame.frameType === 'HIGHEST_CONTRAST' || fIdx === 0;
+                                            const frameTs = Number(
+                                              frame.timestampSeconds ?? frame.timestamp ?? startSec
+                                            );
+                                            const rawUrl = String(frame.url || frame.gcsUri || '');
+                                            const fallbackFilename =
+                                              rawUrl.split('/').pop() ||
+                                              `frame_${evtId}_${isContrast ? 'contrast' : 'blur'}_${Number(
+                                                frameTs.toFixed(2)
+                                              )}.jpg`;
+                                            const basePreviewUrl =
+                                              rawUrl && !rawUrl.startsWith('gs://')
+                                                ? rawUrl
+                                                : `/api/videos/${encodeURIComponent(
+                                                    selectedVideo.videoId
+                                                  )}/frames/${encodeURIComponent(fallbackFilename)}`;
+                                            const previewUrl = basePreviewUrl.includes('?')
+                                              ? basePreviewUrl
+                                              : `${basePreviewUrl}?t=${Number(frameTs.toFixed(2))}`;
+                                            return (
+                                              <div
+                                                key={`${evtId}_frame_${fIdx}`}
+                                                className="rounded-lg bg-slate-950 border border-slate-800 p-2.5 flex flex-col gap-2"
+                                              >
+                                                <div className="flex items-center justify-between text-[11px] font-mono">
+                                                  <span
+                                                    className={`px-2 py-0.5 rounded font-semibold border ${
+                                                      isContrast
+                                                        ? 'bg-amber-950/80 text-amber-300 border-amber-700/70'
+                                                        : 'bg-sky-950/80 text-sky-300 border-sky-700/70'
+                                                    }`}
+                                                  >
+                                                    {isContrast
+                                                      ? '1. Highest Contrast Frame'
+                                                      : '2. Minimal Blur Frame'}
+                                                  </span>
+                                                  <button
+                                                    type="button"
+                                                    onClick={() =>
+                                                      handleSeekToInterval(
+                                                        frameTs,
+                                                        `${evtId}_${fIdx}`,
+                                                        `${frameTs.toFixed(2)}s`
+                                                      )
+                                                    }
+                                                    className="text-cyan-400 hover:underline"
+                                                  >
+                                                    @{frameTs.toFixed(2)}s
+                                                  </button>
+                                                </div>
+
+                                                <div className="w-full rounded bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center">
+                                                  <img
+                                                    src={previewUrl}
+                                                    alt={frame.label || frame.frameType}
+                                                    className="w-full h-auto max-h-[360px] object-contain block"
+                                                  />
+                                                </div>
+
+                                                <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono text-slate-400">
+                                                  {typeof frame.contrastScore === 'number' && (
+                                                    <span>Contrast: {frame.contrastScore.toFixed(1)}</span>
+                                                  )}
+                                                  {typeof frame.blurScore === 'number' && (
+                                                    <span>Blur: {frame.blurScore.toFixed(3)}</span>
+                                                  )}
+                                                  {typeof frame.sharpnessScore === 'number' && (
+                                                    <span>Sharpness: {frame.sharpnessScore.toFixed(1)}</span>
+                                                  )}
+                                                </div>
+                                              </div>
+                                            );
+                                          })}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+
+                              {/* 2. 4 FPS Refined Inventory Update Action Boundaries */}
+                              {refinedActions.length > 0 && (
+                                <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-3">
+                                  <div className="text-xs font-mono font-semibold text-cyan-300 flex items-center justify-between">
+                                    <span>Refined Inventory Update Action Boundaries (4 FPS)</span>
+                                    <span className="text-[10px] text-slate-400">
+                                      Window = [Pass 1 Start - 1.0s, Pass 1 End + 1.0s] @ 4 fps
+                                    </span>
+                                  </div>
+                                  <div className="grid grid-cols-1 gap-2.5">
+                                    {refinedActions.map((ra: any) => {
+                                      const p1Start = Number(
+                                        ra.pass1StartTimestampSeconds ?? ra.startTimestampSeconds ?? 0
+                                      );
+                                      const p1End = Number(
+                                        ra.pass1EndTimestampSeconds ?? ra.endTimestampSeconds ?? p1Start
+                                      );
+                                      const winStart = Number(
+                                        ra.searchWindowStartSeconds ??
+                                          ra.refinementWindow?.startSeconds ??
+                                          Math.max(0, p1Start - 1)
+                                      );
+                                      const winEnd = Number(
+                                        ra.searchWindowEndSeconds ??
+                                          ra.refinementWindow?.endSeconds ??
+                                          p1End + 1
+                                      );
+                                      const refStart = Number(
+                                        ra.refinedStartTimestampSeconds ??
+                                          ra.startTimestampSeconds ??
+                                          p1Start
+                                      );
+                                      const refEnd = Number(
+                                        ra.refinedEndTimestampSeconds ??
+                                          ra.endTimestampSeconds ??
+                                          p1End
+                                      );
+                                      const actType = String(ra.actionType || ra.actionClass || 'VIAL_ACTION');
+                                      const associatedEvents: string[] = Array.isArray(ra.associatedEventIds)
+                                        ? ra.associatedEventIds
+                                        : Array.isArray(ra.eventList)
+                                        ? ra.eventList
+                                        : [];
+
+                                      return (
+                                        <div
+                                          key={ra.actionId}
+                                          className="rounded-lg bg-slate-950 border border-slate-800 p-3 text-[11px] font-mono space-y-2"
+                                        >
+                                          <div className="flex flex-wrap items-center justify-between gap-2">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                              <span className="font-bold text-indigo-300">{ra.actionId}</span>
+                                              <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300 text-[10px]">
+                                                {actType}
+                                              </span>
+                                              <span className="px-2 py-0.5 rounded bg-emerald-950/70 border border-emerald-700/60 text-emerald-300 font-semibold">
+                                                Refined (4fps): {refStart.toFixed(2)}s – {refEnd.toFixed(2)}s
+                                                {ra.startTime && ra.endTime ? ` (${ra.startTime} – ${ra.endTime})` : ''}
+                                              </span>
+                                            </div>
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                handleSeekToInterval(
+                                                  refStart,
+                                                  ra.actionId,
+                                                  `${refStart.toFixed(2)}s`
+                                                )
+                                              }
+                                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] font-mono font-medium bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border border-cyan-800/70 transition-colors"
+                                            >
+                                              <Play className="w-3 h-3 fill-current" />
+                                              <span>Seek Action</span>
+                                            </button>
+                                          </div>
+                                          <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400">
+                                            <span>
+                                              Pass 1 Action (1fps): {p1Start.toFixed(2)}s – {p1End.toFixed(2)}s
+                                            </span>
+                                            <span>
+                                              4fps Search Window: [{winStart.toFixed(2)}s, {winEnd.toFixed(2)}s]
+                                            </span>
+                                            {associatedEvents.length > 0 && (
+                                              <span>
+                                                Associated Events: {associatedEvents.join(', ')}
+                                              </span>
+                                            )}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              )}
                             </div>
                           );
                         })()
@@ -1914,10 +2440,18 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                   <Terminal className="w-5 h-5" />
                 </div>
                 <div>
-                  <h3 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                  <h3 className="text-base font-bold text-slate-100 flex items-center gap-2 flex-wrap">
                     <span>Pipeline Call & Prompt Inspector</span>
                     <span className="px-2 py-0.5 text-xs rounded bg-purple-950/60 text-purple-300 border border-purple-700/50">
-                      {inspectionModal.audit.model || 'gemini-1.5-pro'}
+                      {inspectionModal.audit.model === 'gemini-4-argon'
+                        ? 'gemini-1.5-pro'
+                        : inspectionModal.audit.model || 'gemini-1.5-pro'}
+                    </span>
+                    <span className="px-2 py-0.5 text-xs rounded bg-indigo-950/60 text-indigo-300 border border-indigo-700/50 font-mono">
+                      Thinking:{' '}
+                      {inspectionModal.audit.thinkingLevel ||
+                        (inspectionModal.audit.generationConfig as any)?.thinkingConfig?.thinkingLevel ||
+                        (inspectionModal.title?.includes('Pass 0') ? 'OFF' : 'MEDIUM')}
                     </span>
                   </h3>
                   <p className="text-xs text-slate-400 font-mono">
@@ -1950,7 +2484,15 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                     <span>Model & Endpoint</span>
                   </div>
                   <div className="font-bold text-slate-100 truncate">
-                    {inspectionModal.audit.model || 'gemini-1.5-pro'}
+                    {inspectionModal.audit.model === 'gemini-4-argon'
+                      ? 'gemini-1.5-pro'
+                      : inspectionModal.audit.model || 'gemini-1.5-pro'}
+                  </div>
+                  <div className="text-[11px] font-mono text-indigo-300 truncate">
+                    Thinking Level:{' '}
+                    {inspectionModal.audit.thinkingLevel ||
+                      (inspectionModal.audit.generationConfig as any)?.thinkingConfig?.thinkingLevel ||
+                      (inspectionModal.title?.includes('Pass 0') ? 'OFF' : 'MEDIUM')}
                   </div>
                   <div className="text-[11px] font-mono text-cyan-400 truncate">
                     Endpoint: {inspectionModal.audit.endpoint || 'us endpoint'}
@@ -1975,12 +2517,18 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                     Prompt: {inspectionModal.audit.modelDiagnostics?.usageMetadata?.promptTokenCount ?? 'N/A'} • Output:{' '}
                     {inspectionModal.audit.modelDiagnostics?.usageMetadata?.candidatesTokenCount ?? 'N/A'}
                   </div>
-                  {(inspectionModal.title?.includes('Pass 1') || inspectionModal.audit.thinkingLevel || (inspectionModal.audit.generationConfig as any)?.thinkingConfig || pass1Audit?.thinkingLevel) && (
-                    <div className="text-[11px] font-mono text-indigo-300 pt-1 border-t border-slate-800/60 space-y-0.5">
-                      <div>Thinking Level: {inspectionModal.audit.thinkingLevel || (inspectionModal.audit.generationConfig as any)?.thinkingConfig?.thinkingLevel || pass1Audit?.thinkingLevel || 'MEDIUM'}</div>
-                      <div>Thinking Tokens: {inspectionModal.audit.modelDiagnostics?.thoughtsTokenCount || pass1Audit?.modelDiagnostics?.thoughtsTokenCount || 'N/A'}</div>
+                  <div className="text-[11px] font-mono text-indigo-300 pt-1 border-t border-slate-800/60 space-y-0.5">
+                    <div>
+                      Thinking Level:{' '}
+                      {inspectionModal.audit.thinkingLevel ||
+                        (inspectionModal.audit.generationConfig as any)?.thinkingConfig?.thinkingLevel ||
+                        (inspectionModal.title?.includes('Pass 0') ? 'OFF' : 'MEDIUM')}
                     </div>
-                  )}
+                    <div>
+                      Thinking Tokens:{' '}
+                      {inspectionModal.audit.modelDiagnostics?.thoughtsTokenCount ?? 'N/A'}
+                    </div>
+                  </div>
                 </div>
 
                 {/* Generation Config */}
@@ -1992,6 +2540,12 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                   <div className="text-slate-100 font-mono">
                     temp: {inspectionModal.audit.generationConfig?.temperature ?? 0.1} • maxTokens:{' '}
                     {inspectionModal.audit.generationConfig?.maxOutputTokens ?? 8192}
+                  </div>
+                  <div className="text-[11px] font-mono text-indigo-300 truncate">
+                    thinkingLevel:{' '}
+                    {inspectionModal.audit.thinkingLevel ||
+                      (inspectionModal.audit.generationConfig as any)?.thinkingConfig?.thinkingLevel ||
+                      (inspectionModal.title?.includes('Pass 0') ? 'OFF' : 'MEDIUM')}
                   </div>
                   <div className="text-[11px] font-mono text-slate-400 truncate">
                     MIME: {inspectionModal.audit.generationConfig?.responseMimeType || 'application/json'}

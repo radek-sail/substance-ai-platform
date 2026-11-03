@@ -43,6 +43,36 @@ export const WorkflowClassificationSchema = z.object({
 });
 export type WorkflowClassification = z.infer<typeof WorkflowClassificationSchema>;
 
+export const ActionRefinementWindowSchema = z.object({
+  startSeconds: z.number(),
+  endSeconds: z.number(),
+  fps: z.number().default(4),
+});
+export type ActionRefinementWindow = z.infer<typeof ActionRefinementWindowSchema>;
+
+export const BestFrameTypeSchema = z.enum([
+  'HIGHEST_CONTRAST',
+  'MINIMAL_BLUR',
+  'BEFORE_ACTION',
+  'AFTER_ACTION',
+  'FIRST_FRAME',
+  'LAST_FRAME',
+]);
+export type BestFrameType = z.infer<typeof BestFrameTypeSchema>;
+
+export const BestFrameSchema = z.object({
+  frameType: BestFrameTypeSchema,
+  label: z.string().optional(),
+  timestampSeconds: z.number(),
+  timestamp: z.number().optional(),
+  gcsUri: z.string(),
+  url: z.string().optional(),
+  contrastScore: z.number().optional(),
+  blurScore: z.number().optional(),
+  sharpnessScore: z.number().optional(),
+});
+export type BestFrame = z.infer<typeof BestFrameSchema>;
+
 export const ActionIntervalSchema = z.object({
   actionId: z.string(),
   actionType: z.string(), // "VIAL_INSERTION" | "VIAL_REMOVAL" | "CAP_REMOVAL" | "BOX_MANIPULATION" | string
@@ -51,6 +81,25 @@ export const ActionIntervalSchema = z.object({
   endTime: z.string(),
   startTimestampSeconds: z.number(),
   endTimestampSeconds: z.number(),
+  pass1StartTimestampSeconds: z.number().optional(),
+  pass1EndTimestampSeconds: z.number().optional(),
+  refinedStartTimestampSeconds: z.number().optional(),
+  refinedEndTimestampSeconds: z.number().optional(),
+  beforeActionTimestampSeconds: z.number().optional(),
+  afterActionTimestampSeconds: z.number().optional(),
+  refinementWindow: ActionRefinementWindowSchema.optional(),
+  beforeActionFrame: BestFrameSchema.optional(),
+  afterActionFrame: BestFrameSchema.optional(),
+  beforeActionFrameUrl: z.string().optional(),
+  afterActionFrameUrl: z.string().optional(),
+  beforeActionFrameGcsUri: z.string().optional(),
+  afterActionFrameGcsUri: z.string().optional(),
+  firstFrame: BestFrameSchema.optional(),
+  lastFrame: BestFrameSchema.optional(),
+  firstFrameUrl: z.string().optional(),
+  lastFrameUrl: z.string().optional(),
+  firstFrameGcsUri: z.string().optional(),
+  lastFrameGcsUri: z.string().optional(),
   confidenceScore: z.number(),
   targetLocation: z
     .object({
@@ -75,8 +124,10 @@ export type ActionInterval = z.infer<typeof ActionIntervalSchema>;
 export const ActionDetectionPassResultSchema = z.object({
   videoId: z.string(),
   totalActionsDetected: z.number(),
+  totalEventsDetected: z.number().optional(),
   workflowContext: z.string().optional(),
   actions: z.array(ActionIntervalSchema),
+  events: z.lazy(() => z.array(EventSchema)).optional(),
   generatedAt: z.string(),
   modelUsed: z.string().optional(),
   thinkingLevel: z.string().optional(),
@@ -94,10 +145,18 @@ export const ActionSchema = z.object({
   ]),
   actionType: z.string().optional(),
   description: z.string().optional(),
-  startTime: z.string().optional(),
-  endTime: z.string().optional(),
+  startTime: z.union([z.number(), z.string()]).optional(),
+  endTime: z.union([z.number(), z.string()]).optional(),
+  originalStartTime: z.number().optional(),
+  originalEndTime: z.number().optional(),
+  refinedFps: z.number().optional(),
   startTimestampSeconds: z.number().optional(),
   endTimestampSeconds: z.number().optional(),
+  pass1StartTimestampSeconds: z.number().optional(),
+  pass1EndTimestampSeconds: z.number().optional(),
+  refinedStartTimestampSeconds: z.number().optional(),
+  refinedEndTimestampSeconds: z.number().optional(),
+  refinementWindow: ActionRefinementWindowSchema.optional(),
   confidenceScore: z.number().optional(),
   targetLocation: z
     .object({
@@ -134,20 +193,56 @@ export const timeField = z.union([
 export const EventSchema = z.object({
   eventId: z.string(),
   actionId: z.string(),
+  actionIds: z.array(z.string()).optional(),
   eventClass: z.string().optional().default('VIAL_INSERTION'),
   eventTrack: z.enum(['video', 'audio']).default('video'),
   startTime: timeField,
   endTime: timeField,
+  description: z.string().optional(),
+  spokenContext: z.string().optional(),
+  associationReason: z.string().optional(),
   bestShotUrls: z.array(z.string()).default([]),
   bestShotTimes: z.array(z.number()).default([]),
+  bestFrames: z.array(BestFrameSchema).optional(),
+  highestContrastFrame: BestFrameSchema.optional(),
+  minimalBlurFrame: BestFrameSchema.optional(),
   refinementList: z.array(z.string()).default([]),
 });
 export type Event = z.infer<typeof EventSchema>;
 
+export const RefinedActionBoundarySchema = z.object({
+  actionId: z.string(),
+  actionType: z.string().optional(),
+  pass1StartTimestampSeconds: z.number(),
+  pass1EndTimestampSeconds: z.number(),
+  searchWindowStartSeconds: z.number(),
+  searchWindowEndSeconds: z.number(),
+  refinedStartTimestampSeconds: z.number(),
+  refinedEndTimestampSeconds: z.number(),
+  startTime: z.string(),
+  endTime: z.string(),
+  fps: z.number().default(4),
+  confidenceScore: z.number().optional(),
+  associatedEventIds: z.array(z.string()).default([]),
+});
+export type RefinedActionBoundary = z.infer<typeof RefinedActionBoundarySchema>;
+
 export const EventDetectionSchema = z.object({
   events: z.array(EventSchema),
+  refinedActions: z.array(RefinedActionBoundarySchema).optional().default([]),
 });
 export type EventDetection = z.infer<typeof EventDetectionSchema>;
+
+export const EventDetectionPassResultSchema = z.object({
+  videoId: z.string().optional(),
+  events: z.array(EventSchema),
+  refinedActions: z.array(RefinedActionBoundarySchema).default([]),
+  generatedAt: z.string().optional(),
+  modelUsed: z.string().optional(),
+  thinkingLevel: z.string().optional(),
+  executionAudit: ExecutionAuditSchema.optional(),
+});
+export type EventDetectionPassResult = z.infer<typeof EventDetectionPassResultSchema>;
 
 export const RefinementSchema = z.object({
   refinementId: z.string(),

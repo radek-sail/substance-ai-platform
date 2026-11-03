@@ -250,7 +250,9 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
     await saveVideoAnalysis(databaseId, videoId, analysisPayload);
 
     const actionsPayload = (actions as any).toJSON ? (actions as any).toJSON() : actions;
+    const eventsPayload = (events as any).toJSON ? (events as any).toJSON() : events;
     await writePassArtifactJson(videoId, 'action_detection_pass.json', actionsPayload);
+    await writePassArtifactJson(videoId, 'event_detection_pass.json', eventsPayload);
 
     const completedPasses: VideoPasses = {
       pass0: {
@@ -267,8 +269,22 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
         error: null,
         completedAt: nowIso,
       },
-      pass2: { status: 'COMPLETED', data: events, error: null, completedAt: nowIso },
-      pass3: { status: 'COMPLETED', data: refinements, error: null, completedAt: nowIso },
+      pass2: {
+        status: 'COMPLETED',
+        data: eventsPayload,
+        executionAudit: (events as any)?.executionAudit || (eventsPayload as any)?.executionAudit,
+        thinkingLevel: (events as any)?.thinkingLevel || (eventsPayload as any)?.thinkingLevel,
+        error: null,
+        completedAt: nowIso,
+      } as any,
+      pass3: {
+        status: 'COMPLETED',
+        data: refinements,
+        executionAudit: (refinements as any)?.executionAudit,
+        thinkingLevel: (refinements as any)?.thinkingLevel,
+        error: null,
+        completedAt: nowIso,
+      } as any,
       hitl: { status: 'PENDING' },
     };
 
@@ -582,6 +598,11 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         : Array.isArray((rawActionsData as any)?.actions)
         ? (rawActionsData as any).actions
         : [];
+      const pass1Events: Event[] = Array.isArray((rawActionsData as any)?.events)
+        ? (rawActionsData as any).events
+        : Array.isArray(currentPasses.pass1?.data?.events)
+        ? currentPasses.pass1.data.events
+        : [];
       activePassKey = 'pass2';
       const startedAt = new Date().toISOString();
       await syncPassState('pass2', { status: 'RUNNING', startedAt });
@@ -590,35 +611,64 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         classification,
         localVideoPath: effectiveLocalVideoPath,
         actions,
+        events: pass1Events,
         customerId,
         videoId,
         registeredFileUri: geminiFileUri,
         databaseId,
         model,
+        thinkingLevel,
       });
-      await writePassArtifactJson(videoId, 'event_detection_pass.json', events);
+      const eventsPayload = (events as any).toJSON ? (events as any).toJSON() : events;
+      await writePassArtifactJson(videoId, 'event_detection_pass.json', eventsPayload);
       const completedAt = new Date().toISOString();
-      await syncPassState('pass2', {
-        status: 'COMPLETED',
-        data: events,
-        error: null,
-        startedAt,
-        completedAt,
-      });
+      const pass2Audit = (events as any)?.executionAudit || (eventsPayload as any)?.executionAudit;
+      const resolvedPass2Thinking = (events as any)?.thinkingLevel || (eventsPayload as any)?.thinkingLevel || thinkingLevel || 'MEDIUM';
 
-      // Explicitly clear stale error in Firestore on success
+      // Sync updated Pass 1 actions (with 4 fps refined boundaries & eventList) back into pass1 state
+      const updatedPass1Data =
+        rawActionsData && !Array.isArray(rawActionsData) && Array.isArray((rawActionsData as any).actions)
+          ? { ...(rawActionsData as any), actions }
+          : actions;
+      currentPasses.pass1 = {
+        ...currentPasses.pass1,
+        status: 'COMPLETED',
+        data: updatedPass1Data,
+        error: null,
+        updatedAt: completedAt,
+      };
+
+      await syncPassState(
+        'pass2',
+        {
+          status: 'COMPLETED',
+          data: eventsPayload,
+          ...(pass2Audit ? { executionAudit: pass2Audit } : {}),
+          ...(resolvedPass2Thinking ? { thinkingLevel: resolvedPass2Thinking } : {}),
+          error: null,
+          startedAt,
+          completedAt,
+        } as any,
+        pass2Audit
+      );
+
+      // Explicitly clear stale error in Firestore on success and persist refined Pass 1 action intervals
       try {
         await db.collection('videos').doc(videoId).update({
+          'passes.pass1.data': updatedPass1Data,
           'passes.pass2.status': 'COMPLETED',
           'passes.pass2.error': null,
-          'passes.pass2.data': events,
+          'passes.pass2.data': eventsPayload,
+          ...(pass2Audit ? { 'passes.pass2.executionAudit': pass2Audit } : {}),
           updatedAt: completedAt,
         });
         if (databaseId !== '(default)') {
           await getTenantFirestore(databaseId).collection('videos').doc(videoId).update({
+            'passes.pass1.data': updatedPass1Data,
             'passes.pass2.status': 'COMPLETED',
             'passes.pass2.error': null,
-            'passes.pass2.data': events,
+            'passes.pass2.data': eventsPayload,
+            ...(pass2Audit ? { 'passes.pass2.executionAudit': pass2Audit } : {}),
             updatedAt: completedAt,
           });
         }
@@ -670,10 +720,15 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         : Array.isArray((rawActionsData as any)?.actions)
         ? (rawActionsData as any).actions
         : [];
-      const events: Event[] =
+      const rawEventsData =
         eventsInput ||
         currentPasses.pass2?.data ||
         (await runStep2(classification, actions));
+      const events: Event[] = Array.isArray(rawEventsData)
+        ? rawEventsData
+        : Array.isArray((rawEventsData as any)?.events)
+        ? (rawEventsData as any).events
+        : [];
       activePassKey = 'pass3';
       const startedAt = new Date().toISOString();
       await syncPassState('pass3', { status: 'RUNNING', startedAt });
@@ -688,7 +743,10 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         registeredFileUri: geminiFileUri,
         databaseId,
         model,
+        thinkingLevel,
       });
+      const resolvedPass3Thinking = (refinements as any)?.thinkingLevel || thinkingLevel || 'MEDIUM';
+      const pass3Audit = (refinements as any)?.executionAudit;
 
       // Link refinementIds back onto corresponding parent events
       const eventToRefinements = new Map<string, string[]>();
@@ -723,9 +781,15 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         data: enrichedActions,
         error: null,
       };
+      const updatedPass2Data =
+        rawEventsData && !Array.isArray(rawEventsData) && Array.isArray((rawEventsData as any).events)
+          ? { ...(rawEventsData as any), events: enrichedEvents }
+          : Array.isArray((rawEventsData as any)?.refinedActions)
+          ? { events: enrichedEvents, refinedActions: (rawEventsData as any).refinedActions }
+          : enrichedEvents;
       currentPasses.pass2 = {
         ...currentPasses.pass2,
-        data: enrichedEvents,
+        data: updatedPass2Data,
         error: null,
       };
 
@@ -751,10 +815,12 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         {
           status: 'COMPLETED',
           data: refinements,
+          ...(pass3Audit ? { executionAudit: pass3Audit } : {}),
+          ...(resolvedPass3Thinking ? { thinkingLevel: resolvedPass3Thinking } : {}),
           error: null,
           startedAt,
           completedAt,
-        },
+        } as any,
         {
           status: 'ANALYSIS_COMPLETE',
           analysisId: videoId,

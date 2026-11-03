@@ -1410,4 +1410,655 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       }
     });
   });
+
+  describe('7. Pass 1 (1 fps) Event Detection & Action Association + Pass 2 (4 fps) Dual Best Frames & Boundary Refinement', () => {
+    it('should detect BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events in Pass 1 (1 fps) and associate them with vial actions (box-wide & spoken count "four vial")', async () => {
+      let capturedPass1Request = null;
+      setGenAIClient({
+        models: {
+          generateContent: async (params) => {
+            capturedPass1Request = params;
+            return {
+              text: JSON.stringify({
+                totalActionsDetected: 5,
+                actions: [1, 2, 3, 4, 5].map((idx) => ({
+                  actionId: `act_p1_vial_0${idx}`,
+                  actionType: idx === 5 ? 'VIAL_REMOVAL' : 'VIAL_INSERTION',
+                  startTimestampSeconds: idx * 10,
+                  endTimestampSeconds: idx * 10 + 4,
+                  startTime: `00:${idx * 10}`,
+                  endTime: `00:${idx * 10 + 4}`,
+                  targetLocation: {
+                    tower: 'Tower A',
+                    box: 'Box 1',
+                    coordinate: `A${idx}`,
+                  },
+                  targetCoordinate: `A${idx}`,
+                  description: `Vial action ${idx} in Box 1 slot A${idx}`,
+                  confidenceScore: 0.96,
+                })),
+                events: [
+                  {
+                    eventId: 'evt_p1_box_label',
+                    eventClass: 'BOX_LABEL_PRESENTATION',
+                    eventTrack: 'video',
+                    startTime: 1.0,
+                    endTime: 4.0,
+                    description: 'Operator presents Box 1 label at start of video',
+                  },
+                  {
+                    eventId: 'evt_p1_vial_four',
+                    eventClass: 'VIAL_LABEL_PRESENTATION',
+                    eventTrack: 'video',
+                    startTime: 5.0,
+                    endTime: 8.5,
+                    spokenContext: 'four vial',
+                    description: 'Operator shows vial label to camera and says four vial',
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      });
+
+      const pass1Actions = await runPass1ActionDetection({
+        videoId: 'vid-pass1-events-01',
+        customerId: 'cust-alpha',
+        databaseId: 'db-alpha',
+        videoGcsUri: 'gs://cust-alpha-video-manager-storage/normalized/norm_vid-pass1-events-01.mp4',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          inventoryName: 'CryoTank-Alpha',
+          transcribedAudio: 'Showing Box 1 label, then HEK293 vial label, four vial insertions.',
+        },
+      });
+
+      // Verify Pass 1 samples at 1 fps
+      const pass1VideoPart = capturedPass1Request.contents[0].parts.find((p) => p.fileData);
+      assert.strictEqual(pass1VideoPart.videoMetadata.fps, 1);
+
+      // Verify Pass 1 detected 5 actions and 2 presentation events
+      assert.strictEqual(pass1Actions.length, 5);
+      assert.ok(Array.isArray(pass1Actions.events), 'Pass 1 must attach associated events');
+      assert.strictEqual(pass1Actions.events.length, 2);
+
+      const boxEvent = pass1Actions.events.find((e) => e.eventId === 'evt_p1_box_label');
+      const vialEvent = pass1Actions.events.find((e) => e.eventId === 'evt_p1_vial_four');
+
+      // Box label event at start of video is associated with all 5 subsequent actions in Box 1
+      assert.deepStrictEqual(boxEvent.actionIds, [
+        'act_p1_vial_01',
+        'act_p1_vial_02',
+        'act_p1_vial_03',
+        'act_p1_vial_04',
+        'act_p1_vial_05',
+      ]);
+
+      // Vial label event with spoken "four vial" is associated with the 4 subsequent vial actions
+      assert.deepStrictEqual(vialEvent.actionIds, [
+        'act_p1_vial_01',
+        'act_p1_vial_02',
+        'act_p1_vial_03',
+        'act_p1_vial_04',
+      ]);
+
+      // Actions 1..4 should cross-link both events in eventList; Action 5 should cross-link the box event
+      assert.deepStrictEqual(pass1Actions[0].eventList, ['evt_p1_box_label', 'evt_p1_vial_four']);
+      assert.deepStrictEqual(pass1Actions[3].eventList, ['evt_p1_box_label', 'evt_p1_vial_four']);
+      assert.deepStrictEqual(pass1Actions[4].eventList, ['evt_p1_box_label']);
+    });
+
+    it('should associate a BOX_LABEL_PRESENTATION event at the beginning of the video with all subsequent vial actions in that box and extract 2 best frames in Pass 2', async () => {
+      const pass1Actions = [
+        {
+          actionId: 'act_box_01',
+          actionClass: 'VIAL_INSERTION_ACTION',
+          actionType: 'VIAL_INSERTION',
+          startTimestampSeconds: 10.0,
+          endTimestampSeconds: 14.0,
+          startTime: '00:10',
+          endTime: '00:14',
+          targetLocation: { tower: 'Tower A', box: 'Box 1', coordinate: 'A1' },
+          eventList: ['evt_box_label_1'],
+        },
+        {
+          actionId: 'act_box_02',
+          actionClass: 'VIAL_INSERTION_ACTION',
+          actionType: 'VIAL_INSERTION',
+          startTimestampSeconds: 18.0,
+          endTimestampSeconds: 22.0,
+          startTime: '00:18',
+          endTime: '00:22',
+          targetLocation: { tower: 'Tower A', box: 'Box 1', coordinate: 'A2' },
+          eventList: ['evt_box_label_1'],
+        },
+        {
+          actionId: 'act_box_03',
+          actionClass: 'VIAL_REMOVAL_ACTION',
+          actionType: 'VIAL_REMOVAL',
+          startTimestampSeconds: 26.0,
+          endTimestampSeconds: 30.0,
+          startTime: '00:26',
+          endTime: '00:30',
+          targetLocation: { tower: 'Tower A', box: 'Box 1', coordinate: 'B1' },
+          eventList: ['evt_box_label_1'],
+        },
+      ];
+      const pass1Events = [
+        {
+          eventId: 'evt_box_label_1',
+          actionId: 'act_box_01',
+          actionIds: ['act_box_01', 'act_box_02', 'act_box_03'],
+          eventClass: 'BOX_LABEL_PRESENTATION',
+          eventTrack: 'video',
+          startTime: 1.0,
+          endTime: 4.5,
+          description: 'Operator presents Box 1 label to camera before accessing slots',
+          bestShotTimes: [],
+          bestShotUrls: [],
+          bestFrames: [],
+          refinementList: [],
+        },
+      ];
+
+      setGenAIClient({
+        models: {
+          generateContent: async () => ({
+            text: JSON.stringify({
+              events: [
+                {
+                  eventId: 'evt_box_label_1',
+                  eventClass: 'BOX_LABEL_PRESENTATION',
+                  eventTrack: 'video',
+                  startTime: 1.0,
+                  endTime: 4.5,
+                  description: 'Operator presents Box 1 label to camera before accessing slots',
+                  highestContrastTimestamp: 2.25,
+                  minimalBlurTimestamp: 3.0,
+                  bestShotTimes: [2.25, 3.0],
+                },
+              ],
+              refinedActions: [
+                {
+                  actionId: 'act_box_01',
+                  refinedStartTimestampSeconds: 9.75,
+                  refinedEndTimestampSeconds: 14.25,
+                },
+                {
+                  actionId: 'act_box_02',
+                  refinedStartTimestampSeconds: 17.5,
+                  refinedEndTimestampSeconds: 22.25,
+                },
+                {
+                  actionId: 'act_box_03',
+                  refinedStartTimestampSeconds: 25.75,
+                  refinedEndTimestampSeconds: 30.5,
+                },
+              ],
+            }),
+          }),
+        },
+      });
+
+      const events = await runPass2EventDetection({
+        videoId: 'vid-box-assoc-01',
+        customerId: 'cust-alpha',
+        databaseId: 'db-alpha',
+        videoGcsUri: 'gs://cust-alpha-video-manager-storage/normalized/norm_vid-box-assoc-01.mp4',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          inventoryName: 'CryoTank-Alpha',
+          transcribedAudio: 'Opening Box 1 and performing three vial updates.',
+        },
+        actions: pass1Actions,
+        events: pass1Events,
+      });
+
+      assert.strictEqual(events.length, 1);
+      const boxEvt = events[0];
+      assert.strictEqual(boxEvt.eventClass, 'BOX_LABEL_PRESENTATION');
+      assert.deepStrictEqual(boxEvt.actionIds, ['act_box_01', 'act_box_02', 'act_box_03']);
+      assert.strictEqual(boxEvt.bestFrames.length, 2);
+      assert.strictEqual(boxEvt.bestFrames[0].frameType, 'HIGHEST_CONTRAST');
+      assert.strictEqual(boxEvt.bestFrames[1].frameType, 'MINIMAL_BLUR');
+      assert.strictEqual(boxEvt.bestShotUrls.length, 2);
+    });
+
+    it('should run Pass 2 at 4 fps ONLY on targeted Pass 1 action [start-1s, end+1s] and event windows (no 1 fps full-video scan)', async () => {
+      const pass1Actions = [1, 2, 3, 4, 5].map((idx) => ({
+        actionId: `act_vial_0${idx}`,
+        actionClass: 'VIAL_INSERTION_ACTION',
+        actionType: 'VIAL_INSERTION',
+        startTimestampSeconds: idx * 10,
+        endTimestampSeconds: idx * 10 + 4,
+        startTime: `00:${idx * 10}`,
+        endTime: `00:${idx * 10 + 4}`,
+        eventList: idx <= 4 ? ['evt_vial_four'] : [],
+      }));
+      const pass1Events = [
+        {
+          eventId: 'evt_vial_four',
+          actionId: 'act_vial_01',
+          actionIds: ['act_vial_01', 'act_vial_02', 'act_vial_03', 'act_vial_04'],
+          eventClass: 'VIAL_LABEL_PRESENTATION',
+          eventTrack: 'video',
+          startTime: 4.0,
+          endTime: 8.0,
+          spokenContext: 'four vial',
+          description: 'Operator shows vial label to camera and says four vial',
+          bestShotTimes: [],
+          bestShotUrls: [],
+          bestFrames: [],
+          refinementList: [],
+        },
+      ];
+
+      let capturedRequest = null;
+      setGenAIClient({
+        models: {
+          generateContent: async (params) => {
+            capturedRequest = params;
+            return {
+              text: JSON.stringify({
+                events: [
+                  {
+                    eventId: 'evt_vial_four',
+                    eventClass: 'VIAL_LABEL_PRESENTATION',
+                    eventTrack: 'video',
+                    startTime: 4.0,
+                    endTime: 8.0,
+                    spokenContext: 'four vial',
+                    description: 'Operator shows vial label to camera and says four vial',
+                    highestContrastTimestamp: 5.5,
+                    minimalBlurTimestamp: 6.25,
+                    bestShotTimes: [5.5, 6.25],
+                  },
+                ],
+                refinedActions: pass1Actions.map((a) => ({
+                  actionId: a.actionId,
+                  refinedStartTimestampSeconds: a.startTimestampSeconds - 0.5,
+                  refinedEndTimestampSeconds: a.endTimestampSeconds + 0.5,
+                })),
+              }),
+            };
+          },
+        },
+      });
+
+      const events = await runPass2EventDetection({
+        videoId: 'vid-four-vials-01',
+        customerId: 'cust-alpha',
+        databaseId: 'db-alpha',
+        videoGcsUri: 'gs://cust-alpha-video-manager-storage/normalized/norm_vid-four-vials-01.mp4',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          inventoryName: 'CryoTank-Alpha',
+          transcribedAudio: 'Showing HEK293 label, four vial insertions starting at A1.',
+        },
+        actions: pass1Actions,
+        events: pass1Events,
+      });
+
+      assert.strictEqual(events.length, 1);
+      const vialEvt = events[0];
+      assert.strictEqual(vialEvt.eventClass, 'VIAL_LABEL_PRESENTATION');
+      assert.strictEqual(vialEvt.actionIds.length, 4, 'Should preserve Pass 1 association with 4 subsequent vial actions');
+      assert.deepStrictEqual(vialEvt.actionIds, [
+        'act_vial_01',
+        'act_vial_02',
+        'act_vial_03',
+        'act_vial_04',
+      ]);
+
+      // Verify 2 best frames (HIGHEST_CONTRAST and MINIMAL_BLUR) are recorded
+      assert.strictEqual(vialEvt.bestFrames.length, 2);
+      assert.strictEqual(vialEvt.highestContrastFrame.frameType, 'HIGHEST_CONTRAST');
+      assert.strictEqual(vialEvt.minimalBlurFrame.frameType, 'MINIMAL_BLUR');
+      assert.ok(vialEvt.highestContrastFrame.url.includes('/api/videos/vid-four-vials-01/frames/'));
+      assert.ok(vialEvt.minimalBlurFrame.url.includes('/api/videos/vid-four-vials-01/frames/'));
+
+      // Verify Pass 2 sends ONLY 4 fps clipped video parts (5 action windows + 1 event window = 6 parts, zero 1 fps full-video parts)
+      const userParts = capturedRequest.contents[0].parts;
+      const videoParts = userParts.filter((p) => p.fileData);
+      const oneFpsParts = videoParts.filter((p) => p.videoMetadata && p.videoMetadata.fps === 1);
+      const fourFpsParts = videoParts.filter((p) => p.videoMetadata && p.videoMetadata.fps === 4);
+      assert.strictEqual(oneFpsParts.length, 0, 'Pass 2 must not scan the full video at 1 fps');
+      assert.strictEqual(
+        fourFpsParts.length,
+        6,
+        'Pass 2 must include 4 fps clipped windows for the 5 Pass 1 actions and 1 Pass 1 presentation event'
+      );
+      assert.deepStrictEqual(fourFpsParts[0].videoMetadata, {
+        fps: 4,
+        startOffset: '9s',
+        endOffset: '15s',
+      });
+      assert.deepStrictEqual(fourFpsParts[5].videoMetadata, {
+        fps: 4,
+        startOffset: '4s',
+        endOffset: '8s',
+      });
+
+      // Verify refinedActions clamp strictly to [start - 1s, end + 1s]
+      assert.strictEqual(events.refinedActions.length, 5);
+      assert.strictEqual(events.refinedActions[0].searchWindowStartSeconds, 9);
+      assert.strictEqual(events.refinedActions[0].searchWindowEndSeconds, 15);
+      assert.strictEqual(events.refinedActions[0].refinedStartTimestampSeconds, 9.5);
+      assert.strictEqual(events.refinedActions[0].refinedEndTimestampSeconds, 14.5);
+      assert.strictEqual(events.refinedActions[0].fps, 4);
+    });
+
+    it('should prioritize clear label visibility for presentation events (allowing both frames to be the same) and refine action interval boundaries without before/after box frame selection, reporting refinedActions in event_detection_pass.json', async () => {
+      const pass1Actions = [
+        {
+          actionId: 'act_refined_01',
+          actionClass: 'VIAL_INSERTION_ACTION',
+          actionType: 'VIAL_INSERTION',
+          startTimestampSeconds: 10.0,
+          endTimestampSeconds: 14.0,
+          startTime: '00:10',
+          endTime: '00:14',
+          eventList: ['evt_same_frame_box', 'evt_same_frame_vial'],
+        },
+      ];
+      const pass1Events = [
+        {
+          eventId: 'evt_same_frame_box',
+          actionId: 'act_refined_01',
+          actionIds: ['act_refined_01'],
+          eventClass: 'BOX_LABEL_PRESENTATION',
+          eventTrack: 'video',
+          startTime: 1.0,
+          endTime: 3.0,
+          description: 'Operator shows Box 1 label clearly to camera at 2.25s',
+          bestShotTimes: [],
+          bestShotUrls: [],
+          bestFrames: [],
+          refinementList: [],
+        },
+        {
+          eventId: 'evt_same_frame_vial',
+          actionId: 'act_refined_01',
+          actionIds: ['act_refined_01'],
+          eventClass: 'VIAL_LABEL_PRESENTATION',
+          eventTrack: 'video',
+          startTime: 4.0,
+          endTime: 7.0,
+          description: 'Operator shows vial label clearly to camera at 5.75s',
+          bestShotTimes: [],
+          bestShotUrls: [],
+          bestFrames: [],
+          refinementList: [],
+        },
+      ];
+
+      let capturedPass2Request = null;
+      setGenAIClient({
+        models: {
+          generateContent: async (params) => {
+            capturedPass2Request = params;
+            return {
+              text: JSON.stringify({
+                events: [
+                  {
+                    eventId: 'evt_same_frame_box',
+                    eventClass: 'BOX_LABEL_PRESENTATION',
+                    eventTrack: 'video',
+                    startTime: 1.0,
+                    endTime: 3.0,
+                    highestContrastTimestamp: 2.25,
+                    minimalBlurTimestamp: 2.25,
+                    bestShotTimes: [2.25, 2.25],
+                  },
+                  {
+                    eventId: 'evt_same_frame_vial',
+                    eventClass: 'VIAL_LABEL_PRESENTATION',
+                    eventTrack: 'video',
+                    startTime: 4.0,
+                    endTime: 7.0,
+                    highestContrastTimestamp: 5.75,
+                    minimalBlurTimestamp: 5.75,
+                    bestShotTimes: [5.75, 5.75],
+                  },
+                ],
+                refinedActions: [
+                  {
+                    actionId: 'act_refined_01',
+                    refinedStartTimestampSeconds: 9.25,
+                    refinedEndTimestampSeconds: 14.75,
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      });
+
+      const events = await runPass2EventDetection({
+        videoId: 'vid-same-frame-refined-01',
+        customerId: 'cust-alpha',
+        databaseId: 'db-alpha',
+        videoGcsUri: 'gs://cust-alpha-video-manager-storage/normalized/norm_vid-same-frame-refined-01.mp4',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          inventoryName: 'CryoTank-Alpha',
+        },
+        actions: pass1Actions,
+        events: pass1Events,
+      });
+
+      assert.strictEqual(events.length, 2);
+      // Both frames are allowed to have the exact same timestamp when a single frame best shows the label clearly to the camera
+      assert.deepStrictEqual(events[0].bestShotTimes, [2.25, 2.25]);
+      assert.strictEqual(events[0].highestContrastFrame.timestampSeconds, 2.25);
+      assert.strictEqual(events[0].minimalBlurFrame.timestampSeconds, 2.25);
+      assert.deepStrictEqual(events[1].bestShotTimes, [5.75, 5.75]);
+      assert.strictEqual(events[1].highestContrastFrame.timestampSeconds, 5.75);
+      assert.strictEqual(events[1].minimalBlurFrame.timestampSeconds, 5.75);
+
+      // Verify action interval boundaries are refined in-place and before/after frame fields are omitted
+      assert.strictEqual(pass1Actions[0].refinedStartTimestampSeconds, 9.25);
+      assert.strictEqual(pass1Actions[0].refinedEndTimestampSeconds, 14.75);
+      assert.strictEqual(pass1Actions[0].startTimestampSeconds, 9.25);
+      assert.strictEqual(pass1Actions[0].endTimestampSeconds, 14.75);
+      assert.strictEqual(pass1Actions[0].beforeActionFrame, undefined);
+      assert.strictEqual(pass1Actions[0].afterActionFrame, undefined);
+      assert.strictEqual(pass1Actions[0].firstFrame, undefined);
+      assert.strictEqual(pass1Actions[0].lastFrame, undefined);
+
+      // Verify serialized event_detection_pass.json payload includes both events and refinedActions
+      const serializedPass2Json = JSON.parse(JSON.stringify(events));
+      assert.strictEqual(Array.isArray(serializedPass2Json.events), true);
+      assert.strictEqual(serializedPass2Json.events.length, 2);
+      assert.strictEqual(Array.isArray(serializedPass2Json.refinedActions), true);
+      assert.strictEqual(serializedPass2Json.refinedActions.length, 1);
+      assert.strictEqual(serializedPass2Json.refinedActions[0].actionId, 'act_refined_01');
+      assert.strictEqual(serializedPass2Json.refinedActions[0].actionType, 'VIAL_INSERTION');
+      assert.strictEqual(serializedPass2Json.refinedActions[0].refinedStartTimestampSeconds, 9.25);
+      assert.strictEqual(serializedPass2Json.refinedActions[0].refinedEndTimestampSeconds, 14.75);
+      assert.strictEqual(serializedPass2Json.refinedActions[0].beforeActionFrame, undefined);
+      assert.strictEqual(serializedPass2Json.refinedActions[0].afterActionFrame, undefined);
+
+      // Verify prompt and system instruction contain label visibility rules and refined interval boundary rules (no before/after frame selection)
+      const promptPart = capturedPass2Request.contents[0].parts.find((p) => p.text);
+      assert.ok(promptPart.text.includes('shows the label clearly to the camera'));
+      assert.ok(promptPart.text.includes('secondary properties'));
+      assert.ok(promptPart.text.includes('It is OK if both frames are the same'));
+      assert.ok(promptPart.text.includes('refine the action interval boundaries ("refinedStartTimestampSeconds" and "refinedEndTimestampSeconds") at 4 fps'));
+      assert.ok(!promptPart.text.includes('ZERO HAND OCCLUSION MANDATE'));
+      assert.ok(capturedPass2Request.config.systemInstruction.includes('shows the label clearly to the camera'));
+      assert.ok(capturedPass2Request.config.systemInstruction.includes('Refining Vial Insertion & Removal Action Interval Boundaries (Pass 2 @ 4 fps)'));
+
+      // Verify Pass 2 defaults to thinkingLevel MEDIUM and passes thinkingConfig to Gemini
+      assert.deepStrictEqual(capturedPass2Request.config.thinkingConfig, {
+        thinkingLevel: 'MEDIUM',
+      });
+      assert.strictEqual(events.thinkingLevel, 'MEDIUM');
+      assert.strictEqual(events.executionAudit.thinkingLevel, 'MEDIUM');
+      assert.deepStrictEqual(events.executionAudit.generationConfig.thinkingConfig, {
+        thinkingLevel: 'MEDIUM',
+      });
+    });
+
+    it('should support configurable thinkingLevel (e.g. HIGH or OFF) for Pass 2 and Pass 3', async () => {
+      let lastRequestConfig = null;
+      setGenAIClient({
+        models: {
+          generateContent: async (req) => {
+            lastRequestConfig = req.config;
+            return {
+              text: JSON.stringify({ events: [], refinedActions: [] }),
+            };
+          },
+        },
+      });
+
+      const eventsHigh = await runPass2EventDetection({
+        videoId: 'vid-thinking-p2',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_vid-thinking-p2.mp4',
+        thinkingLevel: 'HIGH',
+        actions: [
+          {
+            actionId: 'act-1',
+            actionType: 'VIAL_INSERTION',
+            startTime: '00:05.0',
+            endTime: '00:08.0',
+            startTimestampSeconds: 5,
+            endTimestampSeconds: 8,
+            description: 'Insert vial',
+            confidence: 0.95,
+          },
+        ],
+      });
+      assert.deepStrictEqual(lastRequestConfig.thinkingConfig, { thinkingLevel: 'HIGH' });
+      assert.strictEqual(eventsHigh.thinkingLevel, 'HIGH');
+
+      const eventsOff = await runPass2EventDetection({
+        videoId: 'vid-thinking-p2-off',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_vid-thinking-p2-off.mp4',
+        thinkingLevel: 'OFF',
+        actions: [
+          {
+            actionId: 'act-1',
+            actionType: 'VIAL_INSERTION',
+            startTime: '00:05.0',
+            endTime: '00:08.0',
+            startTimestampSeconds: 5,
+            endTimestampSeconds: 8,
+            description: 'Insert vial',
+            confidence: 0.95,
+          },
+        ],
+      });
+      assert.strictEqual(lastRequestConfig.thinkingConfig, undefined);
+      assert.strictEqual(eventsOff.thinkingLevel, 'OFF');
+
+      setGenAIClient({
+        models: {
+          generateContent: async (req) => {
+            lastRequestConfig = req.config;
+            return {
+              text: JSON.stringify([]),
+            };
+          },
+        },
+      });
+
+      const refinementsDefault = await runPass3AnalysisRefinement({
+        videoId: 'vid-thinking-p3',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_vid-thinking-p3.mp4',
+        events: [],
+      });
+      assert.deepStrictEqual(lastRequestConfig.thinkingConfig, { thinkingLevel: 'MEDIUM' });
+      assert.strictEqual(refinementsDefault.thinkingLevel, 'MEDIUM');
+      assert.strictEqual(refinementsDefault.executionAudit.thinkingLevel, 'MEDIUM');
+      assert.strictEqual(refinementsDefault.executionAudit.model, 'gemini-1.5-pro');
+    });
+
+    it('should enforce no temporal overlap between neighboring intervals in Pass 2 and record targetModel & thinkingLevel in executionAudit', async () => {
+      setGenAIClient({
+        models: {
+          generateContent: async (req) => {
+            if (req.model === 'gemini-1.5-pro' || req.model === 'gemini-1.5-pro-002') {
+              const err = new Error('404 Model not found');
+              err.status = 404;
+              throw err;
+            }
+            return {
+              text: JSON.stringify({
+                events: [],
+                refinedActions: [
+                  {
+                    actionId: 'act-1',
+                    beforeActionTimestampSeconds: 9.2,
+                    afterActionTimestampSeconds: 15.0,
+                    refinedStartTimestampSeconds: 9.2,
+                    refinedEndTimestampSeconds: 15.0,
+                  },
+                  {
+                    actionId: 'act-2',
+                    beforeActionTimestampSeconds: 13.8,
+                    afterActionTimestampSeconds: 18.5,
+                    refinedStartTimestampSeconds: 13.8,
+                    refinedEndTimestampSeconds: 18.5,
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      });
+
+      const actions = [
+        {
+          actionId: 'act-1',
+          actionType: 'VIAL_INSERTION',
+          startTime: '00:10.0',
+          endTime: '00:14.0',
+          startTimestampSeconds: 10,
+          endTimestampSeconds: 14,
+          description: 'Insert vial 1',
+          confidence: 0.95,
+        },
+        {
+          actionId: 'act-2',
+          actionType: 'VIAL_INSERTION',
+          startTime: '00:14.5',
+          endTime: '00:18.0',
+          startTimestampSeconds: 14.5,
+          endTimestampSeconds: 18,
+          description: 'Insert vial 2',
+          confidence: 0.95,
+        },
+      ];
+
+      const events = await runPass2EventDetection({
+        videoId: 'vid-no-overlap-p2',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_vid-no-overlap-p2.mp4',
+        model: 'gemini-1.5-pro',
+        thinkingLevel: 'MEDIUM',
+        actions,
+      });
+
+      // Verify model discrepancy is fixed: executionAudit.model is targetModel ('gemini-1.5-pro'), not fallback 'gemini-4-argon'
+      assert.strictEqual(events.modelUsed, 'gemini-1.5-pro');
+      assert.strictEqual(events.executionAudit.model, 'gemini-1.5-pro');
+      assert.strictEqual(events.executionAudit.thinkingLevel, 'MEDIUM');
+
+      // Verify neighboring refined action intervals do NOT overlap in time
+      assert.strictEqual(events.refinedActions.length, 2);
+      const r1 = events.refinedActions[0];
+      const r2 = events.refinedActions[1];
+      assert.ok(
+        r1.searchWindowEndSeconds <= r2.searchWindowStartSeconds,
+        `Expected search windows not to overlap: ${r1.searchWindowEndSeconds} <= ${r2.searchWindowStartSeconds}`
+      );
+      assert.ok(
+        r1.refinedEndTimestampSeconds <= r2.refinedStartTimestampSeconds,
+        `Expected refined intervals not to overlap: ${r1.refinedEndTimestampSeconds} <= ${r2.refinedStartTimestampSeconds}`
+      );
+      assert.ok(actions[0].endTimestampSeconds <= actions[1].startTimestampSeconds);
+    });
+  });
 });

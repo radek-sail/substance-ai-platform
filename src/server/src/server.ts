@@ -10,6 +10,7 @@ import {
   uploadVideoHandler,
   listVideosHandler,
   associateInventoryHandler,
+  getVideoFrameHandler,
 } from './controllers/video.controller';
 import {
   analyzePipelineHandler,
@@ -59,6 +60,7 @@ app.use('/api/videos', videoRoutes);
 app.get('/api/videos', listVideosHandler);
 app.post('/api/videos/upload', uploadMiddleware, uploadVideoHandler);
 app.post('/api/videos/:videoId/associate-inventory', associateInventoryHandler);
+app.get('/api/videos/:videoId/frames/:filename', getVideoFrameHandler);
 
 // Pipeline analysis routes
 app.use('/api/pipeline', pipelineRoutes);

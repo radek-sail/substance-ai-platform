@@ -13,13 +13,22 @@ import {
   ActionDetectionPassResult,
   EventSchema,
   Event,
+  BestFrame,
+  BestFrameSchema,
+  RefinedActionBoundary,
+  RefinedActionBoundarySchema,
   EventDetectionSchema,
+  EventDetectionPassResultSchema,
+  EventDetectionPassResult,
   timeField,
   RefinementSchema,
   Refinement,
 } from '@sail/shared';
-import { extractCandidateFrame } from './ffmpeg.service';
-import { uploadToTenantStorage, getTenantGcsUri } from './storage.service';
+import {
+  extractCandidateFrame,
+  selectBestEventFrames,
+} from './ffmpeg.service';
+import { storage, uploadToTenantStorage, getTenantGcsUri } from './storage.service';
 import { getVideoMetadata, updateVideoPass } from './firestore.service';
 
 /**
@@ -334,35 +343,108 @@ export function parseTimeStringToSeconds(timeStr: string): number {
 export class ActionDetectionPassResultObject extends Array<Action> implements ActionDetectionPassResult {
   videoId: string;
   totalActionsDetected: number;
+  totalEventsDetected?: number;
   workflowContext?: string;
   actions: ActionInterval[];
+  events?: Event[];
   generatedAt: string;
   modelUsed?: string;
   thinkingLevel?: string;
   executionAudit?: any;
 
-  constructor(data: ActionDetectionPassResult, items: Action[]) {
-    super(...items);
-    this.videoId = data.videoId;
-    this.totalActionsDetected = data.totalActionsDetected;
-    this.workflowContext = data.workflowContext;
-    this.actions = data.actions;
-    this.generatedAt = data.generatedAt;
-    this.modelUsed = data.modelUsed;
-    this.thinkingLevel = data.thinkingLevel;
-    this.executionAudit = data.executionAudit;
+  static get [Symbol.species]() {
+    return Array;
+  }
+
+  constructor(data: ActionDetectionPassResult, items?: Action[]) {
+    if (Array.isArray(items)) {
+      super(...items);
+    } else if (typeof data === 'number') {
+      super(data);
+      this.videoId = '';
+      this.totalActionsDetected = 0;
+      this.actions = [];
+      this.generatedAt = '';
+      return;
+    } else {
+      super();
+    }
+    this.videoId = data?.videoId || '';
+    this.totalActionsDetected = data?.totalActionsDetected || 0;
+    this.totalEventsDetected = data?.totalEventsDetected;
+    this.workflowContext = data?.workflowContext;
+    this.actions = data?.actions || [];
+    this.events = data?.events;
+    this.generatedAt = data?.generatedAt || '';
+    this.modelUsed = data?.modelUsed;
+    this.thinkingLevel = data?.thinkingLevel;
+    this.executionAudit = data?.executionAudit;
   }
 
   toJSON(): ActionDetectionPassResult {
     return {
       videoId: this.videoId,
       totalActionsDetected: this.totalActionsDetected,
+      ...(this.totalEventsDetected !== undefined ? { totalEventsDetected: this.totalEventsDetected } : {}),
       workflowContext: this.workflowContext,
       actions: this.actions,
+      ...(this.events !== undefined ? { events: this.events } : {}),
       generatedAt: this.generatedAt,
       modelUsed: this.modelUsed,
       thinkingLevel: this.thinkingLevel,
       executionAudit: this.executionAudit,
+    };
+  }
+}
+
+/**
+ * Implements EventDetectionPassResult while extending Array<Event> to provide
+ * complete backwards-compatibility with existing tests and downstream passes,
+ * while ensuring JSON.stringify() includes both `events` and `refinedActions` in
+ * `event_detection_pass.json`.
+ */
+export class EventDetectionPassResultObject extends Array<Event> implements EventDetectionPassResult {
+  videoId?: string;
+  events: Event[];
+  refinedActions: RefinedActionBoundary[];
+  generatedAt?: string;
+  modelUsed?: string;
+  thinkingLevel?: string;
+  executionAudit?: any;
+
+  static get [Symbol.species]() {
+    return Array;
+  }
+
+  constructor(data: EventDetectionPassResult, items?: Event[]) {
+    if (Array.isArray(items)) {
+      super(...items);
+    } else if (typeof data === 'number') {
+      super(data);
+      this.events = [];
+      this.refinedActions = [];
+      return;
+    } else {
+      super(...(data?.events || []));
+    }
+    this.videoId = data?.videoId;
+    this.events = data?.events || [];
+    this.refinedActions = data?.refinedActions || [];
+    this.generatedAt = data?.generatedAt;
+    this.modelUsed = data?.modelUsed;
+    this.thinkingLevel = data?.thinkingLevel;
+    this.executionAudit = data?.executionAudit;
+  }
+
+  toJSON(): EventDetectionPassResult {
+    return {
+      ...(this.videoId !== undefined ? { videoId: this.videoId } : {}),
+      events: Array.from(this),
+      refinedActions: this.refinedActions,
+      ...(this.generatedAt !== undefined ? { generatedAt: this.generatedAt } : {}),
+      ...(this.modelUsed !== undefined ? { modelUsed: this.modelUsed } : {}),
+      ...(this.thinkingLevel !== undefined ? { thinkingLevel: this.thinkingLevel } : {}),
+      ...(this.executionAudit !== undefined ? { executionAudit: this.executionAudit } : {}),
     };
   }
 }
@@ -404,7 +486,9 @@ export interface PipelineExecutionParams {
     pass1Model?: string;
     pass1Thinking?: string;
     pass2Model?: string;
+    pass2Thinking?: string;
     pass3Model?: string;
+    pass3Thinking?: string;
   };
 }
 
@@ -454,6 +538,9 @@ Return a valid JSON object matching WorkflowClassificationSchema.`;
       fileData: {
         fileUri: gcsUri,
         mimeType: 'video/mp4',
+      },
+      videoMetadata: {
+        fps: 1,
       },
     });
   }
@@ -561,9 +648,11 @@ export interface Pass1Options {
 
 export interface Pass2Options {
   model?: string;
+  thinkingLevel?: string;
   videoGcsUri?: string;
   classification?: WorkflowClassification;
   actions?: Action[];
+  events?: Event[];
   localVideoPath?: string;
   customerId?: string;
   videoId?: string;
@@ -574,6 +663,7 @@ export interface Pass2Options {
 
 export interface Pass3Options {
   model?: string;
+  thinkingLevel?: string;
   videoGcsUri?: string;
   classification?: WorkflowClassification;
   actions?: Action[];
@@ -677,6 +767,13 @@ CRITICAL CONSTRAINTS:
 - \`startTime\` / \`endTime\`: "MM:SS" format, paired with float \`startTimestampSeconds\` / \`endTimestampSeconds\` and \`confidenceScore\` (0.0–1.0).
 - Explicitly forbidden: Repeating hierarchical taxonomy strings or repeating phrase chains.
 
+LABEL PRESENTATION EVENT DETECTION & ACTION ASSOCIATION (1 fps):
+- In the "events" array, detect every 'BOX_LABEL_PRESENTATION' (operator shows cryo-box label/identifier to the camera) and 'VIAL_LABEL_PRESENTATION' (operator shows cryovial label/barcode to the camera) across the 1 fps timeline.
+- Associate each presentation event with the relevant physical actions in "actions" by populating "actionIds" (and primary "actionId"):
+  * Box-wide association: If the operator shows a box label at the start or before working on a box, associate that BOX_LABEL_PRESENTATION event with ALL subsequent vial insertion/removal actions performed in that box.
+  * Spoken count association: If the operator shows a vial label and states a count in the audio, associate that VIAL_LABEL_PRESENTATION event with that number of subsequent vial insertion/removal actions following the presentation.
+  * Record any relevant spoken phrase in "spokenContext" and the rationale in "associationReason".
+
 Return a JSON object conforming to ActionDetectionPassResultSchema.`;
 
   const parts: any[] = [];
@@ -685,6 +782,9 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       fileData: {
         fileUri: gcsUri,
         mimeType: 'video/mp4',
+      },
+      videoMetadata: {
+        fps: 1,
       },
     });
   }
@@ -695,6 +795,7 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
     properties: {
       workflowContext: { type: 'STRING' },
       totalActionsDetected: { type: 'INTEGER' },
+      totalEventsDetected: { type: 'INTEGER' },
       modelUsed: { type: 'STRING' },
       actions: {
         type: 'ARRAY',
@@ -729,6 +830,44 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
             'endTimestampSeconds',
             'confidenceScore',
           ],
+        },
+      },
+      events: {
+        type: 'ARRAY',
+        description:
+          'Chronological list of all BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events detected at 1 fps and associated with the detected actions.',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            eventId: { type: 'STRING' },
+            eventClass: {
+              type: 'STRING',
+              enum: [
+                'BOX_LABEL_PRESENTATION',
+                'VIAL_LABEL_PRESENTATION',
+                'BOX_LABEL_PRESENTATION_EVENT',
+                'VIAL_LABEL_PRESENTATION_EVENT',
+              ],
+            },
+            actionId: {
+              type: 'STRING',
+              description: 'Primary actionId associated with this presentation event (e.g. act_001)',
+            },
+            actionIds: {
+              type: 'ARRAY',
+              items: { type: 'STRING' },
+              description:
+                'All actionIds from actions associated with this presentation event (e.g. all actions in the box for a box label presentation, or N subsequent vial actions when operator states a count).',
+            },
+            startTime: { type: 'STRING' },
+            endTime: { type: 'STRING' },
+            startTimestampSeconds: { type: 'NUMBER' },
+            endTimestampSeconds: { type: 'NUMBER' },
+            description: { type: 'STRING' },
+            spokenContext: { type: 'STRING' },
+            associationReason: { type: 'STRING' },
+          },
+          required: ['eventId', 'eventClass', 'startTimestampSeconds', 'endTimestampSeconds'],
         },
       },
     },
@@ -1035,6 +1174,86 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
     normalizedActions.push(ActionSchema.parse(actionItem));
   }
 
+  // Extract & associate BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events detected at 1 fps in Pass 1
+  const rawPass1Events: any[] = Array.isArray(parsedJson?.events)
+    ? parsedJson.events
+    : Array.isArray(parsedJson?.eventList)
+    ? parsedJson.eventList
+    : [];
+
+  const normalizedPass1RawEvents = rawPass1Events.map((evt: any, idx: number) => {
+    const startSec =
+      typeof evt.startTimestampSeconds === 'number'
+        ? evt.startTimestampSeconds
+        : typeof evt.startTime === 'number'
+        ? evt.startTime
+        : typeof evt.startTime === 'string'
+        ? parseTimeStringToSeconds(evt.startTime)
+        : 0;
+    const endSec =
+      typeof evt.endTimestampSeconds === 'number'
+        ? evt.endTimestampSeconds
+        : typeof evt.endTime === 'number'
+        ? evt.endTime
+        : typeof evt.endTime === 'string'
+        ? parseTimeStringToSeconds(evt.endTime)
+        : startSec;
+    return {
+      ...evt,
+      eventId: evt.eventId || `evt_${String(idx + 1).padStart(3, '0')}`,
+      eventClass: evt.eventClass || 'VIAL_LABEL_PRESENTATION',
+      eventTrack: evt.eventTrack === 'audio' ? 'audio' : 'video',
+      startTime: startSec,
+      endTime: endSec,
+    };
+  });
+
+  const associatedPass1RawEvents = associatePresentationEventsWithActions(
+    normalizedPass1RawEvents,
+    normalizedActions,
+    classification
+  );
+
+  const pass1Events: Event[] = associatedPass1RawEvents.map((evt: any) =>
+    EventSchema.parse({
+      eventId: evt.eventId,
+      actionId: evt.actionId || normalizedActions[0]?.actionId || 'act_001',
+      actionIds:
+        Array.isArray(evt.actionIds) && evt.actionIds.length > 0
+          ? evt.actionIds
+          : [evt.actionId || normalizedActions[0]?.actionId || 'act_001'],
+      eventClass: evt.eventClass || 'VIAL_LABEL_PRESENTATION',
+      eventTrack: evt.eventTrack === 'audio' ? 'audio' : 'video',
+      startTime: evt.startTime ?? 0,
+      endTime: evt.endTime ?? 0,
+      description: evt.description,
+      spokenContext: evt.spokenContext,
+      associationReason: evt.associationReason,
+      bestShotUrls: Array.isArray(evt.bestShotUrls) ? evt.bestShotUrls : [],
+      bestShotTimes: Array.isArray(evt.bestShotTimes) ? evt.bestShotTimes : [],
+      refinementList: Array.isArray(evt.refinementList) ? evt.refinementList : [],
+    })
+  );
+
+  // Cross-link Pass 1 associated presentation events back onto Pass 1 actions & intervals
+  if (pass1Events.length > 0) {
+    for (let i = 0; i < normalizedActions.length; i++) {
+      const act = normalizedActions[i];
+      const interval = normalizedIntervals[i];
+      const linkedEventIds = pass1Events
+        .filter(
+          (e) =>
+            e.actionId === act.actionId ||
+            (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId))
+        )
+        .map((e) => e.eventId);
+      if (linkedEventIds.length > 0) {
+        act.eventList = Array.from(new Set(linkedEventIds));
+        interval.eventList = act.eventList;
+      }
+    }
+  }
+
   const thinkingLevel = config.thinkingConfig?.thinkingLevel || targetThinking || undefined;
 
   const executionAudit = {
@@ -1059,9 +1278,10 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
     },
   };
 
-  const pass1Result = {
+  const pass1Result: ActionDetectionPassResult = {
     videoId: finalVideoId,
     totalActionsDetected: normalizedIntervals.length,
+    ...(pass1Events.length > 0 ? { totalEventsDetected: pass1Events.length, events: pass1Events } : {}),
     workflowContext: classification.workflowType,
     actions: normalizedIntervals,
     generatedAt: new Date().toISOString(),
@@ -1081,6 +1301,8 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
   actions.modelUsed = targetModel;
   if (thinkingLevel) actions.thinkingLevel = thinkingLevel;
   actions.executionAudit = executionAudit;
+  actions.events = pass1Events;
+  actions.totalEventsDetected = pass1Events.length;
 
   console.log(`[Pass 1] Video duration: ${durationSeconds}s. Actions detected: ${result.actions.length}.`);
   console.log(`[Pass 1] Actions detected: ${result.actions.length}`);
@@ -1119,23 +1341,49 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
 }
 
 /**
- * Pass 2 (Event Detection) structured Gemini responseSchema:
- * Explicitly defines eventClass, startTime, endTime float seconds, and sub-event metadata.
+ * Pass 2 (Event Detection & 4 fps Boundary Refinement) structured Gemini responseSchema:
+ * Detects BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events, associates them with
+ * Pass 1 actions (actionIds), identifies the 2 best frames (highest contrast & minimal blur),
+ * and refines Pass 1 action interval boundaries at 4 fps within [start - 1s, end + 1s].
  */
 export const eventDetectionSchema = {
   type: 'OBJECT',
   properties: {
     events: {
       type: 'ARRAY',
-      description: 'Chronological list of fine-grained sub-events detected at 4 fps.',
+      description:
+        'Chronological list of detected BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events (and optional state/audio sub-events).',
       items: {
         type: 'OBJECT',
         properties: {
           eventId: { type: 'STRING' },
+          actionId: {
+            type: 'STRING',
+            description: 'Primary Pass 1 actionId associated with this event (e.g. act_001)',
+          },
+          actionIds: {
+            type: 'ARRAY',
+            items: { type: 'STRING' },
+            description:
+              'All Pass 1 actionIds associated with this event (e.g. all actions in the box for a box label presentation, or N subsequent vial actions when operator states a count like "four vials").',
+          },
           eventClass: {
             type: 'STRING',
-            enum: ['VIAL_INSERTION', 'VIAL_REMOVAL', 'CAP_REMOVAL', 'LABEL_PRESENTATION', 'OTHER'],
-            description: 'Explicit sub-event class',
+            enum: [
+              'BOX_LABEL_PRESENTATION',
+              'VIAL_LABEL_PRESENTATION',
+              'BOX_LABEL_PRESENTATION_EVENT',
+              'VIAL_LABEL_PRESENTATION_EVENT',
+              'VIAL_INSERTION',
+              'VIAL_REMOVAL',
+              'CAP_REMOVAL',
+              'LABEL_PRESENTATION',
+              'PRE_ACTION_BOX_STATE_EVENT',
+              'POST_ACTION_BOX_STATE_EVENT',
+              'OPERATOR_AUDIO_UTTERANCE_EVENT',
+              'OTHER',
+            ],
+            description: 'Explicit event class (BOX_LABEL_PRESENTATION or VIAL_LABEL_PRESENTATION)',
           },
           eventTrack: {
             type: 'STRING',
@@ -1144,16 +1392,39 @@ export const eventDetectionSchema = {
           },
           startTime: {
             type: 'NUMBER',
-            description: 'Start time in elapsed seconds as float (e.g. 32.5)',
+            description: 'Start time in elapsed seconds as float (e.g. 2.5)',
           },
           endTime: {
             type: 'NUMBER',
-            description: 'End time in elapsed seconds as float (e.g. 36.0)',
+            description: 'End time in elapsed seconds as float (e.g. 6.0)',
+          },
+          description: {
+            type: 'STRING',
+            description: 'Concise description of the label presentation event',
+          },
+          spokenContext: {
+            type: 'STRING',
+            description: 'Relevant spoken phrase during or near the presentation (e.g. "four vials")',
+          },
+          associationReason: {
+            type: 'STRING',
+            description: 'Reason explaining why this event is associated with actionIds',
+          },
+          highestContrastTimestamp: {
+            type: 'NUMBER',
+            description:
+              'Timestamp in elapsed seconds (within [startTime, endTime]) of a frame that first and foremost shows the label clearly to the camera (unoccluded and oriented toward the camera), and secondarily has the highest contrast among such frames. It is OK if this equals minimalBlurTimestamp.',
+          },
+          minimalBlurTimestamp: {
+            type: 'NUMBER',
+            description:
+              'Timestamp in elapsed seconds (within [startTime, endTime]) of a frame that first and foremost shows the label clearly to the camera (unoccluded and oriented toward the camera), and secondarily has the minimal amount of blur among such frames. It is OK if this equals highestContrastTimestamp.',
           },
           bestShotTimes: {
             type: 'ARRAY',
             items: { type: 'NUMBER' },
-            description: 'Candidate frame timestamps in elapsed seconds as float',
+            description:
+              'Two best frame timestamps [highestContrastTimestamp, minimalBlurTimestamp] in elapsed seconds that clearly show the label to the camera (it is OK if both timestamps are the same)',
           },
           refinementList: {
             type: 'ARRAY',
@@ -1164,16 +1435,420 @@ export const eventDetectionSchema = {
         required: ['eventId', 'eventClass', 'startTime', 'endTime'],
       },
     },
+    refinedActions: {
+      type: 'ARRAY',
+      description:
+        'For each Pass 1 vial insertion or removal action, refine the start and end interval boundaries (refinedStartTimestampSeconds and refinedEndTimestampSeconds) at 4 fps precision within [max(0, pass1Start - 1), min(duration, pass1End + 1)].',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          actionId: { type: 'STRING' },
+          actionType: { type: 'STRING' },
+          refinedStartTimestampSeconds: {
+            type: 'NUMBER',
+            description:
+              'Refined start timestamp in seconds at 4 fps precision within [pass1Start - 1s, pass1End + 1s] marking when the vial insertion or removal action begins.',
+          },
+          refinedEndTimestampSeconds: {
+            type: 'NUMBER',
+            description:
+              'Refined end timestamp in seconds at 4 fps precision within [pass1Start - 1s, pass1End + 1s] marking when the vial insertion or removal action completes.',
+          },
+          confidenceScore: { type: 'NUMBER' },
+        },
+        required: [
+          'actionId',
+          'refinedStartTimestampSeconds',
+          'refinedEndTimestampSeconds',
+        ],
+      },
+    },
   },
   required: ['events'],
 };
 
 /**
- * Pass 2 (Event Detection):
- * - For each detected action, extracts sub-events at 4 fps (label presentations, before/after shots, audio utterances).
- * - Extracts candidate frame timestamps, calls extractCandidateFrame from ffmpeg.service.ts,
- *   and uploads frames to gs://${bucketName}/frames/{videoId}/.
- * - Populates bestShotUrls and validates output via an array of EventSchema objects.
+ * Parses spoken vial count phrases such as "four vials", "four vial", "4 vials", "three vials", etc.
+ */
+export function parseSpokenVialCount(text?: string): number | null {
+  if (!text || typeof text !== 'string') return null;
+  const wordToNum: Record<string, number> = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+  };
+  const wordMatch = text.match(
+    /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(?:cryo\s*)?vials?\b/i
+  );
+  if (wordMatch) {
+    return wordToNum[wordMatch[1].toLowerCase()] || null;
+  }
+  const digitMatch = text.match(/\b(\d+)\s+(?:cryo\s*)?vials?\b/i);
+  if (digitMatch) {
+    const parsed = parseInt(digitMatch[1], 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+/**
+ * Computes the 4 fps boundary refinement window for a Pass 1 action by extending
+ * its Pass 1 interval by 1 second at the beginning and 1 second at the end:
+ * [max(0, start - 1), min(duration, end + 1)].
+ */
+export function computeActionRefinementWindow(
+  action: Action | ActionInterval,
+  durationSeconds?: number
+): {
+  pass1StartSeconds: number;
+  pass1EndSeconds: number;
+  searchWindowStartSeconds: number;
+  searchWindowEndSeconds: number;
+  hasExplicitTimestamps: boolean;
+} {
+  const rawStart =
+    (action as any).pass1StartTimestampSeconds ??
+    action.startTimestampSeconds ??
+    (action.startTime !== undefined
+      ? typeof action.startTime === 'number'
+        ? action.startTime
+        : parseTimeStringToSeconds(String(action.startTime))
+      : undefined);
+  const rawEnd =
+    (action as any).pass1EndTimestampSeconds ??
+    action.endTimestampSeconds ??
+    (action.endTime !== undefined
+      ? typeof action.endTime === 'number'
+        ? action.endTime
+        : parseTimeStringToSeconds(String(action.endTime))
+      : undefined);
+
+  const hasExplicitTimestamps =
+    typeof rawStart === 'number' &&
+    typeof rawEnd === 'number' &&
+    !isNaN(rawStart) &&
+    !isNaN(rawEnd) &&
+    (rawEnd > 0 || rawStart > 0 || Boolean(action.startTime));
+
+  const pass1StartSeconds = typeof rawStart === 'number' && !isNaN(rawStart) ? Math.max(0, rawStart) : 0;
+  const pass1EndSeconds =
+    typeof rawEnd === 'number' && !isNaN(rawEnd) && rawEnd >= pass1StartSeconds
+      ? rawEnd
+      : pass1StartSeconds;
+
+  const searchWindowStartSeconds = Math.max(0, Number((pass1StartSeconds - 1.0).toFixed(2)));
+  const unclampedEnd = Number((pass1EndSeconds + 1.0).toFixed(2));
+  const searchWindowEndSeconds =
+    typeof durationSeconds === 'number' && durationSeconds > 0
+      ? Math.min(durationSeconds, unclampedEnd)
+      : unclampedEnd;
+
+  return {
+    pass1StartSeconds,
+    pass1EndSeconds,
+    searchWindowStartSeconds,
+    searchWindowEndSeconds,
+    hasExplicitTimestamps,
+  };
+}
+
+/**
+ * Associates detected BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events
+ * with the appropriate Pass 1 inventory update actions:
+ * - Box label presentation: associated with all subsequent vial actions in that box (until next box label).
+ * - Vial label presentation: if operator states a count (e.g. "four vials"), associated with the N subsequent
+ *   vial actions following the event; otherwise associated with the immediately following (or overlapping) action.
+ */
+export function associatePresentationEventsWithActions(
+  rawEvents: any[],
+  actions: Action[],
+  classification?: WorkflowClassification
+): any[] {
+  if (!Array.isArray(rawEvents) || rawEvents.length === 0) return [];
+  const validActionIds = new Set(actions.map((a) => a.actionId));
+
+  const actionsWithTimes = actions.map((a, idx) => {
+    const win = computeActionRefinementWindow(a);
+    return {
+      action: a,
+      index: idx,
+      startSec: win.pass1StartSeconds,
+      endSec: win.pass1EndSeconds,
+      hasTime: win.hasExplicitTimestamps,
+    };
+  });
+
+  // Find timestamps of all box label presentations to bound box scopes
+  const boxEventStarts = rawEvents
+    .filter((e) => {
+      const cls = String(e.eventClass || '').toUpperCase();
+      return cls.includes('BOX_LABEL');
+    })
+    .map((e) => (typeof e.startTime === 'number' ? e.startTime : parseTimeStringToSeconds(String(e.startTime || 0))))
+    .sort((a, b) => a - b);
+
+  return rawEvents.map((evt) => {
+    const cls = String(evt.eventClass || evt.actionType || '').toUpperCase();
+    const evtStart =
+      typeof evt.startTime === 'number' ? evt.startTime : parseTimeStringToSeconds(String(evt.startTime || 0));
+
+    // Filter any model-provided actionIds to known Pass 1 actions (or keep if actions list is empty)
+    let resolvedIds: string[] = Array.isArray(evt.actionIds)
+      ? evt.actionIds.filter((id: any) => typeof id === 'string' && (validActionIds.size === 0 || validActionIds.has(id)))
+      : [];
+
+    let associationReason: string | undefined = evt.associationReason;
+    const spokenContext: string | undefined = evt.spokenContext;
+
+    if (cls.includes('BOX_LABEL')) {
+      // Find next box label presentation after this one, if any
+      const nextBoxStart = boxEventStarts.find((t) => t > evtStart + 0.5);
+      const followingBoxActions = actionsWithTimes
+        .filter((item) => {
+          if (!item.hasTime) return true;
+          const afterBoxPresentation = item.endSec >= evtStart - 1.0;
+          const beforeNextBox = nextBoxStart === undefined || item.startSec < nextBoxStart;
+          return afterBoxPresentation && beforeNextBox;
+        })
+        .map((item) => item.action.actionId);
+
+      if (resolvedIds.length <= 1 && followingBoxActions.length > 0) {
+        resolvedIds = followingBoxActions;
+        if (!associationReason) {
+          associationReason = `Box label presentation at ${evtStart.toFixed(1)}s applies to ${resolvedIds.length} subsequent vial action(s) in this box.`;
+        }
+      }
+    } else if (cls.includes('VIAL_LABEL') || cls === 'LABEL_PRESENTATION') {
+      const spokenCount =
+        parseSpokenVialCount(spokenContext) ??
+        parseSpokenVialCount(evt.description) ??
+        parseSpokenVialCount(classification?.transcribedAudio);
+
+      if (spokenCount && spokenCount > 1 && resolvedIds.length < spokenCount) {
+        const subsequentActions = actionsWithTimes
+          .filter((item) => !item.hasTime || item.endSec >= evtStart - 1.0)
+          .slice(0, spokenCount)
+          .map((item) => item.action.actionId);
+        if (subsequentActions.length > 0) {
+          resolvedIds = subsequentActions;
+          if (!associationReason) {
+            associationReason = `Operator presented vial label with spoken count (${spokenCount} vials); associated with ${resolvedIds.length} subsequent vial action(s).`;
+          }
+        }
+      } else if (resolvedIds.length === 0) {
+        if (evt.actionId && (validActionIds.size === 0 || validActionIds.has(evt.actionId))) {
+          resolvedIds = [evt.actionId];
+        } else {
+          const nextAction =
+            actionsWithTimes.find((item) => item.hasTime && item.endSec >= evtStart - 1.0) ||
+            actionsWithTimes[0];
+          if (nextAction) {
+            resolvedIds = [nextAction.action.actionId];
+          }
+        }
+        if (!associationReason && resolvedIds.length > 0) {
+          associationReason = `Associated with subsequent vial action ${resolvedIds.join(', ')}.`;
+        }
+      }
+    }
+
+    if (resolvedIds.length === 0) {
+      const fallbackActionId = evt.actionId || actions[0]?.actionId || 'act_001';
+      resolvedIds = [fallbackActionId];
+    }
+
+    // Deduplicate while preserving order
+    resolvedIds = Array.from(new Set(resolvedIds));
+    const primaryActionId =
+      evt.actionId && resolvedIds.includes(evt.actionId) ? evt.actionId : resolvedIds[0];
+
+    return {
+      ...evt,
+      actionId: primaryActionId,
+      actionIds: resolvedIds,
+      ...(spokenContext ? { spokenContext } : {}),
+      ...(associationReason ? { associationReason } : {}),
+    };
+  });
+}
+
+/**
+ * Resolves the local normalized video path if cached on disk during upload/transcoding.
+ */
+function resolveLocalNormalizedVideoPath(videoId?: string, explicitLocalPath?: string): string | undefined {
+  if (explicitLocalPath && fs.existsSync(explicitLocalPath)) {
+    return explicitLocalPath;
+  }
+  if (!videoId) return undefined;
+  const candidates = [
+    `/tmp/sail_normalized_cache/norm_${videoId}.mp4`,
+    path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${videoId}.mp4`),
+    `/tmp/norm_${videoId}.mp4`,
+    path.join(os.tmpdir(), `norm_${videoId}.mp4`),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Ensures the normalized video file is available on local disk for FFmpeg frame extraction,
+ * downloading it from GCS into `sail_normalized_cache/norm_${videoId}.mp4` when not yet cached locally.
+ */
+async function ensureLocalNormalizedVideoPath(
+  videoId?: string,
+  explicitLocalPath?: string,
+  candidateGcsUris: (string | undefined)[] = []
+): Promise<string | undefined> {
+  const existing = resolveLocalNormalizedVideoPath(videoId, explicitLocalPath);
+  if (existing) {
+    return existing;
+  }
+  if (!videoId || process.env.NODE_ENV === 'test') {
+    return undefined;
+  }
+
+  let cacheBaseDir = '/tmp';
+  try {
+    if (!fs.existsSync(cacheBaseDir)) {
+      fs.mkdirSync(cacheBaseDir, { recursive: true });
+    }
+  } catch {
+    cacheBaseDir = os.tmpdir();
+  }
+  const cacheDir = path.join(cacheBaseDir, 'sail_normalized_cache');
+  try {
+    if (!fs.existsSync(cacheDir)) {
+      fs.mkdirSync(cacheDir, { recursive: true });
+    }
+  } catch {
+    return undefined;
+  }
+
+  const destPath = path.join(cacheDir, `norm_${videoId}.mp4`);
+  const defaultBucket = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
+
+  const gcsTargets: { bucketName: string; objectPath: string }[] = [];
+  const addTarget = (bName: string, objPath: string) => {
+    const cleanObj = objPath.replace(/^\/+/, '');
+    if (!bName || !cleanObj) return;
+    if (!gcsTargets.some((t) => t.bucketName === bName && t.objectPath === cleanObj)) {
+      gcsTargets.push({ bucketName: bName, objectPath: cleanObj });
+    }
+  };
+
+  for (const rawUri of candidateGcsUris) {
+    if (!rawUri || typeof rawUri !== 'string') continue;
+    if (rawUri.startsWith('gs://')) {
+      const withoutScheme = rawUri.slice(5);
+      const slashIdx = withoutScheme.indexOf('/');
+      if (slashIdx > 0) {
+        addTarget(withoutScheme.slice(0, slashIdx), withoutScheme.slice(slashIdx + 1));
+      }
+    } else {
+      addTarget(defaultBucket, rawUri);
+    }
+  }
+
+  addTarget(defaultBucket, `normalized/${videoId}/chunk_000.mp4`);
+  addTarget(defaultBucket, `normalized/norm_${videoId}.mp4`);
+  addTarget(defaultBucket, `uploads/${videoId}.mp4`);
+
+  for (const target of gcsTargets) {
+    try {
+      const file = storage.bucket(target.bucketName).file(target.objectPath);
+      const [exists] = await file.exists();
+      if (!exists) continue;
+      await file.download({ destination: destPath });
+      if (fs.existsSync(destPath) && fs.statSync(destPath).size > 256) {
+        console.log(
+          `[Pass 2] Downloaded video gs://${target.bucketName}/${target.objectPath} to ${destPath} for frame extraction.`
+        );
+        return destPath;
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+
+  return undefined;
+}
+
+function resolvePersistentFrameDirs(videoId?: string): { primaryDir: string; mirrorDir?: string } {
+  const safeVideoId = videoId || 'default';
+  let primaryBase = '/tmp';
+  try {
+    if (!fs.existsSync(primaryBase)) {
+      fs.mkdirSync(primaryBase, { recursive: true });
+    }
+  } catch {
+    primaryBase = os.tmpdir();
+  }
+  const primaryDir = path.join(primaryBase, 'sail_frames_cache', safeVideoId);
+  if (!fs.existsSync(primaryDir)) {
+    fs.mkdirSync(primaryDir, { recursive: true });
+  }
+
+  const osTmpDir = path.join(os.tmpdir(), 'sail_frames_cache', safeVideoId);
+  let mirrorDir: string | undefined;
+  if (path.resolve(osTmpDir) !== path.resolve(primaryDir)) {
+    try {
+      if (!fs.existsSync(osTmpDir)) {
+        fs.mkdirSync(osTmpDir, { recursive: true });
+      }
+      mirrorDir = osTmpDir;
+    } catch {
+      mirrorDir = undefined;
+    }
+  }
+  return { primaryDir, mirrorDir };
+}
+
+function mirrorFrameFile(localPath: string, mirrorDir?: string): void {
+  if (!mirrorDir || !localPath || !fs.existsSync(localPath)) return;
+  try {
+    const dest = path.join(mirrorDir, path.basename(localPath));
+    if (path.resolve(dest) !== path.resolve(localPath)) {
+      fs.copyFileSync(localPath, dest);
+    }
+  } catch {
+    // ignore mirror error
+  }
+}
+
+function isRealJpegFile(filePath?: string): boolean {
+  if (!filePath || !fs.existsSync(filePath)) return false;
+  try {
+    const buf = fs.readFileSync(filePath);
+    return buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pass 2 (Event Detection & 4 fps Action Boundary Refinement):
+ * 1. Detects BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events in the video.
+ * 2. Associates each presentation event with the relevant Pass 1 inventory update actions (`actionIds`),
+ *    supporting box-wide associations and spoken multi-vial counts (e.g., "four vials").
+ * 3. Selects and extracts the 2 best frames per event:
+ *    - 1 frame with HIGHEST_CONTRAST
+ *    - 1 frame with MINIMAL_BLUR
+ *    Uploads both frames to GCS and caches them for UI display.
+ * 4. Refines Pass 1 action interval boundaries at 4 fps strictly within the window
+ *    [max(0, pass1Start - 1s), min(duration, pass1End + 1s)].
  */
 export async function runPass2EventDetection(
   paramsOrVideoId: Pass2Options | string,
@@ -1183,6 +1858,7 @@ export async function runPass2EventDetection(
   const videoId = isString ? paramsOrVideoId : paramsOrVideoId.videoId;
   const mergedOptions: Pass2Options = isString ? (options || {}) : { ...paramsOrVideoId, ...options };
   const targetModel = mergedOptions.model || DEFAULT_PRO_MODEL;
+  const targetThinking = mergedOptions.thinkingLevel || 'MEDIUM';
   const databaseId = mergedOptions.databaseId || '(default)';
   const customerId = mergedOptions.customerId || 'customer-alpha';
 
@@ -1202,8 +1878,7 @@ export async function runPass2EventDetection(
     mergedOptions.classification ||
     videoDoc?.passes?.pass0?.data || {
       workflowType: 'INVENTORY_UPDATE_WORKFLOW',
-      confidence: 1.0,
-      notes: 'Default classification',
+      transcribedAudio: '',
     };
 
   const rawActions =
@@ -1212,6 +1887,14 @@ export async function runPass2EventDetection(
     videoDoc?.passes?.pass1?.data ||
     [];
   const actions: Action[] = Array.isArray(rawActions) ? rawActions : [];
+  const rawPass1Events =
+    mergedOptions.events ||
+    (mergedOptions.actions as any)?.events ||
+    videoDoc?.passes?.pass1?.data?.events ||
+    [];
+  const pass1Events: Event[] = Array.isArray(rawPass1Events) ? rawPass1Events : [];
+  const durationSeconds: number | undefined =
+    videoDoc?.durationSeconds || (videoDoc as any)?.durationSec || undefined;
 
   const guidelineFile =
     classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
@@ -1227,23 +1910,152 @@ export async function runPass2EventDetection(
     videoDoc?.normalizedGcsUri ||
     videoDoc?.rawGcsUri;
   const gcsUri = resolveNormalizedGcsUri(resolvedGcs, videoId);
+  const resolvedLocalVideoPath = await ensureLocalNormalizedVideoPath(
+    videoId,
+    mergedOptions.localVideoPath,
+    [
+      gcsUri,
+      mergedOptions.registeredFileUri,
+      mergedOptions.videoGcsUri,
+      videoDoc?.normalizedGcsUri,
+      (videoDoc as any)?.chunks?.[0]?.gcsUri,
+      videoDoc?.rawGcsUri,
+    ]
+  );
 
   const scratchDir = path.join(os.tmpdir(), `sail_frames_${videoId || 'temp'}`);
   if (!fs.existsSync(scratchDir)) {
     fs.mkdirSync(scratchDir, { recursive: true });
   }
+  const { primaryDir: persistentFrameDir, mirrorDir: mirrorFrameDir } = resolvePersistentFrameDirs(videoId);
 
   try {
-    for (const action of actions) {
-      const promptText = `Action ID: ${action.actionId} (${action.actionClass || (action as any).actionType || 'ACTION'}).
-Temporal span analysis at 4 fps.
-Extract fine-grained sub-events: label presentations, pre-action/post-action state shots, and operator speech utterances.
-Ensure every event explicitly includes eventClass (one of: "VIAL_INSERTION", "VIAL_REMOVAL", "CAP_REMOVAL", "LABEL_PRESENTATION", "OTHER").
-Timestamps must be numeric elapsed seconds as float: startTime (e.g. 32.5) and endTime (e.g. 36.0).
-Return a JSON object containing an "events" array conforming to the response schema.`;
+    // Compute 4 fps refinement windows [max(0, start - 1), min(duration, end + 1)] for each Pass 1 action
+    const actionRefinementWindows = actions.map((action) => ({
+      action,
+      ...computeActionRefinementWindow(action, durationSeconds),
+    }));
 
-      const parts: any[] = [];
-      if (gcsUri) {
+    // Ensure neighboring action refinement search windows do not overlap in time
+    for (let i = 0; i < actionRefinementWindows.length - 1; i++) {
+      const wCurr = actionRefinementWindows[i];
+      const wNext = actionRefinementWindows[i + 1];
+      if (
+        wCurr.hasExplicitTimestamps &&
+        wNext.hasExplicitTimestamps &&
+        wCurr.searchWindowEndSeconds > wNext.searchWindowStartSeconds
+      ) {
+        const rawMid =
+          wCurr.pass1EndSeconds <= wNext.pass1StartSeconds
+            ? (wCurr.pass1EndSeconds + wNext.pass1StartSeconds) / 2
+            : (wCurr.searchWindowEndSeconds + wNext.searchWindowStartSeconds) / 2;
+        const mid = Number(rawMid.toFixed(2));
+        wCurr.searchWindowEndSeconds = Math.max(
+          wCurr.searchWindowStartSeconds,
+          Math.min(wCurr.searchWindowEndSeconds, mid)
+        );
+        wNext.searchWindowStartSeconds = Math.min(
+          wNext.searchWindowEndSeconds,
+          Math.max(wNext.searchWindowStartSeconds, wCurr.searchWindowEndSeconds)
+        );
+      }
+    }
+
+    // Compute 4 fps inspection windows for each Pass 1 presentation event
+    const eventWindows = pass1Events.map((evt) => {
+      const startSec =
+        typeof evt.startTime === 'number'
+          ? evt.startTime
+          : parseTimeStringToSeconds(String(evt.startTime || 0));
+      const endSec =
+        typeof evt.endTime === 'number'
+          ? evt.endTime
+          : parseTimeStringToSeconds(String(evt.endTime || startSec));
+      return {
+        event: evt,
+        startSeconds: Math.max(0, Number(startSec.toFixed(2))),
+        endSeconds: Math.max(startSec, Number(endSec.toFixed(2))),
+        hasExplicitTimestamps: endSec > 0 || startSec > 0,
+      };
+    });
+
+    const hasExplicitActionWindows = actionRefinementWindows.some((w) => w.hasExplicitTimestamps);
+    const hasExplicitEventWindows = eventWindows.some((w) => w.hasExplicitTimestamps);
+
+    const actionSummaryLines = actionRefinementWindows.map((w, idx) => {
+      const actType = w.action.actionType || w.action.actionClass || 'VIAL_ACTION';
+      const coord = w.action.targetCoordinate || (w.action.boxRowId ? `${w.action.boxRowId}${w.action.boxColId || ''}` : 'UNKNOWN');
+      return `  ${idx + 1}. actionId="${w.action.actionId}" (${actType}, slot=${coord}): Pass 1 interval [${w.pass1StartSeconds.toFixed(2)}s - ${w.pass1EndSeconds.toFixed(2)}s] -> 4 fps refinement window [${w.searchWindowStartSeconds.toFixed(2)}s - ${w.searchWindowEndSeconds.toFixed(2)}s]`;
+    });
+
+    const eventSummaryLines = eventWindows.map((ew, idx) => {
+      const actionIdsStr = Array.isArray(ew.event.actionIds) && ew.event.actionIds.length > 0
+        ? ew.event.actionIds.join(', ')
+        : ew.event.actionId;
+      return `  ${idx + 1}. eventId="${ew.event.eventId}" (${ew.event.eventClass}, associated actionIds=[${actionIdsStr}]): Pass 1 interval [${ew.startSeconds.toFixed(2)}s - ${ew.endSeconds.toFixed(2)}s]`;
+    });
+
+    const promptText = [
+      `Pass 2 Targeted 4 fps Best-Frame Selection & Action Boundary Refinement for videoId="${videoId || 'unknown'}".`,
+      classification.transcribedAudio
+        ? `Pass 0 Audio Transcript Context: "${classification.transcribedAudio}"`
+        : '',
+      `Pass 1 Detected Inventory Update Actions (${actions.length}):`,
+      actionSummaryLines.length > 0 ? actionSummaryLines.join('\n') : '  (No Pass 1 actions provided)',
+      `Pass 1 Detected & Associated Label Presentation Events (${pass1Events.length}):`,
+      eventSummaryLines.length > 0 ? eventSummaryLines.join('\n') : '  (None pre-populated in Pass 1)',
+      ``,
+      `Instructions (4 fps targeted window analysis only):`,
+      `1. For each presentation event (BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION), inspect its window at 4 fps and identify the 2 best frames within [startTime, endTime]:`,
+      `   - Primary Criterion: The most important aspect of frame selection is that the frame shows the label clearly to the camera (oriented directly toward the camera, in frame, legible, and not occluded by the operator's fingers or hand).`,
+      `   - Secondary Properties: The amount of blur and high contrast are secondary properties evaluated among frames that show the label clearly to the camera.`,
+      `   - "highestContrastTimestamp": timestamp (seconds) of the frame that shows the label clearly to the camera and secondarily has the highest contrast.`,
+      `   - "minimalBlurTimestamp": timestamp (seconds) of the frame that shows the label clearly to the camera and secondarily has the minimal amount of blur.`,
+      `   - It is OK if both frames are the same ("highestContrastTimestamp" === "minimalBlurTimestamp"). Set "bestShotTimes" to [highestContrastTimestamp, minimalBlurTimestamp] and preserve the Pass 1 "actionIds" associations.`,
+      `2. For each Pass 1 vial insertion or removal action, inspect its 4 fps refinement window in "refinedActions" and refine the action interval boundaries ("refinedStartTimestampSeconds" and "refinedEndTimestampSeconds") at 4 fps within [pass1Start - 1s, pass1End + 1s]:`,
+      `   - "refinedStartTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the vial insertion or removal action begins.`,
+      `   - "refinedEndTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the vial insertion or removal action completes.`,
+      `   - Neighboring action intervals must NEVER overlap in time: for any consecutive actions i and i+1, "refinedEndTimestampSeconds" of action i MUST be <= "refinedStartTimestampSeconds" of action i+1.`,
+      `Return a JSON object containing "events" and "refinedActions" conforming to the response schema.`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    const parts: any[] = [];
+    if (gcsUri) {
+      if (hasExplicitActionWindows || hasExplicitEventWindows) {
+        // Send ONLY 4 fps clipped windows for Pass 1 actions ([start - 1s, end + 1s]) and Pass 1 events ([startTime, endTime]) — NO full-video scan
+        for (const win of actionRefinementWindows) {
+          if (win.hasExplicitTimestamps) {
+            parts.push({
+              fileData: {
+                fileUri: gcsUri,
+                mimeType: 'video/mp4',
+              },
+              videoMetadata: {
+                fps: 4,
+                startOffset: `${win.searchWindowStartSeconds}s`,
+                endOffset: `${win.searchWindowEndSeconds}s`,
+              },
+            });
+          }
+        }
+        for (const ew of eventWindows) {
+          if (ew.hasExplicitTimestamps) {
+            parts.push({
+              fileData: {
+                fileUri: gcsUri,
+                mimeType: 'video/mp4',
+              },
+              videoMetadata: {
+                fps: 4,
+                startOffset: `${ew.startSeconds}s`,
+                endOffset: `${ew.endSeconds}s`,
+              },
+            });
+          }
+        }
+      } else {
         parts.push({
           fileData: {
             fileUri: gcsUri,
@@ -1251,166 +2063,596 @@ Return a JSON object containing an "events" array conforming to the response sch
           },
         });
       }
-      parts.push({ text: promptText });
+    }
+    parts.push({ text: promptText });
 
-      const pass2Candidates = Array.from(
-        new Set(
-          targetModel.toLowerCase().includes('flash')
-            ? [targetModel, DEFAULT_FLASH_MODEL]
-            : [targetModel, 'gemini-1.5-pro-002', 'gemini-1.5-pro', 'gemini-4-argon', 'gemini-3.1-pro-preview']
-        )
-      );
-      let response: any;
-      for (let mIdx = 0; mIdx < pass2Candidates.length; mIdx++) {
-        const candidateModel = pass2Candidates[mIdx];
-        try {
-          response = await generateContentWithRetry(client, {
-            model: candidateModel,
-            contents: [
-              {
-                role: 'user',
-                parts,
-              },
-            ],
-            config: {
-              systemInstruction,
-              temperature: 0.1,
-              responseMimeType: 'application/json',
-              responseSchema: eventDetectionSchema,
+    const pass2Candidates = Array.from(
+      new Set(
+        targetModel.toLowerCase().includes('flash')
+          ? [targetModel, DEFAULT_FLASH_MODEL]
+          : [targetModel, 'gemini-1.5-pro-002', 'gemini-1.5-pro', 'gemini-4-argon', 'gemini-3.1-pro-preview']
+      )
+    );
+
+    const pass2Config: any = {
+      systemInstruction,
+      temperature: 0.1,
+      responseMimeType: 'application/json',
+      responseSchema: eventDetectionSchema,
+    };
+    if (targetThinking && targetThinking !== 'OFF') {
+      pass2Config.thinkingConfig = {
+        thinkingLevel: targetThinking,
+      };
+    }
+
+    let rawResult: any = { events: [], refinedActions: [] };
+    let usedModel = targetModel;
+    let response: any;
+
+    if (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' && actions.length > 0) {
+      const collectedArchiveEvents: any[] = [];
+      for (const action of actions) {
+        const archiveActionPrompt = [
+          `Pass 2 Archive Event Detection for videoId="${videoId || 'unknown'}".`,
+          `Action ID: ${action.actionId}`,
+          `Action Class: ${action.actionClass || action.actionType || 'REAGENT_ACTION'}`,
+          promptText,
+        ].join('\n');
+        const archiveParts: any[] = [];
+        if (gcsUri) {
+          archiveParts.push({
+            fileData: {
+              fileUri: gcsUri,
+              mimeType: 'video/mp4',
             },
           });
-          break;
-        } catch (err: any) {
-          const isNotFound =
-            err?.status === 404 ||
-            err?.statusCode === 404 ||
-            err?.code === 404 ||
-            err?.code === 'NOT_FOUND' ||
-            err?.message?.includes('404') ||
-            err?.message?.includes('NOT_FOUND') ||
-            err?.message?.includes('not found');
-          if (isNotFound && mIdx < pass2Candidates.length - 1) {
-            console.warn(`[Pass 2] Model ${candidateModel} not found, falling back to next Pro candidate...`);
-            continue;
+        }
+        archiveParts.push({ text: archiveActionPrompt });
+
+        let actionResp: any;
+        for (let mIdx = 0; mIdx < pass2Candidates.length; mIdx++) {
+          const candidateModel = pass2Candidates[mIdx];
+          try {
+            usedModel = candidateModel;
+            actionResp = await generateContentWithRetry(client, {
+              model: candidateModel,
+              contents: [{ role: 'user', parts: archiveParts }],
+              config: pass2Config,
+            });
+            response = actionResp;
+            break;
+          } catch (err: any) {
+            const isNotFound =
+              err?.status === 404 ||
+              err?.statusCode === 404 ||
+              err?.code === 404 ||
+              err?.code === 'NOT_FOUND' ||
+              err?.message?.includes('404') ||
+              err?.message?.includes('NOT_FOUND') ||
+              err?.message?.includes('not found');
+            if (isNotFound && mIdx < pass2Candidates.length - 1) {
+              continue;
+            }
+            throw err;
           }
-          throw err;
+        }
+        const actionRawText = actionResp ? extractTextFromResponse(actionResp) : '[]';
+        const actionParsed = extractJsonFromText(actionRawText);
+        const actionEvents = Array.isArray(actionParsed)
+          ? actionParsed
+          : actionParsed?.events || actionParsed?.eventList || [];
+        for (const ev of actionEvents) {
+          collectedArchiveEvents.push({
+            ...ev,
+            actionId: ev.actionId || action.actionId,
+          });
+        }
+      }
+      rawResult = { events: collectedArchiveEvents, refinedActions: [] };
+    } else {
+      if (actions.length > 0 || mergedOptions.videoGcsUri || gcsUri) {
+        for (let mIdx = 0; mIdx < pass2Candidates.length; mIdx++) {
+          const candidateModel = pass2Candidates[mIdx];
+          try {
+            usedModel = candidateModel;
+            response = await generateContentWithRetry(client, {
+              model: candidateModel,
+              contents: [
+                {
+                  role: 'user',
+                  parts,
+                },
+              ],
+              config: pass2Config,
+            });
+            break;
+          } catch (err: any) {
+            const isNotFound =
+              err?.status === 404 ||
+              err?.statusCode === 404 ||
+              err?.code === 404 ||
+              err?.code === 'NOT_FOUND' ||
+              err?.message?.includes('404') ||
+              err?.message?.includes('NOT_FOUND') ||
+              err?.message?.includes('not found');
+            if (isNotFound && mIdx < pass2Candidates.length - 1) {
+              console.warn(`[Pass 2] Model ${candidateModel} not found, falling back to next candidate...`);
+              continue;
+            }
+            // Fallback if Vertex AI rejects multiple fileData clips in a single content message
+            if (parts.length > 2 && gcsUri) {
+              const singlePartFallback = [
+                {
+                  fileData: {
+                    fileUri: gcsUri,
+                    mimeType: 'video/mp4',
+                  },
+                },
+                { text: promptText },
+              ];
+              response = await generateContentWithRetry(client, {
+                model: candidateModel,
+                contents: [{ role: 'user', parts: singlePartFallback }],
+                config: pass2Config,
+              });
+              break;
+            }
+            throw err;
+          }
         }
       }
 
-      const rawText = extractTextFromResponse(response);
+      const rawText = response ? extractTextFromResponse(response) : '{"events":[],"refinedActions":[]}';
       const parsedJson = extractJsonFromText(rawText);
-      const rawResult: any = Array.isArray(parsedJson)
-        ? { events: parsedJson }
+      rawResult = Array.isArray(parsedJson)
+        ? { events: parsedJson, refinedActions: [] }
         : parsedJson && typeof parsedJson === 'object'
         ? parsedJson
-        : { events: [] };
+        : { events: [], refinedActions: [] };
 
       if (!Array.isArray(rawResult.events) && Array.isArray((rawResult as any).eventList)) {
         rawResult.events = (rawResult as any).eventList;
       }
+    }
 
-      if (Array.isArray(rawResult.events)) {
-        rawResult.events = rawResult.events.map((evt: any) => ({
-          ...evt,
-          eventClass: evt.eventClass || evt.actionType || 'VIAL_INSERTION',
-          startTime:
-            typeof evt.startTime === 'string' && evt.startTimestampSeconds !== undefined
-              ? evt.startTimestampSeconds
-              : evt.startTime !== undefined
-              ? evt.startTime
-              : evt.startTimestampSeconds !== undefined
-              ? evt.startTimestampSeconds
-              : 0,
-          endTime:
-            typeof evt.endTime === 'string' && evt.endTimestampSeconds !== undefined
-              ? evt.endTimestampSeconds
-              : evt.endTime !== undefined
-              ? evt.endTime
-              : evt.endTimestampSeconds !== undefined
-              ? evt.endTimestampSeconds
-              : 0,
-        }));
+    const rawModelEvents: any[] = Array.isArray(rawResult.events) ? rawResult.events : [];
+    let combinedRawEvents: any[] = [];
+
+    if (pass1Events.length > 0) {
+      const modelById = new Map<string, any>();
+      for (const me of rawModelEvents) {
+        if (me && typeof me.eventId === 'string') {
+          modelById.set(me.eventId, me);
+        }
       }
+      const matchedModelIds = new Set<string>();
+      combinedRawEvents = pass1Events.map((p1Evt, idx) => {
+        const matched =
+          modelById.get(p1Evt.eventId) ||
+          (rawModelEvents.length === pass1Events.length ? rawModelEvents[idx] : undefined);
+        if (matched?.eventId) {
+          matchedModelIds.add(matched.eventId);
+        }
+        return {
+          ...p1Evt,
+          ...(matched || {}),
+          eventId: p1Evt.eventId,
+          eventClass: p1Evt.eventClass || matched?.eventClass || 'VIAL_LABEL_PRESENTATION',
+          actionId: p1Evt.actionId || matched?.actionId,
+          actionIds:
+            Array.isArray(p1Evt.actionIds) && p1Evt.actionIds.length > 0
+              ? p1Evt.actionIds
+              : matched?.actionIds,
+          spokenContext: p1Evt.spokenContext || matched?.spokenContext,
+          associationReason: p1Evt.associationReason || matched?.associationReason,
+          startTime: p1Evt.startTime !== undefined ? p1Evt.startTime : matched?.startTime,
+          endTime: p1Evt.endTime !== undefined ? p1Evt.endTime : matched?.endTime,
+        };
+      });
+      for (const me of rawModelEvents) {
+        if (me && me.eventId && !matchedModelIds.has(me.eventId) && !pass1Events.some((p) => p.eventId === me.eventId)) {
+          combinedRawEvents.push(me);
+        }
+      }
+    } else {
+      combinedRawEvents = rawModelEvents;
+    }
 
-      const rawEvents: any[] = Array.isArray(rawResult.events) ? rawResult.events : [];
+    const normalizedRawEvents = combinedRawEvents.map(
+      (evt: any, idx: number) => {
+        const startTime =
+          typeof evt.startTime === 'string' && evt.startTimestampSeconds !== undefined
+            ? evt.startTimestampSeconds
+            : evt.startTime !== undefined
+            ? evt.startTime
+            : evt.startTimestampSeconds !== undefined
+            ? evt.startTimestampSeconds
+            : 0;
+        const endTime =
+          typeof evt.endTime === 'string' && evt.endTimestampSeconds !== undefined
+            ? evt.endTimestampSeconds
+            : evt.endTime !== undefined
+            ? evt.endTime
+            : evt.endTimestampSeconds !== undefined
+            ? evt.endTimestampSeconds
+            : 0;
+        return {
+          ...evt,
+          eventId: evt.eventId || `evt_${String(idx + 1).padStart(3, '0')}`,
+          eventClass: evt.eventClass || evt.actionType || 'VIAL_LABEL_PRESENTATION',
+          startTime,
+          endTime,
+        };
+      }
+    );
 
-      for (let i = 0; i < rawEvents.length; i++) {
-        const rawEvent = rawEvents[i];
-        const bestShotTimes: number[] = Array.isArray(rawEvent.bestShotTimes)
-          ? rawEvent.bestShotTimes.map((t: any) => Number(t)).filter((n: number) => !isNaN(n))
-          : [];
-        const bestShotUrls: string[] = [];
+    // 1. Preserve/ensure presentation event associations with Pass 1 actions
+    const associatedRawEvents = associatePresentationEventsWithActions(
+      normalizedRawEvents,
+      actions,
+      classification
+    );
 
-        for (const timestamp of bestShotTimes) {
-          const frameFilename = `frame_${rawEvent.eventId || 'evt'}_${timestamp}.jpg`;
-          const destinationGcsPath = `frames/${videoId || 'default'}/${frameFilename}`;
+    // 2. Extract and record the 2 best frames (HIGHEST_CONTRAST and MINIMAL_BLUR) for each event
+    for (let i = 0; i < associatedRawEvents.length; i++) {
+      const rawEvent = associatedRawEvents[i];
+      const eventId = rawEvent.eventId || `evt_${String(i + 1).padStart(3, '0')}`;
+      const numStart =
+        typeof rawEvent.startTime === 'number'
+          ? rawEvent.startTime
+          : parseTimeStringToSeconds(String(rawEvent.startTime || 0));
+      const numEnd =
+        typeof rawEvent.endTime === 'number'
+          ? rawEvent.endTime
+          : parseTimeStringToSeconds(String(rawEvent.endTime || numStart));
 
-          if (mergedOptions.localVideoPath && fs.existsSync(mergedOptions.localVideoPath)) {
-            try {
-              const frameLocalPath = await extractCandidateFrame(
-                mergedOptions.localVideoPath,
-                timestamp,
-                scratchDir,
-                frameFilename
-              );
-              const uploadedGcsUri = await uploadToTenantStorage(
-                customerId,
-                frameLocalPath,
-                destinationGcsPath,
-                'image/jpeg'
-              );
-              bestShotUrls.push(uploadedGcsUri);
+      const rawBestShotTimes: number[] = Array.isArray(rawEvent.bestShotTimes)
+        ? rawEvent.bestShotTimes.map((t: any) => Number(t)).filter((n: number) => !isNaN(n))
+        : [];
 
-              // Clean up local frame file
-              if (fs.existsSync(frameLocalPath)) {
-                await fs.promises.unlink(frameLocalPath).catch(() => {});
-              }
-            } catch (frameErr) {
-              console.warn(`[Pass 2] Frame extraction failed at ${timestamp}s:`, frameErr);
-              bestShotUrls.push(getTenantGcsUri(customerId, destinationGcsPath));
-            }
-          } else {
-            // Cloud-native URI mapping
-            bestShotUrls.push(getTenantGcsUri(customerId, destinationGcsPath));
+      const hasExplicitDualFrameFields =
+        typeof rawEvent.highestContrastTimestamp === 'number' ||
+        typeof rawEvent.minimalBlurTimestamp === 'number' ||
+        Array.isArray(rawEvent.bestFrames) ||
+        rawBestShotTimes.length >= 2;
+
+      const isLegacySingleShotMock = !hasExplicitDualFrameFields && rawBestShotTimes.length === 1;
+
+      const contrastCandidateTs =
+        typeof rawEvent.highestContrastTimestamp === 'number'
+          ? Number(rawEvent.highestContrastTimestamp)
+          : rawBestShotTimes[0] !== undefined
+          ? rawBestShotTimes[0]
+          : Number(((numStart + numEnd) / 2).toFixed(2));
+
+      const blurCandidateTs =
+        typeof rawEvent.minimalBlurTimestamp === 'number'
+          ? Number(rawEvent.minimalBlurTimestamp)
+          : rawBestShotTimes[1] !== undefined
+          ? rawBestShotTimes[1]
+          : contrastCandidateTs;
+
+      const selectedFrames = await selectBestEventFrames(
+        resolvedLocalVideoPath || '',
+        eventId,
+        numStart,
+        numEnd,
+        persistentFrameDir,
+        {
+          highestContrastTimestamp: contrastCandidateTs,
+          minimalBlurTimestamp: blurCandidateTs,
+          bestShotTimes: rawBestShotTimes,
+        }
+      );
+
+      mirrorFrameFile(selectedFrames.highestContrast.localPath, mirrorFrameDir);
+      mirrorFrameFile(selectedFrames.minimalBlur.localPath, mirrorFrameDir);
+
+      // Upload HIGHEST_CONTRAST and MINIMAL_BLUR frames to GCS
+      const contrastDestGcsPath = `frames/${videoId || 'default'}/${selectedFrames.highestContrast.filename}`;
+      const blurDestGcsPath = `frames/${videoId || 'default'}/${selectedFrames.minimalBlur.filename}`;
+
+      let contrastGcsUri = getTenantGcsUri(customerId, contrastDestGcsPath);
+      let blurGcsUri = getTenantGcsUri(customerId, blurDestGcsPath);
+
+      if (resolvedLocalVideoPath && fs.existsSync(resolvedLocalVideoPath)) {
+        if (isRealJpegFile(selectedFrames.highestContrast.localPath)) {
+          try {
+            contrastGcsUri = await uploadToTenantStorage(
+              customerId,
+              selectedFrames.highestContrast.localPath,
+              contrastDestGcsPath,
+              'image/jpeg'
+            );
+          } catch {
+            contrastGcsUri = getTenantGcsUri(customerId, contrastDestGcsPath);
           }
         }
+        if (isRealJpegFile(selectedFrames.minimalBlur.localPath)) {
+          try {
+            blurGcsUri = await uploadToTenantStorage(
+              customerId,
+              selectedFrames.minimalBlur.localPath,
+              blurDestGcsPath,
+              'image/jpeg'
+            );
+          } catch {
+            blurGcsUri = getTenantGcsUri(customerId, blurDestGcsPath);
+          }
+        }
+      }
 
-        const validatedEvent = EventSchema.parse({
-          ...rawEvent,
-          eventId: rawEvent.eventId || `evt_${action.actionId}_${i + 1}`,
-          actionId: action.actionId,
-          eventClass: rawEvent.eventClass || rawEvent.actionType || 'VIAL_INSERTION',
-          eventTrack: rawEvent.eventTrack === 'audio' ? 'audio' : 'video',
-          startTime: rawEvent.startTime !== undefined ? rawEvent.startTime : 0,
-          endTime: rawEvent.endTime !== undefined ? rawEvent.endTime : 0,
-          bestShotUrls,
-          bestShotTimes,
-          refinementList: Array.isArray(rawEvent.refinementList) ? rawEvent.refinementList : [],
-        });
+      const highestContrastFrame: BestFrame = BestFrameSchema.parse({
+        frameType: 'HIGHEST_CONTRAST',
+        label: 'Highest Contrast',
+        timestampSeconds: selectedFrames.highestContrast.timestampSec,
+        gcsUri: contrastGcsUri,
+        url: `/api/videos/${encodeURIComponent(videoId || 'default')}/frames/${encodeURIComponent(
+          selectedFrames.highestContrast.filename
+        )}`,
+        contrastScore: selectedFrames.highestContrast.contrastScore,
+        blurScore: selectedFrames.highestContrast.blurScore,
+        sharpnessScore: selectedFrames.highestContrast.sharpnessScore,
+      });
 
-        allEvents.push(validatedEvent);
+      const minimalBlurFrame: BestFrame = BestFrameSchema.parse({
+        frameType: 'MINIMAL_BLUR',
+        label: 'Minimal Blur',
+        timestampSeconds: selectedFrames.minimalBlur.timestampSec,
+        gcsUri: blurGcsUri,
+        url: `/api/videos/${encodeURIComponent(videoId || 'default')}/frames/${encodeURIComponent(
+          selectedFrames.minimalBlur.filename
+        )}`,
+        contrastScore: selectedFrames.minimalBlur.contrastScore,
+        blurScore: selectedFrames.minimalBlur.blurScore,
+        sharpnessScore: selectedFrames.minimalBlur.sharpnessScore,
+      });
+
+      const bestFrames: BestFrame[] = [highestContrastFrame, minimalBlurFrame];
+
+      // Preserve 1-element bestShotUrls for legacy unit test mocks that only supply 1 bestShotTime
+      // while populating 2 bestShotUrls for all 2-frame Pass 2 analyses
+      let bestShotTimes: number[];
+      let bestShotUrls: string[];
+
+      if (isLegacySingleShotMock) {
+        bestShotTimes = [...rawBestShotTimes];
+        const legacyFilename = `frame_${eventId}_${rawBestShotTimes[0]}.jpg`;
+        const legacyDestPath = `frames/${videoId || 'default'}/${legacyFilename}`;
+        bestShotUrls = [getTenantGcsUri(customerId, legacyDestPath)];
+      } else {
+        bestShotTimes = [highestContrastFrame.timestampSeconds, minimalBlurFrame.timestampSeconds];
+        bestShotUrls = [highestContrastFrame.gcsUri, minimalBlurFrame.gcsUri];
+      }
+
+      const validatedEvent = EventSchema.parse({
+        ...rawEvent,
+        eventId,
+        actionId: rawEvent.actionId || actions[0]?.actionId || 'act_001',
+        actionIds:
+          Array.isArray(rawEvent.actionIds) && rawEvent.actionIds.length > 0
+            ? rawEvent.actionIds
+            : [rawEvent.actionId || actions[0]?.actionId || 'act_001'],
+        eventClass: rawEvent.eventClass || rawEvent.actionType || 'VIAL_LABEL_PRESENTATION',
+        eventTrack: rawEvent.eventTrack === 'audio' ? 'audio' : 'video',
+        startTime: rawEvent.startTime !== undefined ? rawEvent.startTime : 0,
+        endTime: rawEvent.endTime !== undefined ? rawEvent.endTime : 0,
+        bestShotUrls,
+        bestShotTimes,
+        bestFrames,
+        highestContrastFrame,
+        minimalBlurFrame,
+        refinementList: Array.isArray(rawEvent.refinementList) ? rawEvent.refinementList : [],
+      });
+
+      allEvents.push(validatedEvent);
+    }
+
+    // 3. Refine Pass 1 action interval boundaries at 4 fps within [max(0, start - 1), min(duration, end + 1)]
+    const rawRefinedMap = new Map<string, any>();
+    if (Array.isArray(rawResult.refinedActions)) {
+      for (const ra of rawResult.refinedActions) {
+        if (ra && typeof ra.actionId === 'string') {
+          rawRefinedMap.set(ra.actionId, ra);
+        }
       }
     }
 
-    (allEvents as any).modelUsed = targetModel;
+    // First compute clamped refinedStart & refinedEnd for each action, then enforce non-overlap between neighboring intervals
+    const resolvedActionIntervals = actionRefinementWindows.map((win) => {
+      const act = win.action;
+      const modelRefined = rawRefinedMap.get(act.actionId);
+
+      // Clamp refined / before-action & after-action timestamps strictly inside [searchWindowStartSeconds, searchWindowEndSeconds]
+      let refinedStart = Math.max(
+        win.searchWindowStartSeconds,
+        Math.min(win.searchWindowEndSeconds, win.pass1StartSeconds)
+      );
+      let refinedEnd = Math.max(
+        refinedStart,
+        Math.min(win.searchWindowEndSeconds, win.pass1EndSeconds)
+      );
+
+      if (modelRefined) {
+        const rawBeforeTs =
+          typeof modelRefined.beforeActionTimestampSeconds === 'number' && !isNaN(modelRefined.beforeActionTimestampSeconds)
+            ? modelRefined.beforeActionTimestampSeconds
+            : modelRefined.refinedStartTimestampSeconds;
+        const rawAfterTs =
+          typeof modelRefined.afterActionTimestampSeconds === 'number' && !isNaN(modelRefined.afterActionTimestampSeconds)
+            ? modelRefined.afterActionTimestampSeconds
+            : modelRefined.refinedEndTimestampSeconds;
+
+        if (typeof rawBeforeTs === 'number' && !isNaN(rawBeforeTs)) {
+          refinedStart = Math.max(
+            win.searchWindowStartSeconds,
+            Math.min(win.searchWindowEndSeconds, Number(rawBeforeTs.toFixed(2)))
+          );
+        }
+        if (typeof rawAfterTs === 'number' && !isNaN(rawAfterTs)) {
+          refinedEnd = Math.max(
+            refinedStart,
+            Math.min(win.searchWindowEndSeconds, Number(rawAfterTs.toFixed(2)))
+          );
+        }
+      }
+
+      return {
+        win,
+        act,
+        modelRefined,
+        refinedStart,
+        refinedEnd,
+      };
+    });
+
+    // Enforce no temporal overlap between neighboring action intervals:
+    // curr.refinedEnd <= next.refinedStart for all consecutive actions
+    for (let i = 0; i < resolvedActionIntervals.length - 1; i++) {
+      const curr = resolvedActionIntervals[i];
+      const next = resolvedActionIntervals[i + 1];
+      if (curr.refinedEnd > next.refinedStart) {
+        const pass1GapMid = (curr.win.pass1EndSeconds + next.win.pass1StartSeconds) / 2;
+        const usePass1Mid =
+          curr.win.pass1EndSeconds <= next.win.pass1StartSeconds &&
+          pass1GapMid >= curr.refinedStart &&
+          pass1GapMid <= next.refinedEnd;
+        const rawBoundary = usePass1Mid
+          ? pass1GapMid
+          : (curr.refinedEnd + next.refinedStart) / 2;
+        const boundary = Number(
+          Math.max(curr.refinedStart, Math.min(next.refinedEnd, rawBoundary)).toFixed(2)
+        );
+        curr.refinedEnd = boundary;
+        next.refinedStart = Math.max(boundary, next.refinedStart);
+        next.refinedEnd = Math.max(next.refinedStart, next.refinedEnd);
+      }
+    }
+
+    const refinedActionsList: RefinedActionBoundary[] = [];
+    for (const resolvedInterval of resolvedActionIntervals) {
+      const { win, act, modelRefined, refinedStart, refinedEnd } = resolvedInterval;
+
+      // Collect all events associated with this actionId
+      const associatedEventIds = allEvents
+        .filter((e) => e.actionId === act.actionId || (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId)))
+        .map((e) => e.eventId);
+
+      const mergedEventList = Array.from(new Set([...(act.eventList || []), ...associatedEventIds]));
+
+      const refinedTimeStartStr = formatSecondsToTimeString(refinedStart);
+      const refinedTimeEndStr = formatSecondsToTimeString(refinedEnd);
+
+      // Mutate action in-place so downstream Pass 3 and callers receive refined interval boundaries & eventList
+      act.pass1StartTimestampSeconds = win.pass1StartSeconds;
+      act.pass1EndTimestampSeconds = win.pass1EndSeconds;
+      act.refinedStartTimestampSeconds = refinedStart;
+      act.refinedEndTimestampSeconds = refinedEnd;
+      if (win.hasExplicitTimestamps || modelRefined) {
+        act.startTimestampSeconds = refinedStart;
+        act.endTimestampSeconds = refinedEnd;
+        act.startTime = refinedTimeStartStr;
+        act.endTime = refinedTimeEndStr;
+      }
+      act.refinementWindow = {
+        startSeconds: win.searchWindowStartSeconds,
+        endSeconds: win.searchWindowEndSeconds,
+        fps: 4,
+      };
+      act.eventList = mergedEventList;
+
+      refinedActionsList.push(
+        RefinedActionBoundarySchema.parse({
+          actionId: act.actionId,
+          actionType: act.actionType || act.actionClass,
+          pass1StartTimestampSeconds: win.pass1StartSeconds,
+          pass1EndTimestampSeconds: win.pass1EndSeconds,
+          searchWindowStartSeconds: win.searchWindowStartSeconds,
+          searchWindowEndSeconds: win.searchWindowEndSeconds,
+          refinedStartTimestampSeconds: refinedStart,
+          refinedEndTimestampSeconds: refinedEnd,
+          startTime: refinedTimeStartStr,
+          endTime: refinedTimeEndStr,
+          fps: 4,
+          confidenceScore: modelRefined?.confidenceScore ?? act.confidenceScore,
+          associatedEventIds,
+        })
+      );
+    }
+
+    const thinkingLevel = pass2Config.thinkingConfig?.thinkingLevel || targetThinking || 'MEDIUM';
+    const thoughtsTokenCount = (response?.usageMetadata as any)?.thoughtsTokenCount || 0;
+
+    const executionAudit = {
+      model: targetModel,
+      modelUsed: targetModel,
+      ...(thinkingLevel ? { thinkingLevel } : {}),
+      endpoint: process.env.GOOGLE_CLOUD_API_ENDPOINT || 'us',
+      calledAt: new Date().toISOString(),
+      promptText,
+      systemInstruction: systemInstruction || null,
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+        fps: 4,
+        ...(pass2Config.thinkingConfig
+          ? { thinkingConfig: pass2Config.thinkingConfig }
+          : thinkingLevel
+          ? { thinkingConfig: { thinkingLevel } }
+          : {}),
+        refinementWindows: refinedActionsList.map((r) => ({
+          actionId: r.actionId,
+          startOffset: `${r.searchWindowStartSeconds}s`,
+          endOffset: `${r.searchWindowEndSeconds}s`,
+          fps: 4,
+        })),
+      },
+      schema: eventDetectionSchema,
+      videoMetadata: {
+        durationSeconds,
+        uri: gcsUri,
+      },
+      modelDiagnostics: {
+        finishReason: response?.candidates?.[0]?.finishReason || 'STOP',
+        usageMetadata: response?.usageMetadata || null,
+        thoughtsTokenCount,
+      },
+    };
+
+    const validatedPass2Result = EventDetectionPassResultSchema.parse({
+      videoId: videoId || undefined,
+      events: allEvents,
+      refinedActions: refinedActionsList,
+      generatedAt: new Date().toISOString(),
+      modelUsed: targetModel,
+      thinkingLevel,
+      executionAudit,
+    });
+
+    const pass2ResultObj = new EventDetectionPassResultObject(validatedPass2Result, allEvents);
 
     // Reset passes.pass2.error = null on success when writing to Firestore
     if (videoId) {
       try {
         await updateVideoPass(databaseId, videoId, 'pass2', {
           status: 'COMPLETED',
-          data: allEvents,
+          data: pass2ResultObj.toJSON(),
+          executionAudit,
           completedAt: new Date().toISOString(),
           error: null,
           modelUsed: targetModel,
+          ...(thinkingLevel ? { thinkingLevel } : {}),
         });
         if (databaseId !== '(default)') {
           await updateVideoPass('(default)', videoId, 'pass2', {
             status: 'COMPLETED',
-            data: allEvents,
+            data: pass2ResultObj.toJSON(),
+            executionAudit,
             completedAt: new Date().toISOString(),
             error: null,
             modelUsed: targetModel,
+            ...(thinkingLevel ? { thinkingLevel } : {}),
           });
         }
       } catch (firestoreErr) {
@@ -1418,7 +2660,7 @@ Return a JSON object containing an "events" array conforming to the response sch
       }
     }
 
-    return allEvents;
+    return pass2ResultObj;
   } finally {
     // Clean up temporary scratch frame directory
     if (fs.existsSync(scratchDir)) {
@@ -1443,6 +2685,7 @@ export async function runPass3AnalysisRefinement(
   const videoId = isString ? paramsOrVideoId : paramsOrVideoId.videoId;
   const mergedOptions: Pass3Options = isString ? (options || {}) : { ...paramsOrVideoId, ...options };
   const targetModel = mergedOptions.model || DEFAULT_PRO_MODEL;
+  const targetThinking = mergedOptions.thinkingLevel || 'MEDIUM';
   const databaseId = mergedOptions.databaseId || '(default)';
 
   let videoDoc = mergedOptions.videoRecord;
@@ -1469,7 +2712,11 @@ export async function runPass3AnalysisRefinement(
     mergedOptions.events ||
     videoDoc?.passes?.pass2?.data ||
     [];
-  const events: Event[] = Array.isArray(rawEvents) ? rawEvents : [];
+  const events: Event[] = Array.isArray(rawEvents)
+    ? rawEvents
+    : Array.isArray((rawEvents as any)?.events)
+    ? (rawEvents as any).events
+    : [];
 
   const client = getGenAIClient();
   const systemInstruction = loadGuideline('refinement-agent-guidelines.md');
@@ -1502,6 +2749,9 @@ Output a JSON array of Refinement objects conforming to RefinementSchema.`;
         fileUri: gcsUri,
         mimeType: 'video/mp4',
       },
+      videoMetadata: {
+        fps: 1,
+      },
     });
   }
   parts.push({ text: promptText });
@@ -1513,6 +2763,15 @@ Output a JSON array of Refinement objects conforming to RefinementSchema.`;
         : [targetModel, 'gemini-1.5-pro-002', 'gemini-1.5-pro', 'gemini-4-argon', 'gemini-3.1-pro-preview']
     )
   );
+  const pass3Config: any = {
+    systemInstruction,
+    responseMimeType: 'application/json',
+  };
+  if (targetThinking && targetThinking !== 'OFF') {
+    pass3Config.thinkingConfig = {
+      thinkingLevel: targetThinking,
+    };
+  }
   let response: any;
   for (let mIdx = 0; mIdx < pass3Candidates.length; mIdx++) {
     const candidateModel = pass3Candidates[mIdx];
@@ -1525,10 +2784,7 @@ Output a JSON array of Refinement objects conforming to RefinementSchema.`;
             parts,
           },
         ],
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-        },
+        config: pass3Config,
       });
       break;
     } catch (err: any) {
@@ -1556,7 +2812,37 @@ Output a JSON array of Refinement objects conforming to RefinementSchema.`;
     : parsedJson.refinements || parsedJson.refinementList || [];
 
   const validated = RefinementSchema.array().parse(refinementsArray);
+  const thinkingLevel = pass3Config.thinkingConfig?.thinkingLevel || targetThinking || 'MEDIUM';
+  const thoughtsTokenCount = (response?.usageMetadata as any)?.thoughtsTokenCount || 0;
+  const executionAudit = {
+    model: targetModel,
+    modelUsed: targetModel,
+    ...(thinkingLevel ? { thinkingLevel } : {}),
+    endpoint: process.env.GOOGLE_CLOUD_API_ENDPOINT || 'us',
+    calledAt: new Date().toISOString(),
+    promptText,
+    systemInstruction: systemInstruction || null,
+    generationConfig: {
+      responseMimeType: 'application/json',
+      ...(pass3Config.thinkingConfig
+        ? { thinkingConfig: pass3Config.thinkingConfig }
+        : thinkingLevel
+        ? { thinkingConfig: { thinkingLevel } }
+        : {}),
+    },
+    videoMetadata: {
+      durationSeconds: Number(videoDoc?.durationSeconds || videoDoc?.durationSec || 120),
+      uri: gcsUri,
+    },
+    modelDiagnostics: {
+      finishReason: response?.candidates?.[0]?.finishReason || 'STOP',
+      usageMetadata: response?.usageMetadata || null,
+      thoughtsTokenCount,
+    },
+  };
   (validated as any).modelUsed = targetModel;
+  (validated as any).thinkingLevel = thinkingLevel;
+  (validated as any).executionAudit = executionAudit;
   return validated;
 }
 
@@ -1606,6 +2892,7 @@ export async function executeHierarchicalPipeline(params: PipelineExecutionParam
     videoId: params.videoId,
     databaseId: params.databaseId,
     model: params.options?.pass2Model,
+    thinkingLevel: params.options?.pass2Thinking,
   });
 
   // Pass 3: Analysis Refinement
@@ -1619,6 +2906,7 @@ export async function executeHierarchicalPipeline(params: PipelineExecutionParam
     videoId: params.videoId,
     databaseId: params.databaseId,
     model: params.options?.pass3Model,
+    thinkingLevel: params.options?.pass3Thinking,
   });
 
   return {

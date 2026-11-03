@@ -1,13 +1,16 @@
 import React, { useState } from 'react';
 import {
   Image as ImageIcon,
-  CheckCircle2,
   Sparkles,
   Edit3,
   RotateCcw,
   ExternalLink,
   ShieldCheck,
-  AlertCircle,
+  Tag,
+  Link2,
+  Clock,
+  Contrast,
+  Focus,
 } from 'lucide-react';
 import type { Action, Event, Refinement } from '@sail/shared';
 
@@ -30,6 +33,31 @@ interface VialInspectorProps {
   readOnly?: boolean;
 }
 
+function resolveFrameUrl(url?: string, fallbackTime?: number): string {
+  if (!url) return '';
+  let resolved = url;
+  if (url.startsWith('gs://')) {
+    const withoutScheme = url.slice('gs://'.length);
+    const parts = withoutScheme.split('/');
+    // Pattern: gs://<bucket>/frames/<videoId>/<filename>
+    const framesIdx = parts.indexOf('frames');
+    if (framesIdx >= 0 && parts.length > framesIdx + 2) {
+      const videoId = parts[framesIdx + 1];
+      const filename = parts.slice(framesIdx + 2).join('/');
+      resolved = `/api/videos/${encodeURIComponent(videoId)}/frames/${encodeURIComponent(filename)}`;
+    }
+  }
+  if (
+    fallbackTime !== undefined &&
+    Number.isFinite(fallbackTime) &&
+    resolved.startsWith('/api/videos/') &&
+    !resolved.includes('?')
+  ) {
+    resolved = `${resolved}?t=${Number(fallbackTime.toFixed(2))}`;
+  }
+  return resolved;
+}
+
 export const VialInspector: React.FC<VialInspectorProps> = ({
   action,
   events = [],
@@ -40,18 +68,73 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
   onResetField,
   readOnly = false,
 }) => {
-  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [selectedImage, setSelectedImage] = useState<{
+    url: string;
+    title: string;
+    subtitle?: string;
+  } | null>(null);
 
-  // Extract best shots from events
-  const bestShots: { url: string; time: number; label: string }[] = [];
-  events.forEach((ev) => {
-    if (ev.bestShotUrls && ev.bestShotUrls.length > 0) {
-      ev.bestShotUrls.forEach((url, idx) => {
-        const time = ev.bestShotTimes?.[idx] || ev.startTime;
+  // Filter events associated with the selected action (many-to-many via actionIds or single actionId)
+  const associatedEvents = action
+    ? events.filter(
+        (ev) =>
+          (Array.isArray(ev.actionIds) && ev.actionIds.includes(action.actionId)) ||
+          ev.actionId === action.actionId ||
+          (Array.isArray(action.eventList) && action.eventList.includes(ev.eventId))
+      )
+    : events;
+
+  const displayEvents = associatedEvents.length > 0 ? associatedEvents : events;
+
+  // Extract best shots from events (preferring Pass 2 bestFrames: HIGHEST_CONTRAST and MINIMAL_BLUR)
+  const bestShots: {
+    url: string;
+    time: number;
+    label: string;
+    eventId: string;
+    frameType?: 'HIGHEST_CONTRAST' | 'MINIMAL_BLUR';
+    contrastScore?: number;
+    blurScore?: number;
+    associatedActionIds: string[];
+    spokenContext?: string;
+  }[] = [];
+
+  displayEvents.forEach((ev) => {
+    const associatedActionIds =
+      Array.isArray(ev.actionIds) && ev.actionIds.length > 0
+        ? ev.actionIds
+        : ev.actionId
+        ? [ev.actionId]
+        : [];
+
+    if (Array.isArray(ev.bestFrames) && ev.bestFrames.length > 0) {
+      ev.bestFrames.forEach((bf) => {
+        const frameTime = bf.timestampSeconds ?? bf.timestamp ?? ev.startTime;
         bestShots.push({
-          url,
+          url: resolveFrameUrl(bf.url || bf.gcsUri, frameTime),
+          time: frameTime,
+          label: ev.eventClass.replace(/_EVENT/g, ''),
+          eventId: ev.eventId,
+          frameType: bf.frameType === 'MINIMAL_BLUR' ? 'MINIMAL_BLUR' : 'HIGHEST_CONTRAST',
+          contrastScore: bf.contrastScore,
+          blurScore: bf.blurScore ?? bf.sharpnessScore,
+          associatedActionIds,
+          spokenContext: ev.spokenContext,
+        });
+      });
+    } else if (ev.bestShotUrls && ev.bestShotUrls.length > 0) {
+      ev.bestShotUrls.forEach((url, idx) => {
+        const time = ev.bestShotTimes?.[idx] ?? ev.startTime;
+        const inferredType: 'HIGHEST_CONTRAST' | 'MINIMAL_BLUR' | undefined =
+          idx === 0 ? 'HIGHEST_CONTRAST' : idx === 1 ? 'MINIMAL_BLUR' : undefined;
+        bestShots.push({
+          url: resolveFrameUrl(url, time),
           time,
           label: ev.eventClass.replace(/_EVENT/g, ''),
+          eventId: ev.eventId,
+          frameType: inferredType,
+          associatedActionIds,
+          spokenContext: ev.spokenContext,
         });
       });
     }
@@ -85,7 +168,7 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
               </span>
             </h3>
             <p className="text-[11px] text-slate-400">
-              Verify multi-frame OCR and spatial coordinates before atomic sign-off
+              Verify Pass 2 label presentations (Highest Contrast & Minimal Blur frames) & 4 FPS refined boundaries
             </p>
           </div>
         </div>
@@ -96,43 +179,210 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
         </div>
       </div>
 
-      {/* Best-Shot Candidate Image Thumbnails */}
+      {/* Selected Action & 4 FPS Refined Interval Summary */}
+      {action &&
+        (() => {
+          const refStart = Number(
+            action.refinedStartTimestampSeconds ??
+              action.startTimestampSeconds ??
+              action.startTime ??
+              0
+          );
+          const refEnd = Number(
+            action.refinedEndTimestampSeconds ??
+              action.endTimestampSeconds ??
+              action.endTime ??
+              refStart
+          );
+
+          return (
+            <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-3 space-y-2.5 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="px-2 py-0.5 rounded bg-cyan-950 border border-cyan-700/60 text-cyan-300 font-mono text-[11px]">
+                    {action.actionId}
+                  </span>
+                  <span className="font-semibold text-slate-200 font-mono">{action.actionClass}</span>
+                </div>
+
+                <div className="flex items-center gap-3 font-mono text-[11px]">
+                  {(typeof action.pass1StartTimestampSeconds === 'number' ||
+                    typeof action.originalStartTime === 'number') && (
+                    <span className="text-slate-500">
+                      Pass 1 (1 FPS): [
+                      {(action.pass1StartTimestampSeconds ?? action.originalStartTime ?? 0).toFixed(2)}s –{' '}
+                      {(action.pass1EndTimestampSeconds ?? action.originalEndTime ?? 0).toFixed(2)}s]
+                    </span>
+                  )}
+                  {(typeof action.refinedStartTimestampSeconds === 'number' ||
+                    typeof action.startTimestampSeconds === 'number' ||
+                    typeof action.startTime === 'number') && (
+                    <span className="flex items-center gap-1 text-emerald-300 bg-emerald-950/60 border border-emerald-800/60 px-2 py-0.5 rounded">
+                      <Clock className="w-3 h-3 text-emerald-400" />
+                      <span>
+                        {action.refinedFps === 4 || typeof action.refinedStartTimestampSeconds === 'number'
+                          ? 'Pass 2 (4 FPS): '
+                          : 'Interval: '}
+                        [{refStart.toFixed(2)}s – {refEnd.toFixed(2)}s]
+                      </span>
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+      {/* Associated Label Presentation Events & Action Links */}
+      {displayEvents.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-[11px] font-semibold text-slate-300 flex items-center justify-between">
+            <span className="flex items-center gap-1.5">
+              <Tag className="w-3.5 h-3.5 text-purple-400" />
+              <span>Associated Label Presentation Events</span>
+            </span>
+            <span className="text-[10px] font-mono text-slate-500">
+              {displayEvents.length} Event{displayEvents.length === 1 ? '' : 's'} Linked
+            </span>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {displayEvents.map((ev) => {
+              const linkedIds =
+                Array.isArray(ev.actionIds) && ev.actionIds.length > 0
+                  ? ev.actionIds
+                  : ev.actionId
+                  ? [ev.actionId]
+                  : [];
+              return (
+                <div
+                  key={ev.eventId}
+                  className="bg-slate-950/80 border border-slate-800/90 rounded-lg px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-[11px]"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="px-1.5 py-0.5 rounded bg-purple-950/80 border border-purple-700/60 text-purple-200 font-mono text-[10px]">
+                      {ev.eventClass.replace(/_EVENT/g, '')}
+                    </span>
+                    <span className="font-mono text-slate-400">
+                      [{ev.startTime.toFixed(2)}s – {ev.endTime.toFixed(2)}s]
+                    </span>
+                    {ev.spokenContext && (
+                      <span className="text-amber-300 font-mono text-[10px] bg-amber-950/50 border border-amber-800/50 px-1.5 py-0.5 rounded">
+                        “{ev.spokenContext}”
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1 flex-wrap">
+                    <Link2 className="w-3 h-3 text-cyan-400 shrink-0" />
+                    {linkedIds.map((id) => (
+                      <span
+                        key={id}
+                        className={`px-1.5 py-0.5 rounded font-mono text-[10px] border ${
+                          action?.actionId === id
+                            ? 'bg-cyan-900/60 border-cyan-500 text-cyan-200'
+                            : 'bg-slate-900 border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        {id}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Best-Shot Candidate Image Thumbnails (2 Best Frames per Event: Highest Contrast & Minimal Blur) */}
       <div>
         <div className="text-xs font-semibold text-slate-300 mb-2 flex items-center justify-between">
           <span className="flex items-center gap-1.5">
             <ImageIcon className="w-3.5 h-3.5 text-cyan-400" />
-            <span>Pass 2 Candidate Best-Shot Frames</span>
+            <span>Pass 2 Best Frames (Highest Contrast & Minimal Blur)</span>
           </span>
           <span className="text-[10px] text-slate-500 font-mono">
-            {bestShots.length} Frames Evaluated
+            {bestShots.length} Frame{bestShots.length === 1 ? '' : 's'} Recorded
           </span>
         </div>
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {bestShots.length > 0 ? (
             bestShots.map((shot, idx) => (
               <div
-                key={idx}
-                onClick={() => setSelectedImage(shot.url)}
-                className="group relative aspect-video bg-black rounded-xl border border-slate-800 hover:border-cyan-500 overflow-hidden cursor-pointer shadow-md transition-all duration-150 hover:scale-[1.02]"
+                key={`${shot.eventId}_${shot.frameType || idx}`}
+                onClick={() =>
+                  setSelectedImage({
+                    url: shot.url,
+                    title: `${shot.label} — ${
+                      shot.frameType === 'HIGHEST_CONTRAST'
+                        ? 'Highest Contrast Frame'
+                        : shot.frameType === 'MINIMAL_BLUR'
+                        ? 'Minimal Blur Frame'
+                        : 'Best Frame'
+                    } @ ${shot.time.toFixed(2)}s`,
+                    subtitle:
+                      shot.associatedActionIds.length > 0
+                        ? `Associated Actions: ${shot.associatedActionIds.join(', ')}`
+                        : undefined,
+                  })
+                }
+                className="group relative w-full bg-slate-950 rounded-xl border border-slate-800 hover:border-cyan-500 overflow-hidden cursor-pointer shadow-md transition-all duration-150 hover:scale-[1.01] flex items-center justify-center"
               >
                 <img
                   src={shot.url}
                   alt={shot.label}
-                  className="w-full h-full object-cover group-hover:brightness-110"
+                  className="w-full h-auto max-h-72 object-contain block group-hover:brightness-110"
                 />
-                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-80" />
-                <div className="absolute bottom-1.5 left-2 right-2 flex items-center justify-between text-[10px] font-mono text-slate-200">
-                  <span className="truncate">{shot.label}</span>
-                  <span className="text-cyan-400 shrink-0">{shot.time.toFixed(1)}s</span>
+                <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/20 to-transparent opacity-90" />
+
+                {/* Top Left Badge: Frame Type */}
+                {shot.frameType && (
+                  <div
+                    className={`absolute top-2 left-2 px-2 py-0.5 rounded-md text-[10px] font-mono font-semibold flex items-center gap-1 border backdrop-blur-sm ${
+                      shot.frameType === 'HIGHEST_CONTRAST'
+                        ? 'bg-amber-950/85 border-amber-500/70 text-amber-200'
+                        : 'bg-cyan-950/85 border-cyan-500/70 text-cyan-200'
+                    }`}
+                  >
+                    {shot.frameType === 'HIGHEST_CONTRAST' ? (
+                      <>
+                        <Contrast className="w-3 h-3 text-amber-400" />
+                        <span>Highest Contrast</span>
+                      </>
+                    ) : (
+                      <>
+                        <Focus className="w-3 h-3 text-cyan-400" />
+                        <span>Minimal Blur</span>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                <div className="absolute bottom-1.5 left-2 right-2 flex flex-col gap-0.5 text-[10px] font-mono text-slate-200">
+                  <div className="flex items-center justify-between">
+                    <span className="truncate font-semibold">{shot.label}</span>
+                    <span className="text-cyan-400 shrink-0">{shot.time.toFixed(2)}s</span>
+                  </div>
+                  {(typeof shot.contrastScore === 'number' ||
+                    typeof shot.blurScore === 'number') && (
+                    <div className="flex items-center justify-between text-[9px] text-slate-400">
+                      {typeof shot.contrastScore === 'number' && (
+                        <span>Contrast: {shot.contrastScore.toFixed(1)}</span>
+                      )}
+                      {typeof shot.blurScore === 'number' && (
+                        <span>Sharpness: {shot.blurScore.toFixed(1)}</span>
+                      )}
+                    </div>
+                  )}
                 </div>
-                <div className="absolute top-1.5 right-1.5 p-1 rounded bg-black/60 text-slate-300 opacity-0 group-hover:opacity-100 transition-opacity">
+
+                <div className="absolute top-2 right-2 p-1 rounded bg-black/60 text-slate-300 opacity-0 group-hover:opacity-100 transition-opacity">
                   <ExternalLink className="w-3 h-3" />
                 </div>
               </div>
             ))
           ) : (
-            <div className="col-span-4 bg-slate-950 p-4 rounded-xl border border-slate-800 text-center text-xs text-slate-500">
+            <div className="col-span-2 bg-slate-950 p-4 rounded-xl border border-slate-800 text-center text-xs text-slate-500">
               No candidate best-shot frames captured for this segment.
             </div>
           )}
@@ -281,9 +531,14 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-2">
-              <span className="text-xs font-mono text-cyan-400">
-                Full Resolution Candidate Frame
-              </span>
+              <div>
+                <div className="text-xs font-mono text-cyan-400">{selectedImage.title}</div>
+                {selectedImage.subtitle && (
+                  <div className="text-[11px] font-mono text-slate-400">
+                    {selectedImage.subtitle}
+                  </div>
+                )}
+              </div>
               <button
                 type="button"
                 onClick={() => setSelectedImage(null)}
@@ -293,8 +548,8 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
               </button>
             </div>
             <img
-              src={selectedImage}
-              alt="Candidate frame full"
+              src={selectedImage.url}
+              alt={selectedImage.title}
               className="w-full max-h-[70vh] object-contain rounded-xl border border-slate-800"
             />
           </div>
@@ -305,4 +560,3 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
 };
 
 export default VialInspector;
-

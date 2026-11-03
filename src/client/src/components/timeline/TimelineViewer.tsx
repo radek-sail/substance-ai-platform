@@ -51,7 +51,9 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
   const playheadPercent = Math.max(0, Math.min(100, (currentTime / (duration || 35)) * 100));
 
   const getEventBadgeColor = (eventClass: string) => {
-    if (eventClass.includes('LABEL')) return 'bg-purple-600/30 border-purple-500 text-purple-200';
+    if (eventClass.includes('BOX_LABEL')) return 'bg-amber-600/30 border-amber-500 text-amber-200';
+    if (eventClass.includes('VIAL_LABEL') || eventClass.includes('LABEL'))
+      return 'bg-purple-600/30 border-purple-500 text-purple-200';
     if (eventClass.includes('PRE_ACTION')) return 'bg-amber-600/30 border-amber-500 text-amber-200';
     if (eventClass.includes('POST_ACTION')) return 'bg-teal-600/30 border-teal-500 text-teal-200';
     if (eventClass.includes('INSERTION')) return 'bg-cyan-600/30 border-cyan-500 text-cyan-200';
@@ -62,8 +64,10 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
   };
 
   const getActionBadgeColor = (actionClass: string) => {
-    if (actionClass.includes('INSERTION')) return 'from-cyan-900/60 to-blue-900/60 border-cyan-500/70 text-cyan-200';
-    if (actionClass.includes('REMOVAL')) return 'from-rose-900/60 to-red-900/60 border-rose-500/70 text-rose-200';
+    if (actionClass.includes('INSERTION'))
+      return 'from-cyan-900/60 to-blue-900/60 border-cyan-500/70 text-cyan-200';
+    if (actionClass.includes('REMOVAL'))
+      return 'from-rose-900/60 to-red-900/60 border-rose-500/70 text-rose-200';
     if (actionClass.includes('SEEDING'))
       return 'from-emerald-900/60 to-teal-900/60 border-emerald-500/70 text-emerald-200';
     return 'from-indigo-900/60 to-violet-900/60 border-indigo-500/70 text-indigo-200';
@@ -84,7 +88,7 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
           <Activity className="w-4 h-4 text-cyan-400" />
           <span>Synchronized Multi-Pass Timeline</span>
           <span className="text-[11px] font-mono text-slate-500">
-            (Pass 1 Actions & Pass 2 Events)
+            (Pass 1 Actions & Pass 2 4-FPS Refined Events)
           </span>
         </div>
         <div className="flex items-center gap-2 font-mono text-[11px] text-cyan-300">
@@ -143,22 +147,52 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
         className="relative bg-slate-950 border border-slate-800 rounded-xl p-2.5 cursor-crosshair group flex flex-col gap-2"
         onClick={handleRulerClick}
       >
-        {/* Track 1: Action Track (Pass 1) */}
+        {/* Track 1: Action Track (Pass 1 / Pass 2 Refined at 4 FPS) */}
         <div>
           <div className="text-[10px] font-mono uppercase text-slate-500 tracking-wider mb-1 flex items-center gap-1">
             <Sparkles className="w-3 h-3 text-cyan-400" />
-            <span>Pass 1: Compound Actions Track</span>
+            <span>Pass 1 / Pass 2 (4 FPS Refined): Inventory Actions Track</span>
           </div>
 
           <div className="relative h-9 bg-slate-900/80 rounded-lg border border-slate-800/80 overflow-hidden">
             {actions.map((act) => {
-              // Action span calculation
-              const actionEvents = events.filter((e) => act.eventList?.includes(e.eventId));
-              const start = actionEvents.length > 0 ? Math.min(...actionEvents.map((e) => e.startTime)) : 0;
-              const end = actionEvents.length > 0 ? Math.max(...actionEvents.map((e) => e.endTime)) : duration;
+              // Prefer explicit action startTime/endTime (refined in Pass 2 at 4 FPS), else derive from associated events
+              const actionEvents = events.filter(
+                (e) =>
+                  act.eventList?.includes(e.eventId) ||
+                  e.actionId === act.actionId ||
+                  (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId))
+              );
+              const start =
+                typeof act.refinedStartTimestampSeconds === 'number'
+                  ? act.refinedStartTimestampSeconds
+                  : typeof act.startTimestampSeconds === 'number'
+                  ? act.startTimestampSeconds
+                  : typeof act.startTime === 'number'
+                  ? act.startTime
+                  : actionEvents.length > 0
+                  ? Math.min(...actionEvents.map((e) => e.startTime))
+                  : 0;
+              const end =
+                typeof act.refinedEndTimestampSeconds === 'number'
+                  ? act.refinedEndTimestampSeconds
+                  : typeof act.endTimestampSeconds === 'number'
+                  ? act.endTimestampSeconds
+                  : typeof act.endTime === 'number'
+                  ? act.endTime
+                  : actionEvents.length > 0
+                  ? Math.max(...actionEvents.map((e) => e.endTime))
+                  : duration;
               const leftPercent = Math.max(0, Math.min(100, (start / duration) * 100));
-              const widthPercent = Math.max(8, Math.min(100 - leftPercent, ((end - start) / duration) * 100));
+              const widthPercent = Math.max(
+                6,
+                Math.min(100 - leftPercent, ((end - start) / duration) * 100)
+              );
               const isSelected = selectedActionId === act.actionId;
+              const isRefined4Fps =
+                act.refinedFps === 4 ||
+                typeof act.refinedStartTimestampSeconds === 'number' ||
+                typeof act.originalStartTime === 'number';
 
               return (
                 <div
@@ -171,14 +205,18 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
                   className={`absolute top-1 bottom-1 rounded-md px-2 flex items-center justify-between text-[11px] font-medium border bg-gradient-to-r cursor-pointer transition-all duration-150 hover:brightness-125 ${getActionBadgeColor(
                     act.actionClass
                   )} ${
-                    isSelected ? 'ring-2 ring-cyan-400 shadow-lg shadow-cyan-500/30 brightness-110' : ''
+                    isSelected
+                      ? 'ring-2 ring-cyan-400 shadow-lg shadow-cyan-500/30 brightness-110 z-10'
+                      : ''
                   }`}
                   style={{ left: `${leftPercent}%`, width: `${widthPercent}%` }}
-                  title={`${act.actionClass} (${start.toFixed(1)}s - ${end.toFixed(1)}s)`}
+                  title={`${act.actionClass} (${start.toFixed(2)}s - ${end.toFixed(2)}s)${
+                    isRefined4Fps ? ' [Refined @ 4 FPS]' : ''
+                  }`}
                 >
                   <span className="truncate font-mono">{act.actionClass}</span>
-                  <span className="text-[10px] opacity-75 font-mono ml-1 hidden sm:inline">
-                    {start.toFixed(0)}s–{end.toFixed(0)}s
+                  <span className="text-[10px] opacity-80 font-mono ml-1 hidden sm:inline">
+                    {start.toFixed(1)}s–{end.toFixed(1)}s{isRefined4Fps ? ' (4fps)' : ''}
                   </span>
                 </div>
               );
@@ -186,11 +224,11 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
           </div>
         </div>
 
-        {/* Track 2: Event Track (Pass 2) */}
+        {/* Track 2: Event Track (Pass 2 Label Presentations & Best Frames) */}
         <div>
           <div className="text-[10px] font-mono uppercase text-slate-500 tracking-wider mb-1 flex items-center gap-1">
             <Tag className="w-3 h-3 text-purple-400" />
-            <span>Pass 2: Temporal Sub-Events & Best-Shots</span>
+            <span>Pass 2: Label Presentations & Best Frames (Highest Contrast + Minimal Blur)</span>
           </div>
 
           <div className="relative h-10 bg-slate-900/80 rounded-lg border border-slate-800/80 overflow-hidden">
@@ -201,6 +239,17 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
                 Math.min(100 - leftPercent, ((ev.endTime - ev.startTime) / duration) * 100)
               );
               const isSelected = selectedEventId === ev.eventId;
+              const isLinkedToSelectedAction =
+                Boolean(selectedActionId) &&
+                ((Array.isArray(ev.actionIds) && ev.actionIds.includes(selectedActionId!)) ||
+                  ev.actionId === selectedActionId);
+
+              const linkedCount =
+                Array.isArray(ev.actionIds) && ev.actionIds.length > 0
+                  ? ev.actionIds.length
+                  : ev.actionId
+                  ? 1
+                  : 0;
 
               return (
                 <div
@@ -213,15 +262,31 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
                   className={`absolute top-1 bottom-1 rounded-md px-1.5 flex items-center gap-1 text-[10px] font-mono border cursor-pointer transition-all duration-150 hover:scale-[1.02] hover:z-20 ${getEventBadgeColor(
                     ev.eventClass
                   )} ${
-                    isSelected ? 'ring-2 ring-purple-400 shadow-md shadow-purple-500/40 z-10' : ''
+                    isSelected
+                      ? 'ring-2 ring-purple-400 shadow-md shadow-purple-500/40 z-10'
+                      : isLinkedToSelectedAction
+                      ? 'ring-1 ring-cyan-400/80'
+                      : ''
                   }`}
                   style={{ left: `${leftPercent}%`, width: `${widthPercent}%` }}
-                  title={`${ev.eventClass} [${ev.startTime.toFixed(1)}s - ${ev.endTime.toFixed(1)}s]`}
+                  title={`${ev.eventClass} [${ev.startTime.toFixed(2)}s - ${ev.endTime.toFixed(
+                    2
+                  )}s] • Linked Actions: ${
+                    Array.isArray(ev.actionIds) && ev.actionIds.length > 0
+                      ? ev.actionIds.join(', ')
+                      : ev.actionId
+                  }`}
                 >
-                  {ev.bestShotUrls && ev.bestShotUrls.length > 0 && (
+                  {((ev.bestFrames && ev.bestFrames.length > 0) ||
+                    (ev.bestShotUrls && ev.bestShotUrls.length > 0)) && (
                     <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0 shadow-sm shadow-cyan-400" />
                   )}
                   <span className="truncate">{ev.eventClass.replace(/_EVENT|_SPAN/g, '')}</span>
+                  {linkedCount > 1 && (
+                    <span className="text-[9px] px-1 rounded bg-black/40 text-cyan-300 shrink-0">
+                      ×{linkedCount}
+                    </span>
+                  )}
                 </div>
               );
             })}
@@ -257,4 +322,3 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
 };
 
 export default TimelineViewer;
-
