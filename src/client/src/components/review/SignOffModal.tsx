@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   FileCheck2,
   AlertCircle,
@@ -9,11 +9,10 @@ import {
   User,
   ShieldCheck,
   Lock,
-  ArrowRight,
 } from 'lucide-react';
 import { TenantConfig, DEFAULT_GCS_BUCKET, apiService, SignOffResponse } from '../../services/api.service';
 import { HumanEditedVialData } from '../inventory/VialInspector';
-import type { BoxUpdate } from '@sail/shared';
+import type { Action, BoxUpdate } from '@sail/shared';
 
 interface SignOffModalProps {
   isOpen: boolean;
@@ -25,6 +24,9 @@ interface SignOffModalProps {
   archiveId?: string;
   rawAiInventoryData?: HumanEditedVialData;
   editedInventoryData?: HumanEditedVialData;
+  onChangeInventoryField?: (field: keyof HumanEditedVialData, value: any) => void;
+  inventoryActions?: Action[];
+  editedActionsMap?: Record<string, HumanEditedVialData>;
   markdownDoc?: string;
   onCommitSuccess: (res: SignOffResponse) => void;
 }
@@ -39,32 +41,113 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
   archiveId = 'archive_exp_402',
   rawAiInventoryData,
   editedInventoryData,
+  onChangeInventoryField,
+  inventoryActions = [],
+  editedActionsMap = {},
   markdownDoc = '',
   onCommitSuccess,
 }) => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [confirmedCheck, setConfirmedCheck] = useState(false);
-  const [operatorInitials, setOperatorInitials] = useState(tenant.operatorInitials || 'RS');
+  const [operatorInitials, setOperatorInitials] = useState(
+    editedInventoryData?.userInitials ||
+      editedInventoryData?.operatorInitials ||
+      tenant.operatorInitials ||
+      'RS'
+  );
+
+  // Local editable fallback state when parent does not provide onChangeInventoryField
+  const [localEdited, setLocalEdited] = useState<HumanEditedVialData>({
+    cellLineName: editedInventoryData?.cellLineName || 'HEK293T',
+    lotNumber: editedInventoryData?.lotNumber || 'LOT-8841',
+    passage: editedInventoryData?.passage ?? 5,
+    operatorInitials: editedInventoryData?.operatorInitials || tenant.operatorInitials || 'JS',
+    userInitials:
+      editedInventoryData?.userInitials ||
+      editedInventoryData?.operatorInitials ||
+      tenant.operatorInitials ||
+      'JS',
+    dateFrozen: editedInventoryData?.dateFrozen || '2026-03-15',
+    fullText:
+      editedInventoryData?.fullText ||
+      `${editedInventoryData?.cellLineName || 'HEK293T'} | P${editedInventoryData?.passage ?? 5} | ${
+        editedInventoryData?.lotNumber || 'LOT-8841'
+      }`,
+    targetCoordinate: editedInventoryData?.targetCoordinate || 'C4',
+    boxId: editedInventoryData?.boxId || 'box_01',
+    actionId: editedInventoryData?.actionId,
+    actionType: editedInventoryData?.actionType || 'VIAL_INSERTION',
+  });
+
+  useEffect(() => {
+    if (editedInventoryData) {
+      setLocalEdited((prev) => ({
+        ...prev,
+        ...editedInventoryData,
+        userInitials:
+          editedInventoryData.userInitials ??
+          editedInventoryData.operatorInitials ??
+          prev.userInitials,
+        fullText:
+          editedInventoryData.fullText ??
+          `${editedInventoryData.cellLineName || 'HEK293T'} | P${editedInventoryData.passage ?? 5} | ${
+            editedInventoryData.lotNumber || 'LOT-8841'
+          }`,
+      }));
+    }
+  }, [editedInventoryData]);
 
   if (!isOpen) return null;
 
   const isInventory = workflowType === 'INVENTORY_UPDATE_WORKFLOW';
+  const activeEdited = editedInventoryData
+    ? {
+        ...localEdited,
+        ...editedInventoryData,
+        userInitials:
+          editedInventoryData.userInitials ??
+          editedInventoryData.operatorInitials ??
+          localEdited.userInitials,
+        dateFrozen: editedInventoryData.dateFrozen ?? localEdited.dateFrozen,
+        fullText: editedInventoryData.fullText ?? localEdited.fullText,
+      }
+    : localEdited;
+
+  const handleFieldEdit = (field: keyof HumanEditedVialData, value: any) => {
+    setLocalEdited((prev) => ({ ...prev, [field]: value }));
+    onChangeInventoryField?.(field, value);
+  };
 
   // Compare diffs for inventory
-  const diffs: { field: string; raw: string; edited: string; isModified: boolean }[] = [];
-  if (isInventory && rawAiInventoryData && editedInventoryData) {
-    const fields: (keyof HumanEditedVialData)[] = [
-      'cellLineName',
-      'lotNumber',
-      'passage',
-      'targetCoordinate',
+  const diffs: {
+    field: keyof HumanEditedVialData;
+    label: string;
+    raw: string;
+    edited: string;
+    isModified: boolean;
+  }[] = [];
+
+  if (isInventory && rawAiInventoryData) {
+    const fieldDefs: { field: keyof HumanEditedVialData; label: string }[] = [
+      { field: 'cellLineName', label: 'Cell Line Name' },
+      { field: 'userInitials', label: "User's Initials" },
+      { field: 'dateFrozen', label: 'Date Frozen' },
+      { field: 'fullText', label: 'Full Label Text' },
+      { field: 'targetCoordinate', label: 'Box Well Location' },
+      { field: 'lotNumber', label: 'Lot Number' },
+      { field: 'passage', label: 'Passage' },
     ];
-    fields.forEach((f) => {
-      const rawVal = String(rawAiInventoryData[f]);
-      const editedVal = String(editedInventoryData[f]);
+    fieldDefs.forEach(({ field, label }) => {
+      const rawVal = String(
+        rawAiInventoryData[field] ??
+          (field === 'userInitials' ? rawAiInventoryData.operatorInitials : '') ??
+          ''
+      );
+      const editedVal = String(activeEdited[field] ?? '');
       diffs.push({
-        field: f,
+        field,
+        label,
         raw: rawVal,
         edited: editedVal,
         isModified: rawVal !== editedVal,
@@ -80,26 +163,109 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
     try {
       let result: SignOffResponse;
       if (isInventory) {
-        const boxId = 'box_01';
-        // Parse row and col from targetCoordinate (e.g. "C4")
-        const targetCoord = editedInventoryData?.targetCoordinate || 'C4';
-        const match = targetCoord.match(/^([A-Z])(\d+)$/);
-        const row = match ? match[1] : 'C';
-        const col = match ? parseInt(match[2], 10) : 4;
+        const boxUpdates: BoxUpdate[] = [];
 
-        const boxUpdates: BoxUpdate[] = [
-          {
+        // If multiple inventory update actions exist, build a BoxUpdate for each
+        const relevantActions = inventoryActions.filter((a) => {
+          const cls = String(a.actionClass || '');
+          return cls.includes('INSERTION') || cls.includes('REMOVAL') || cls.includes('HANDLING');
+        });
+
+        if (relevantActions.length > 0) {
+          relevantActions.forEach((act, idx) => {
+            const actEdit =
+              editedActionsMap[act.actionId] ||
+              (act.actionId === activeEdited.actionId || idx === 0 ? activeEdited : undefined);
+            const targetCoord =
+              actEdit?.targetCoordinate ||
+              act.boxWellLocation?.coordinate ||
+              (act.boxRowId && act.boxColId ? `${act.boxRowId}${act.boxColId}` : undefined) ||
+              (act.targetRow && act.targetCol ? `${act.targetRow}${act.targetCol}` : 'C4');
+            const match = targetCoord.trim().toUpperCase().match(/^([A-Z])(\d+)$/);
+            const row = match
+              ? match[1]
+              : act.boxWellLocation?.row || act.boxRowId || act.targetRow || 'C';
+            const col = match
+              ? parseInt(match[2], 10)
+              : act.boxWellLocation?.col || act.boxColId || act.targetCol || 4;
+            const rawActType =
+              actEdit?.actionType ||
+              act.boxWellLocation?.actionType ||
+              (String(act.actionClass || '').includes('REMOVAL')
+                ? 'VIAL_REMOVAL'
+                : 'VIAL_INSERTION');
+            const actionType: 'VIAL_INSERTION' | 'VIAL_REMOVAL' =
+              rawActType === 'VIAL_REMOVAL' ? 'VIAL_REMOVAL' : 'VIAL_INSERTION';
+            const cellLineName =
+              actEdit?.cellLineName ||
+              act.vialLabelData?.cellLineName ||
+              act.cellLineInfo?.name ||
+              activeEdited.cellLineName ||
+              'HEK293T';
+            const userInitials =
+              actEdit?.userInitials ||
+              act.vialLabelData?.userInitials ||
+              activeEdited.userInitials ||
+              operatorInitials;
+            const dateFrozen =
+              actEdit?.dateFrozen ||
+              act.vialLabelData?.dateFrozen ||
+              activeEdited.dateFrozen;
+            const fullText =
+              actEdit?.fullText ||
+              act.vialLabelData?.fullText ||
+              act.conflatedLabelText ||
+              activeEdited.fullText ||
+              `${cellLineName} | ${userInitials}${dateFrozen ? ` | ${dateFrozen}` : ''}`;
+
+            boxUpdates.push({
+              boxId: actEdit?.boxId || activeEdited.boxId || 'box_01',
+              row,
+              col,
+              cellLineName,
+              userInitials,
+              operatorInitials: userInitials || operatorInitials,
+              dateFrozen,
+              fullText,
+              lotNumber: actEdit?.lotNumber || act.cellLineInfo?.lotNumber || activeEdited.lotNumber,
+              passage: actEdit?.passage ?? act.cellLineInfo?.passage ?? activeEdited.passage,
+              actionId: act.actionId,
+              actionType,
+              highlighted: actionType !== 'VIAL_REMOVAL',
+              status: actionType === 'VIAL_REMOVAL' ? 'EMPTY' : 'OCCUPIED',
+              updatedAt: new Date().toISOString(),
+            });
+          });
+        } else {
+          const boxId = activeEdited.boxId || 'box_01';
+          const targetCoord = activeEdited.targetCoordinate || 'C4';
+          const match = targetCoord.trim().toUpperCase().match(/^([A-Z])(\d+)$/);
+          const row = match ? match[1] : 'C';
+          const col = match ? parseInt(match[2], 10) : 4;
+          const actionType = activeEdited.actionType || 'VIAL_INSERTION';
+
+          boxUpdates.push({
             boxId,
             row,
             col,
-            cellLineName: editedInventoryData?.cellLineName || 'HEK293T',
-            lotNumber: editedInventoryData?.lotNumber,
-            passage: editedInventoryData?.passage,
-            operatorInitials,
-            status: 'OCCUPIED',
+            cellLineName: activeEdited.cellLineName || 'HEK293T',
+            userInitials: activeEdited.userInitials || operatorInitials,
+            operatorInitials: activeEdited.userInitials || operatorInitials,
+            dateFrozen: activeEdited.dateFrozen,
+            fullText:
+              activeEdited.fullText ||
+              `${activeEdited.cellLineName || 'HEK293T'} | P${activeEdited.passage ?? 5} | ${
+                activeEdited.lotNumber || 'LOT-8841'
+              }`,
+            lotNumber: activeEdited.lotNumber,
+            passage: activeEdited.passage,
+            actionId: activeEdited.actionId,
+            actionType,
+            highlighted: actionType !== 'VIAL_REMOVAL',
+            status: actionType === 'VIAL_REMOVAL' ? 'EMPTY' : 'OCCUPIED',
             updatedAt: new Date().toISOString(),
-          },
-        ];
+          });
+        }
 
         result = await apiService.commitInventorySignOff(
           tenant.databaseId,
@@ -187,12 +353,17 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
           </div>
         </div>
 
-        {/* Diff Review Table */}
+        {/* Diff Review & Inline Edit Table */}
         {isInventory ? (
           <div>
-            <h3 className="text-xs font-semibold text-slate-300 mb-2 flex items-center gap-1.5">
-              <FileCheck2 className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Audit Summary: Human Modifications vs Raw AI Extractions</span>
+            <h3 className="text-xs font-semibold text-slate-300 mb-2 flex items-center justify-between">
+              <span className="flex items-center gap-1.5">
+                <FileCheck2 className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Audit Summary: Human Modifications vs Raw AI Extractions</span>
+              </span>
+              <span className="text-[10px] font-mono text-slate-400">
+                Origin A1: Top-Left Black Corner
+              </span>
             </h3>
 
             <div className="border border-slate-800 rounded-xl overflow-hidden text-xs">
@@ -201,23 +372,39 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
                   <tr>
                     <th className="py-2 px-3">Field</th>
                     <th className="py-2 px-3">Raw AI (Pass 1–3)</th>
-                    <th className="py-2 px-3">Operator Verified</th>
+                    <th className="py-2 px-3">Operator Verified (Editable)</th>
                     <th className="py-2 px-3 text-right">Audit Status</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/80 bg-slate-900/50">
                   {diffs.map((d) => (
                     <tr key={d.field} className="hover:bg-slate-800/40">
-                      <td className="py-2 px-3 text-slate-300 font-sans font-medium capitalize">
-                        {d.field.replace(/([A-Z])/g, ' $1')}
+                      <td className="py-2 px-3 text-slate-300 font-sans font-medium">
+                        {d.label}
                       </td>
-                      <td className="py-2 px-3 text-slate-400">{d.raw}</td>
-                      <td
-                        className={`py-2 px-3 font-bold ${
-                          d.isModified ? 'text-amber-300' : 'text-slate-200'
-                        }`}
-                      >
-                        {d.edited}
+                      <td className="py-2 px-3 text-slate-400 max-w-[160px] truncate" title={d.raw}>
+                        {d.raw || '—'}
+                      </td>
+                      <td className="py-1.5 px-3">
+                        <input
+                          type={d.field === 'passage' ? 'number' : 'text'}
+                          value={d.edited}
+                          onChange={(e) =>
+                            handleFieldEdit(
+                              d.field,
+                              d.field === 'passage'
+                                ? parseInt(e.target.value, 10) || 1
+                                : d.field === 'targetCoordinate'
+                                ? e.target.value.toUpperCase()
+                                : e.target.value
+                            )
+                          }
+                          className={`w-full bg-slate-950 border rounded px-2 py-1 text-xs font-mono focus:outline-none ${
+                            d.isModified
+                              ? 'border-amber-500/70 text-amber-300 font-bold'
+                              : 'border-slate-700 text-slate-200 focus:border-cyan-500'
+                          }`}
+                        />
                       </td>
                       <td className="py-2 px-3 text-right">
                         {d.isModified ? (
@@ -328,4 +515,3 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
 };
 
 export default SignOffModal;
-

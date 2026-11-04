@@ -235,6 +235,12 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
     });
 
     const nowIso = new Date().toISOString();
+    const labelTranscriptions = Array.isArray((refinements as any)?.labelTranscriptions)
+      ? (refinements as any).labelTranscriptions
+      : [];
+    const actionWellLocations = Array.isArray((refinements as any)?.actionWellLocations)
+      ? (refinements as any).actionWellLocations
+      : [];
     const analysisPayload = {
       videoId,
       workloadClassification,
@@ -242,6 +248,8 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
       actions,
       events,
       refinements,
+      labelTranscriptions,
+      actionWellLocations,
       isSignedOff: false,
       updatedAt: nowIso,
     };
@@ -253,6 +261,7 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
     const eventsPayload = (events as any).toJSON ? (events as any).toJSON() : events;
     await writePassArtifactJson(videoId, 'action_detection_pass.json', actionsPayload);
     await writePassArtifactJson(videoId, 'event_detection_pass.json', eventsPayload);
+    await writePassArtifactJson(videoId, 'label_transcriptions.json', labelTranscriptions);
 
     const completedPasses: VideoPasses = {
       pass0: {
@@ -280,6 +289,8 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
       pass3: {
         status: 'COMPLETED',
         data: refinements,
+        labelTranscriptions,
+        actionWellLocations,
         executionAudit: (refinements as any)?.executionAudit,
         thinkingLevel: (refinements as any)?.thinkingLevel,
         error: null,
@@ -760,25 +771,57 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         refinementList: eventToRefinements.get(evt.eventId) || evt.refinementList || [],
       }));
 
-      // Link eventIds back onto corresponding parent actions
+      // Link eventIds back onto corresponding parent actions (supporting multi-action evt.actionIds)
       const actionToEvents = new Map<string, string[]>();
       for (const evt of enrichedEvents) {
-        const list = actionToEvents.get(evt.actionId) || [];
-        list.push(evt.eventId);
-        actionToEvents.set(evt.actionId, list);
+        const linkedActionIds =
+          Array.isArray(evt.actionIds) && evt.actionIds.length > 0
+            ? evt.actionIds
+            : evt.actionId
+            ? [evt.actionId]
+            : [];
+        for (const aId of linkedActionIds) {
+          const list = actionToEvents.get(aId) || [];
+          if (!list.includes(evt.eventId)) {
+            list.push(evt.eventId);
+          }
+          actionToEvents.set(aId, list);
+        }
       }
       const enrichedActions = actions.map((act) => ({
         ...act,
-        eventList: actionToEvents.get(act.actionId) || act.eventList || [],
+        eventList: Array.from(
+          new Set([...(act.eventList || []), ...(actionToEvents.get(act.actionId) || [])])
+        ),
       }));
 
-      await writePassArtifactJson(videoId, 'analysis_refinement_pass.json', refinements);
+      const labelTranscriptions = Array.isArray((refinements as any)?.labelTranscriptions)
+        ? (refinements as any).labelTranscriptions
+        : [];
+      const actionWellLocations = Array.isArray((refinements as any)?.actionWellLocations)
+        ? (refinements as any).actionWellLocations
+        : [];
+
+      const updatedPass1Data =
+        rawActionsData && !Array.isArray(rawActionsData) && Array.isArray((rawActionsData as any).actions)
+          ? { ...(rawActionsData as any), actions: enrichedActions }
+          : enrichedActions;
+
+      const pass3Payload = (refinements as any)?.toJSON ? (refinements as any).toJSON() : refinements;
+      await writePassArtifactJson(videoId, 'analysis_refinement_pass.json', pass3Payload);
+      await writePassArtifactJson(videoId, 'label_transcriptions.json', labelTranscriptions);
+      await writePassArtifactJson(videoId, 'action_detection_pass.json', updatedPass1Data);
+      for (const act of enrichedActions) {
+        if (act.actionId) {
+          await writePassArtifactJson(videoId, `action_${act.actionId}.json`, act);
+        }
+      }
       const completedAt = new Date().toISOString();
 
       // Update pass1 & pass2 enriched links in currentPasses
       currentPasses.pass1 = {
         ...currentPasses.pass1,
-        data: enrichedActions,
+        data: updatedPass1Data,
         error: null,
       };
       const updatedPass2Data =
@@ -800,6 +843,8 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         actions: enrichedActions,
         events: enrichedEvents,
         refinements,
+        labelTranscriptions,
+        actionWellLocations,
         isSignedOff: false,
         updatedAt: completedAt,
       };
@@ -814,7 +859,9 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         'pass3',
         {
           status: 'COMPLETED',
-          data: refinements,
+          data: pass3Payload,
+          labelTranscriptions,
+          actionWellLocations,
           ...(pass3Audit ? { executionAudit: pass3Audit } : {}),
           ...(resolvedPass3Thinking ? { thinkingLevel: resolvedPass3Thinking } : {}),
           error: null,
@@ -827,6 +874,24 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
           updatedAt: completedAt,
         }
       );
+
+      // Persist enriched pass1 and pass2 data onto the video document as well
+      try {
+        await db.collection('videos').doc(videoId).update({
+          'passes.pass1.data': updatedPass1Data,
+          'passes.pass2.data': updatedPass2Data,
+          updatedAt: completedAt,
+        });
+        if (databaseId !== '(default)') {
+          await getTenantFirestore(databaseId).collection('videos').doc(videoId).update({
+            'passes.pass1.data': updatedPass1Data,
+            'passes.pass2.data': updatedPass2Data,
+            updatedAt: completedAt,
+          });
+        }
+      } catch {
+        // Ignore direct update error on mock stores
+      }
 
       return {
         classification,

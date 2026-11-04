@@ -211,7 +211,18 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
       console.log(`[Upload] Verified file exists in GCS: gs://${bucketName}/${destinationPath}`);
     }
 
-    // Cache a local copy of the normalized video in sail_normalized_cache for fast multi-pass execution
+    // Cache a local copy of the raw (full-resolution) and normalized video for fast multi-pass execution
+    if (inputLocalPath && fs.existsSync(inputLocalPath)) {
+      try {
+        const rawCacheDir = path.join(scratchDir, 'sail_raw_cache');
+        if (!fs.existsSync(rawCacheDir)) {
+          fs.mkdirSync(rawCacheDir, { recursive: true });
+        }
+        await fs.promises.copyFile(inputLocalPath, path.join(rawCacheDir, `raw_${videoId}.mp4`));
+      } catch (rawCacheErr) {
+        console.warn(`[VideoIngestion] Failed to cache raw file locally:`, rawCacheErr);
+      }
+    }
     if (fs.existsSync(normalizedLocalPath)) {
       try {
         const cacheDir = path.join(scratchDir, 'sail_normalized_cache');
@@ -619,6 +630,19 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
       }
       console.log(`[Transcode] Found ${chunkFiles.length} chunk(s) generated for ${videoId}`);
 
+      // Cache the raw (full-resolution) video locally before chunking/cleanup so Pass 2/3 frame extraction uses native full frame resolution
+      if (fs.existsSync(rawFilePath)) {
+        try {
+          const rawCacheDir = path.join(scratchDir, 'sail_raw_cache');
+          if (!fs.existsSync(rawCacheDir)) {
+            fs.mkdirSync(rawCacheDir, { recursive: true });
+          }
+          await fs.promises.copyFile(rawFilePath, path.join(rawCacheDir, `raw_${videoId}.mp4`));
+        } catch (rawCacheErr) {
+          console.warn(`[Transcode] Failed to cache raw video locally:`, rawCacheErr);
+        }
+      }
+
       // Upload chunks to GCS
       console.log(`[Transcode] Uploading chunks to GCS...`);
       for (let i = 0; i < chunkFiles.length; i++) {
@@ -884,6 +908,13 @@ export const getVideoFrameHandler = async (req: Request, res: Response): Promise
 
     if (timestampSec !== undefined) {
       try {
+        // Prioritize full-resolution raw video cache before normalized (downsampled) video cache
+        const rawCacheDirs = Array.from(
+          new Set([
+            path.join(scratchDir, 'sail_raw_cache'),
+            path.join(os.tmpdir(), 'sail_raw_cache'),
+          ])
+        );
         const videoCacheDirs = Array.from(
           new Set([
             path.join(scratchDir, 'sail_normalized_cache'),
@@ -891,34 +922,47 @@ export const getVideoFrameHandler = async (req: Request, res: Response): Promise
           ])
         );
         let localVideoPath: string | undefined;
-        for (const vDir of videoCacheDirs) {
-          const candidateVideo = path.join(vDir, `norm_${videoId}.mp4`);
-          if (fs.existsSync(candidateVideo)) {
-            const st = fs.statSync(candidateVideo);
+        for (const rDir of rawCacheDirs) {
+          const candidateRaw = path.join(rDir, `raw_${videoId}.mp4`);
+          if (fs.existsSync(candidateRaw)) {
+            const st = fs.statSync(candidateRaw);
             if (st.size > 1000) {
-              localVideoPath = candidateVideo;
+              localVideoPath = candidateRaw;
               break;
             }
           }
         }
-
-        // Download normalized video from GCS if not cached locally
         if (!localVideoPath) {
-          const targetVideoDir = videoCacheDirs[0];
-          if (!fs.existsSync(targetVideoDir)) {
-            fs.mkdirSync(targetVideoDir, { recursive: true });
+          for (const vDir of videoCacheDirs) {
+            const candidateVideo = path.join(vDir, `norm_${videoId}.mp4`);
+            if (fs.existsSync(candidateVideo)) {
+              const st = fs.statSync(candidateVideo);
+              if (st.size > 1000) {
+                localVideoPath = candidateVideo;
+                break;
+              }
+            }
           }
-          const downloadDest = path.join(targetVideoDir, `norm_${videoId}.mp4`);
+        }
+
+        // Download raw (full-resolution) or normalized video from GCS if not cached locally
+        if (!localVideoPath) {
+          const targetRawDir = rawCacheDirs[0];
+          if (!fs.existsSync(targetRawDir)) {
+            fs.mkdirSync(targetRawDir, { recursive: true });
+          }
+          const downloadDest = path.join(targetRawDir, `raw_${videoId}.mp4`);
 
           const gcsCandidates: { bucket: string; objectPath: string }[] = [
+            { bucket: bucketName, objectPath: `uploads/${videoId}.mp4` },
             { bucket: bucketName, objectPath: `normalized/${videoId}/chunk_000.mp4` },
             { bucket: bucketName, objectPath: `normalized/norm_${videoId}.mp4` },
-            { bucket: bucketName, objectPath: `uploads/${videoId}.mp4` },
           ];
 
           try {
             const videoDoc =
               (await firestoreService.getVideoMetadata('(default)', videoId)) || null;
+            // Prioritize rawGcsUri first for full-resolution frame extraction!
             for (const uri of [videoDoc?.normalizedGcsUri, videoDoc?.rawGcsUri]) {
               if (uri && typeof uri === 'string' && uri.startsWith('gs://')) {
                 const withoutScheme = uri.slice('gs://'.length);

@@ -5,12 +5,21 @@ export const InventoryCellSchema = z.object({
   col: z.number(), // e.g., 1, 2, 3...
   cellCoordinate: z.string(), // e.g., 'A1', 'C4'
   occupied: z.boolean(),
+  highlighted: z.boolean().optional(),
+  lastActionType: z.string().optional(),
   vial: z
     .object({
       cellLineIdentifier: z.string().optional(),
+      cellLineName: z.string().optional(),
+      userInitials: z.string().optional(),
+      operatorInitials: z.string().optional(),
+      dateFrozen: z.string().optional(),
+      fullText: z.string().optional(),
       lotNumber: z.string().optional(),
       passageNumber: z.union([z.number(), z.string()]).optional(),
       targetCoordinate: z.string().optional(),
+      videoId: z.string().optional(),
+      actionId: z.string().optional(),
       notes: z.string().optional(),
       updatedAt: z.string().optional(),
     })

@@ -139,6 +139,26 @@ export const SAMPLE_INVENTORY_ANALYSIS: VideoAnalysisDoc = {
         lot: 'LOT-8841',
         passage: 5,
         operator: 'RS',
+        userInitials: 'RS',
+        dateFrozen: '2026-03-15',
+        fullText: 'HEK293T P5 Lot#8841 RS 2026-03-15',
+        targetCoordinate: 'C4',
+        originCorner: 'TOP_RIGHT_BLACK',
+      },
+      vialLabelData: {
+        cellLineName: 'HEK293T',
+        userInitials: 'RS',
+        dateFrozen: '2026-03-15',
+        fullText: 'HEK293T P5 Lot#8841 RS 2026-03-15',
+      },
+      boxWellLocation: {
+        actionId: 'act_cryo_001',
+        actionType: 'VIAL_INSERTION',
+        row: 'C',
+        col: 4,
+        coordinate: 'C4',
+        originCorner: 'TOP_RIGHT_BLACK',
+        confidence: 0.99,
       },
       towerId: 'tower_02',
       boxRowId: 'C',
@@ -150,6 +170,7 @@ export const SAMPLE_INVENTORY_ANALYSIS: VideoAnalysisDoc = {
     {
       eventId: 'evt_001',
       actionId: 'act_cryo_001',
+      actionIds: ['act_cryo_001'],
       eventClass: 'VIAL_LABEL_PRESENTATION_EVENT',
       eventTrack: 'video',
       startTime: 3.5,
@@ -159,6 +180,12 @@ export const SAMPLE_INVENTORY_ANALYSIS: VideoAnalysisDoc = {
       ],
       bestShotTimes: [6.2],
       refinementList: ['ref_001'],
+      vialLabelData: {
+        cellLineName: 'HEK293T',
+        userInitials: 'RS',
+        dateFrozen: '2026-03-15',
+        fullText: 'HEK293T P5 Lot#8841 RS 2026-03-15',
+      },
     },
     {
       eventId: 'evt_002',
@@ -204,15 +231,32 @@ export const SAMPLE_INVENTORY_ANALYSIS: VideoAnalysisDoc = {
     {
       refinementId: 'ref_001',
       eventId: 'evt_001',
+      actionId: 'act_cryo_001',
+      actionIds: ['act_cryo_001'],
       refinementClass: 'OCR_CONFLATION',
-      transcriptionText: 'HEK293T P5 Lot#8841 RS',
+      transcriptionText: 'HEK293T P5 Lot#8841 RS 2026-03-15',
+      vialLabelData: {
+        cellLineName: 'HEK293T',
+        userInitials: 'RS',
+        dateFrozen: '2026-03-15',
+        fullText: 'HEK293T P5 Lot#8841 RS 2026-03-15',
+      },
+      boxWellLocation: {
+        actionId: 'act_cryo_001',
+        actionType: 'VIAL_INSERTION',
+        row: 'C',
+        col: 4,
+        coordinate: 'C4',
+        originCorner: 'TOP_RIGHT_BLACK',
+        confidence: 0.99,
+      },
       spatialResult: {
         row: 'C',
         col: 4,
       },
       conflationMetadata: {
         confidence: 0.985,
-        framesEvaluated: 6,
+        framesEvaluated: 2,
         ocrEngine: 'Gemini-Pro-OCR',
       },
     },
@@ -245,6 +289,40 @@ export const SAMPLE_INVENTORY_ANALYSIS: VideoAnalysisDoc = {
         framesEvaluated: 5,
         ocrEngine: 'SpatialDifferencingEngine',
       },
+    },
+  ],
+  labelTranscriptions: [
+    {
+      eventId: 'evt_001',
+      eventClass: 'VIAL_LABEL_PRESENTATION_EVENT',
+      eventType: 'VIAL_LABEL_PRESENTATION_EVENT',
+      actionIds: ['act_cryo_001'],
+      isVialLabel: true,
+      cellLineName: 'HEK293T',
+      userInitials: 'RS',
+      dateFrozen: '2026-03-15',
+      fullText: 'HEK293T P5 Lot#8841 RS 2026-03-15',
+      highestContrastShotText: 'HEK293T P5 Lot#8841 RS',
+      minimalBlurShotText: 'HEK293T P5 Lot#8841 RS 2026-03-15',
+      conflatedText: 'HEK293T P5 Lot#8841 RS 2026-03-15',
+      vialLabelData: {
+        cellLineName: 'HEK293T',
+        userInitials: 'RS',
+        dateFrozen: '2026-03-15',
+        fullText: 'HEK293T P5 Lot#8841 RS 2026-03-15',
+      },
+      confidence: 0.985,
+    },
+  ],
+  actionWellLocations: [
+    {
+      actionId: 'act_cryo_001',
+      actionType: 'VIAL_INSERTION',
+      row: 'C',
+      col: 4,
+      coordinate: 'C4',
+      originCorner: 'TOP_RIGHT_BLACK',
+      confidence: 0.99,
     },
   ],
   isSignedOff: false,
@@ -508,8 +586,15 @@ export class ApiService {
       boxId: string;
       cellCoordinate: string;
       occupied: boolean;
+      highlighted?: boolean;
+      lastActionType?: 'VIAL_INSERTION' | 'VIAL_REMOVAL';
       vial?: {
         cellLineIdentifier?: string;
+        cellLineName?: string;
+        userInitials?: string;
+        operatorInitials?: string;
+        dateFrozen?: string;
+        fullText?: string;
         lotNumber?: string;
         passageNumber?: number | string;
         notes?: string;
@@ -529,6 +614,32 @@ export class ApiService {
       throw new Error(errBody.error || `Failed to update cell: status ${res.status}`);
     }
     return await res.json();
+  }
+
+  /**
+   * POST `/api/inventories/:id/empty`
+   * Empties all boxes and cells in the specified cryo-inventory.
+   */
+  public async emptyInventory(
+    id: string,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<InventoryRecord | null> {
+    const headers = await this.getHeaders({
+      'Content-Type': 'application/json',
+      'x-customer-id': options?.customerId || this.tenant.customerId,
+      'x-database-id': options?.databaseId || this.tenant.databaseId,
+    });
+    const res = await fetch(`${this.baseUrl}/api/inventories/${encodeURIComponent(id)}/empty`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ databaseId: options?.databaseId || this.tenant.databaseId }),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to empty inventory: status ${res.status}`);
+    }
+    const json = await res.json();
+    return (json?.inventory || json) as InventoryRecord;
   }
 
   /**
@@ -870,22 +981,29 @@ export class ApiService {
 
     InventorySignOffPayloadSchema.parse(payload);
 
+    let response: Response | undefined;
     try {
       const headers = await this.getHeaders({
         'Content-Type': 'application/json',
         'x-database-id': databaseId,
       });
-      const response = await fetch(`${this.baseUrl}/api/signoff/inventory`, {
+      response = await fetch(`${this.baseUrl}/api/signoff/inventory`, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
       });
+    } catch (err) {
+      console.warn('[ApiService] Signoff endpoint unreachable, committing client-side transaction:', err);
+    }
 
+    if (response) {
       if (response.ok) {
         return (await response.json()) as SignOffResponse;
       }
-    } catch (err) {
-      console.warn('[ApiService] Signoff endpoint unreachable, committing client-side transaction:', err);
+      const errBody = await response.json().catch(() => ({}));
+      throw new Error(
+        errBody.error || errBody.message || `Inventory sign-off failed (HTTP ${response.status})`
+      );
     }
 
     // Atomic payload verified and successfully simulated
@@ -1130,12 +1248,13 @@ export function generateInventorySignOffPayload(
             (act.eventList || []).includes(r.eventId) && r.spatialResult
         );
         const row = (
+          act.boxWellLocation?.row ||
           act.boxRowId ||
           spatialRef?.spatialResult?.row ||
           'A'
         ).toUpperCase();
         const col = Number(
-          act.boxColId ?? spatialRef?.spatialResult?.col ?? 1
+          act.boxWellLocation?.col ?? act.boxColId ?? spatialRef?.spatialResult?.col ?? 1
         );
         const status =
           act.actionClass === 'VIAL_REMOVAL_ACTION' ? 'EMPTY' : 'OCCUPIED';
@@ -1144,7 +1263,21 @@ export function generateInventorySignOffPayload(
           boxId: act.cellLineInfo?.boxId || defaultBoxId,
           row,
           col,
-          cellLineName: act.cellLineName || 'Unknown',
+          cellLineName: act.vialLabelData?.cellLineName || act.cellLineName || 'Unknown',
+          userInitials:
+            act.vialLabelData?.userInitials ||
+            act.cellLineInfo?.userInitials ||
+            operatorInitials,
+          dateFrozen:
+            act.vialLabelData?.dateFrozen ||
+            act.cellLineInfo?.dateFrozen ||
+            undefined,
+          fullText:
+            act.vialLabelData?.fullText ||
+            act.cellLineInfo?.fullText ||
+            act.vialLabelData?.cellLineName ||
+            act.cellLineName ||
+            'Unknown',
           lotNumber:
             act.cellLineInfo?.lotNumber || act.cellLineInfo?.lot || undefined,
           passage:
@@ -1152,6 +1285,12 @@ export function generateInventorySignOffPayload(
               ? act.cellLineInfo.passage
               : undefined,
           operatorInitials,
+          actionId: act.actionId,
+          actionType:
+            act.actionClass === 'VIAL_REMOVAL_ACTION'
+              ? 'VIAL_REMOVAL'
+              : 'VIAL_INSERTION',
+          highlighted: status === 'OCCUPIED',
           status,
           updatedAt: signedOffAt,
         });

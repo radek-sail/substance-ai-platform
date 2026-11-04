@@ -29,21 +29,96 @@ import { CheckCircle2, AlertCircle, Info, Lock, Loader2, LogOut } from 'lucide-r
 import { auth } from './firebase';
 import { Login } from './components/Login';
 
-function deriveInventoryDataFromAnalysis(doc: VideoAnalysisDoc | null): HumanEditedVialData {
-  const firstAction = doc?.actions?.[0];
+function deriveInventoryDataFromAnalysis(
+  doc: VideoAnalysisDoc | null,
+  actionId?: string | null
+): HumanEditedVialData {
+  const targetAction =
+    (actionId && doc?.actions?.find((a) => a.actionId === actionId)) ||
+    doc?.actions?.[0];
   const spatialRef = doc?.refinements?.find(
-    (r) => r.spatialResult?.row && r.spatialResult?.col !== undefined
+    (r) =>
+      (targetAction?.eventList?.includes(r.eventId || '') || !actionId) &&
+      r.spatialResult?.row &&
+      r.spatialResult?.col !== undefined
   );
-  const row = (firstAction?.boxRowId || spatialRef?.spatialResult?.row || 'C').toUpperCase();
-  const col = Number(firstAction?.boxColId ?? spatialRef?.spatialResult?.col ?? 4);
-  const cellLineInfo = (firstAction?.cellLineInfo || {}) as Record<string, any>;
+  const ocrRef = doc?.refinements?.find(
+    (r) =>
+      (targetAction?.eventList?.includes(r.eventId || '') || !actionId) &&
+      (r.vialLabelData || r.refinementClass === 'OCR_CONFLATION')
+  );
+  const wellLoc = targetAction?.boxWellLocation || spatialRef?.boxWellLocation;
+  const row = (
+    wellLoc?.row ||
+    targetAction?.boxRowId ||
+    spatialRef?.spatialResult?.row ||
+    'C'
+  ).toUpperCase();
+  const col = Number(
+    wellLoc?.col ?? targetAction?.boxColId ?? spatialRef?.spatialResult?.col ?? 4
+  );
+  const cellLineInfo = (targetAction?.cellLineInfo || {}) as Record<string, any>;
+  const isDemoDoc = !doc?.videoId || doc.videoId === 'vid_cryo_demo_01';
+  const labelRec = doc?.labelTranscriptions?.find(
+    (lt) =>
+      (targetAction?.actionId && lt.actionIds?.includes(targetAction.actionId)) ||
+      (targetAction?.eventList && lt.eventId && targetAction.eventList.includes(lt.eventId)) ||
+      !actionId
+  );
+  const vialLabelData =
+    targetAction?.vialLabelData ||
+    labelRec?.vialLabelData ||
+    ocrRef?.vialLabelData;
+
+  const cellLineName =
+    vialLabelData?.cellLineName ||
+    labelRec?.cellLineName ||
+    targetAction?.cellLineName ||
+    cellLineInfo.name ||
+    (isDemoDoc ? 'HEK293T' : '');
+  const userInitials = String(
+    vialLabelData?.userInitials ||
+      labelRec?.userInitials ||
+      cellLineInfo.userInitials ||
+      cellLineInfo.operatorInitials ||
+      cellLineInfo.operator ||
+      (isDemoDoc ? 'RS' : '')
+  );
+  const dateFrozen = String(
+    vialLabelData?.dateFrozen ||
+      labelRec?.dateFrozen ||
+      cellLineInfo.dateFrozen ||
+      (isDemoDoc ? '2026-03-15' : '')
+  );
+  const fullText = String(
+    vialLabelData?.fullText ||
+      labelRec?.fullText ||
+      labelRec?.conflatedText ||
+      targetAction?.conflatedLabelText ||
+      cellLineInfo.fullText ||
+      ocrRef?.transcriptionText ||
+      (isDemoDoc ? `${cellLineName} P5 Lot#8841 ${userInitials} ${dateFrozen}` : cellLineName)
+  );
+  const isRemoval = String(
+    targetAction?.actionClass || ''
+  )
+    .toUpperCase()
+    .includes('REMOVAL');
 
   return {
-    cellLineName: firstAction?.cellLineName || 'HEK293T',
+    cellLineName,
+    userInitials,
+    dateFrozen,
+    fullText,
     lotNumber: String(cellLineInfo.lotNumber || cellLineInfo.lot || 'LOT-8841'),
     passage: typeof cellLineInfo.passage === 'number' ? cellLineInfo.passage : 5,
-    operatorInitials: String(cellLineInfo.operatorInitials || cellLineInfo.operator || 'RS'),
-    targetCoordinate: String(cellLineInfo.targetCoordinate || `${row}${col}`),
+    operatorInitials: userInitials,
+    targetCoordinate: String(
+      wellLoc?.coordinate || cellLineInfo.targetCoordinate || `${row}${col}`
+    ),
+    boxId: String(cellLineInfo.boxId || 'box_01'),
+    actionId: targetAction?.actionId || 'act_cryo_001',
+    actionType: isRemoval ? 'VIAL_REMOVAL' : 'VIAL_INSERTION',
   };
 }
 
@@ -95,6 +170,7 @@ export const App: React.FC = () => {
   // Sign-Off & Lock State
   const [isSignedOff, setIsSignedOff] = useState<boolean>(false);
   const [isSignOffModalOpen, setIsSignOffModalOpen] = useState<boolean>(false);
+  const [signOffVersion, setSignOffVersion] = useState<number>(0);
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(
     null
   );
@@ -295,6 +371,7 @@ export const App: React.FC = () => {
     if (videoId) {
       setActiveVideoId(videoId);
     }
+    setSignOffVersion((v) => v + 1);
     setActiveTab('inventory');
     showToast('info', `Navigated to Cryo-Inventory${inventoryId ? ` (${inventoryId})` : ''}`);
   };
@@ -322,12 +399,9 @@ export const App: React.FC = () => {
     const actionsList = analysis?.actions ?? [];
     const action = actionsList.find((a) => a.actionId === actionId);
     if (action) {
-      if (action.boxRowId && action.boxColId) {
-        setEditedInventoryData((prev) => ({
-          ...prev,
-          targetCoordinate: `${action.boxRowId}${action.boxColId}`,
-        }));
-      }
+      const derived = deriveInventoryDataFromAnalysis(analysis, actionId);
+      setRawAiInventoryData(derived);
+      setEditedInventoryData(derived);
       showToast('info', `Selected action ${action.actionClass}`);
     }
   };
@@ -363,6 +437,7 @@ export const App: React.FC = () => {
   // Handle sign-off commit success
   const handleSignOffSuccess = (res: SignOffResponse) => {
     setIsSignedOff(true);
+    setSignOffVersion((v) => v + 1);
     setAnalysis((prev) => (prev ? { ...prev, isSignedOff: true } : prev));
     showToast('success', res.message);
   };
@@ -564,6 +639,8 @@ export const App: React.FC = () => {
                 onSeek={handleTimelineSeek}
                 onSelectAction={handleSelectAction}
                 onSelectEvent={handleSelectEvent}
+                onOpenSignOff={() => setIsSignOffModalOpen(true)}
+                signOffVersion={signOffVersion}
               />
             ) : (
               <div className="space-y-6">
@@ -652,6 +729,10 @@ export const App: React.FC = () => {
         }
         rawAiInventoryData={rawAiInventoryData}
         editedInventoryData={editedInventoryData}
+        onChangeInventoryField={(field, val) =>
+          setEditedInventoryData((prev) => ({ ...prev, [field]: val }))
+        }
+        inventoryActions={safeActions}
         markdownDoc={markdownDoc}
         onCommitSuccess={handleSignOffSuccess}
       />

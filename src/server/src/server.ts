@@ -24,6 +24,7 @@ import {
   listInventoriesHandler,
   createInventoryHandler,
   getInventoryHandler,
+  emptyInventoryHandler,
 } from './controllers/inventory.controller';
 
 // Load environment variables
@@ -80,6 +81,7 @@ app.use('/api/inventories', inventoryRoutes);
 app.get('/api/inventories', listInventoriesHandler);
 app.post('/api/inventories', createInventoryHandler);
 app.get('/api/inventories/:id', getInventoryHandler);
+app.post('/api/inventories/:id/empty', emptyInventoryHandler);
 
 // ----------------------------------------------------
 // Serve Vite frontend static assets

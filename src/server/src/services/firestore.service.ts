@@ -853,8 +853,45 @@ export function formatArchiveMarkdown(
 }
 
 /**
+ * Resolves a box key inside `inventoryDoc.boxes` from a raw boxId such as
+ * 'A-1', 'Box 1', 'box_01', 'CryoBox-A1', etc.
+ */
+function resolveInventoryBoxKey(boxes: Record<string, any>, rawBoxId: string): string {
+  if (!boxes || typeof boxes !== 'object') {
+    return rawBoxId || 'A-1';
+  }
+  if (boxes[rawBoxId]) {
+    return rawBoxId;
+  }
+  const keys = Object.keys(boxes);
+  const lower = String(rawBoxId || '').trim().toLowerCase();
+  const caseMatch = keys.find((k) => k.toLowerCase() === lower);
+  if (caseMatch) {
+    return caseMatch;
+  }
+  // Match patterns like "CryoBox-A1", "Tower A Box 1", "A1" -> "A-1"
+  const towerBoxMatch = String(rawBoxId || '').match(/([A-Za-z])[-_\s]*0*(\d+)/);
+  if (towerBoxMatch) {
+    const candidate = `${towerBoxMatch[1].toUpperCase()}-${parseInt(towerBoxMatch[2], 10)}`;
+    if (boxes[candidate]) {
+      return candidate;
+    }
+  }
+  // Match patterns like "box_01", "Box 1" -> "A-1"
+  const numOnlyMatch = String(rawBoxId || '').match(/(?:box|slot|rack)[-_\s]*0*(\d+)/i);
+  if (numOnlyMatch) {
+    const candidate = `A-${parseInt(numOnlyMatch[1], 10)}`;
+    if (boxes[candidate]) {
+      return candidate;
+    }
+  }
+  return keys[0] || rawBoxId || 'A-1';
+}
+
+/**
  * Atomic Inventory Sign-Off Service:
- * Commits occupied cells to `inventories/{inventoryId}/contents/{boxId}`
+ * Commits occupied cells to `inventories/{inventoryId}/contents/{boxId}`,
+ * syncs the cells (with `highlighted: true` and extracted vial metadata) into `inventories/{inventoryId}.boxes`,
  * and marks `video_analyses/{videoId}.isSignedOff = true`.
  */
 export async function commitInventorySignOff(
@@ -893,7 +930,7 @@ export async function commitInventorySignOff(
   const { databaseId, videoId, inventoryId, boxUpdates, operatorInitials } = parsedPayload;
   const signedOffAt = parsedPayload.signedOffAt || new Date().toISOString();
   const dbId = normalizeDatabaseId(databaseId);
-  const db = getTenantFirestore(dbId);
+  const tenantDb = getTenantFirestore(dbId);
 
   // Group updates by boxId
   const updatesByBox = new Map<string, BoxUpdate[]>();
@@ -909,8 +946,33 @@ export async function commitInventorySignOff(
   const primaryBoxId = boxUpdates[0]?.boxId || 'box_01';
   let combinedOccupiedCells: Record<string, any> = {};
 
+  // Read top-level inventory document if it exists so we can perform occupancy sanity checks
+  let topLevelInvData: Record<string, any> | null = null;
+  const loadTopLevelInventoryData = async (firestoreInstance: Firestore): Promise<Record<string, any> | null> => {
+    try {
+      const invRef = firestoreInstance.collection('inventories').doc(inventoryId);
+      if (invRef && typeof invRef.get === 'function') {
+        const snap = await invRef.get();
+        if (snap && snap.exists) {
+          return snap.data() || null;
+        }
+      }
+    } catch {
+      // Ignore read errors
+    }
+    return null;
+  };
+
+  topLevelInvData = await loadTopLevelInventoryData(tenantDb);
+  if (!topLevelInvData && db && db !== tenantDb) {
+    topLevelInvData = await loadTopLevelInventoryData(db);
+  }
+
+  // Pre-load existing box contents and run sanity checks BEFORE writing any changes
+  const existingCellsByBox = new Map<string, Record<string, any>>();
+
   for (const [boxId, updates] of updatesByBox.entries()) {
-    const boxDocRef = getInventoryBoxDocRef(db, inventoryId, boxId);
+    const boxDocRef = getInventoryBoxDocRef(tenantDb, inventoryId, boxId);
     let existingCells: Record<string, any> = {};
     if (typeof boxDocRef.get === 'function') {
       const existingSnap = await boxDocRef.get();
@@ -921,21 +983,75 @@ export async function commitInventorySignOff(
         }
       }
     }
+    existingCellsByBox.set(boxId, existingCells);
+
+    const resolvedBoxKey = topLevelInvData?.boxes
+      ? resolveInventoryBoxKey(topLevelInvData.boxes, boxId)
+      : boxId;
+    const topLevelBoxCells: Record<string, any> | undefined =
+      topLevelInvData?.boxes?.[resolvedBoxKey]?.cells;
+
+    const currentOccupancy = new Map<string, boolean>();
+
+    for (const cell of updates) {
+      const rowLetter = String(cell.row || 'A').toUpperCase();
+      const colNum = Number(cell.col) || 1;
+      const coordinate = `${rowLetter}${colNum}`;
+      const isRemoval = cell.status === 'EMPTY' || cell.actionType === 'VIAL_REMOVAL';
+
+      let isOccupied: boolean;
+      if (currentOccupancy.has(coordinate)) {
+        isOccupied = currentOccupancy.get(coordinate)!;
+      } else if (topLevelBoxCells && topLevelBoxCells[coordinate] !== undefined) {
+        isOccupied = Boolean(topLevelBoxCells[coordinate].occupied);
+      } else if (existingCells[coordinate] !== undefined) {
+        isOccupied = existingCells[coordinate].status !== 'EMPTY';
+      } else {
+        isOccupied = false;
+      }
+
+      if (!isRemoval && isOccupied) {
+        throw new Error(
+          `Sanity check failed: Cannot insert vial into box ${resolvedBoxKey} well ${coordinate} because it is already occupied.`
+        );
+      }
+      if (isRemoval && !isOccupied) {
+        throw new Error(
+          `Sanity check failed: Cannot remove vial from box ${resolvedBoxKey} well ${coordinate} because the well is empty.`
+        );
+      }
+
+      currentOccupancy.set(coordinate, !isRemoval);
+    }
+  }
+
+  for (const [boxId, updates] of updatesByBox.entries()) {
+    const boxDocRef = getInventoryBoxDocRef(tenantDb, inventoryId, boxId);
+    const existingCells: Record<string, any> = { ...(existingCellsByBox.get(boxId) || {}) };
 
     for (const cell of updates) {
       const coordinate = `${cell.row.toUpperCase()}${cell.col}`;
-      existingCells[coordinate] = {
+      const isRemoval = cell.status === 'EMPTY' || cell.actionType === 'VIAL_REMOVAL';
+      const resolvedStatus = isRemoval ? 'EMPTY' : cell.status || 'OCCUPIED';
+      const resolvedActionType = cell.actionType || (isRemoval ? 'VIAL_REMOVAL' : 'VIAL_INSERTION');
+      existingCells[coordinate] = stripUndefinedFields({
         boxId,
         coordinate,
         row: cell.row.toUpperCase(),
         col: cell.col,
         cellLineName: cell.cellLineName,
+        userInitials: cell.userInitials || cell.operatorInitials || operatorInitials,
+        dateFrozen: cell.dateFrozen,
+        fullText: cell.fullText,
         lotNumber: cell.lotNumber,
         passage: cell.passage,
-        operatorInitials: cell.operatorInitials || operatorInitials,
-        status: cell.status || 'OCCUPIED',
+        operatorInitials: cell.operatorInitials || cell.userInitials || operatorInitials,
+        actionId: cell.actionId,
+        actionType: resolvedActionType,
+        highlighted: cell.highlighted !== undefined ? cell.highlighted : !isRemoval,
+        status: resolvedStatus,
         updatedAt: cell.updatedAt || signedOffAt,
-      };
+      });
     }
 
     combinedOccupiedCells = { ...combinedOccupiedCells, ...existingCells };
@@ -953,25 +1069,288 @@ export async function commitInventorySignOff(
     );
   }
 
-  // Mark video_analyses/{videoId}.isSignedOff = true
-  await db
-    .collection('video_analyses')
-    .doc(videoId)
-    .set(
-      {
+  // Sync updates into the top-level inventory document (`inventories/{inventoryId}`) so Cryo-Inventory view updates immediately
+  const syncTopLevelInventoryDoc = async (firestoreInstance: Firestore) => {
+    try {
+      const invRef = firestoreInstance.collection('inventories').doc(inventoryId);
+      if (!invRef || typeof invRef.get !== 'function' || typeof invRef.set !== 'function') {
+        return;
+      }
+      const invSnap = await invRef.get();
+      const invData: Record<string, any> = invSnap && invSnap.exists ? invSnap.data() || {} : {};
+      const boxes: Record<string, any> = invData.boxes ? { ...invData.boxes } : {};
+
+      for (const [rawBoxId, updates] of updatesByBox.entries()) {
+        const resolvedBoxKey = resolveInventoryBoxKey(boxes, rawBoxId);
+        const existingBox = boxes[resolvedBoxKey] || {
+          boxId: resolvedBoxKey,
+          towerLabel: resolvedBoxKey.split('-')[0] || 'A',
+          boxNumber: parseInt(resolvedBoxKey.split('-')[1] || '1', 10) || 1,
+          rows: invData.rowsPerBox || 9,
+          cols: invData.colsPerBox || 9,
+          cells: {},
+        };
+        const updatedCells: Record<string, any> = { ...(existingBox.cells || {}) };
+
+        for (const cell of updates) {
+          const rowLetter = cell.row.toUpperCase();
+          const colNum = cell.col;
+          const coordinate = `${rowLetter}${colNum}`;
+          const isRemoval = cell.status === 'EMPTY' || cell.actionType === 'VIAL_REMOVAL';
+          const resolvedInitials = cell.userInitials || cell.operatorInitials || operatorInitials;
+
+          if (isRemoval) {
+            updatedCells[coordinate] = {
+              row: rowLetter,
+              col: colNum,
+              cellCoordinate: coordinate,
+              occupied: false,
+              highlighted: false,
+              lastActionType: 'VIAL_REMOVAL',
+            };
+          } else {
+            updatedCells[coordinate] = {
+              row: rowLetter,
+              col: colNum,
+              cellCoordinate: coordinate,
+              occupied: true,
+              highlighted: cell.highlighted !== undefined ? cell.highlighted : true,
+              lastActionType: 'VIAL_INSERTION',
+              vial: stripUndefinedFields({
+                cellLineIdentifier: cell.cellLineName,
+                cellLineName: cell.cellLineName,
+                userInitials: resolvedInitials,
+                operatorInitials: resolvedInitials,
+                dateFrozen: cell.dateFrozen,
+                fullText: cell.fullText,
+                lotNumber: cell.lotNumber,
+                passageNumber: cell.passage,
+                targetCoordinate: coordinate,
+                videoId,
+                actionId: cell.actionId,
+                notes: cell.fullText ? `Extracted from video label: ${cell.fullText}` : undefined,
+                updatedAt: cell.updatedAt || signedOffAt,
+              }),
+            };
+          }
+        }
+
+        boxes[resolvedBoxKey] = {
+          ...existingBox,
+          cells: updatedCells,
+        };
+      }
+
+      if (invSnap && invSnap.exists) {
+        await invRef.set({
+          ...invData,
+          boxes,
+          updatedAt: signedOffAt,
+        });
+      }
+    } catch (syncErr) {
+      console.warn(`[FirestoreService] Could not sync top-level inventory doc ${inventoryId}:`, syncErr);
+    }
+  };
+
+  await syncTopLevelInventoryDoc(tenantDb);
+  if (db && db !== tenantDb) {
+    await syncTopLevelInventoryDoc(db);
+  }
+
+  // Helper to apply HITL edits onto an actions list
+  const applyHitlUpdatesToActions = (rawActions: any[]): any[] => {
+    if (!Array.isArray(rawActions)) return rawActions;
+    return rawActions.map((act, idx) => {
+      const actId = act?.actionId || `act_${idx + 1}`;
+      const matchedUpdate =
+        boxUpdates.find((u) => u.actionId && u.actionId === actId) ||
+        (boxUpdates.length === rawActions.length ? boxUpdates[idx] : undefined);
+      if (!matchedUpdate) return act;
+
+      const rowLetter = String(matchedUpdate.row || 'A').toUpperCase();
+      const colNum = Number(matchedUpdate.col) || 1;
+      const coordinate = `${rowLetter}${colNum}`;
+      const isRemoval = matchedUpdate.status === 'EMPTY' || matchedUpdate.actionType === 'VIAL_REMOVAL';
+      const actionType = isRemoval ? 'VIAL_REMOVAL' : 'VIAL_INSERTION';
+      const actionClass = isRemoval ? 'VIAL_REMOVAL_ACTION' : 'VIAL_INSERTION_ACTION';
+      const resolvedInitials =
+        matchedUpdate.userInitials || matchedUpdate.operatorInitials || operatorInitials;
+      const resolvedFullText = matchedUpdate.fullText || matchedUpdate.cellLineName;
+
+      return stripUndefinedFields({
+        ...act,
+        actionId: actId,
+        inventoryId: inventoryId || act.inventoryId,
+        actionType,
+        actionClass,
+        cellLineName: matchedUpdate.cellLineName,
+        conflatedLabelText: resolvedFullText,
+        targetCoordinate: coordinate,
+        boxRowId: rowLetter,
+        boxColId: colNum,
+        vialLabelData: stripUndefinedFields({
+          ...(act.vialLabelData || {}),
+          cellLineName: matchedUpdate.cellLineName,
+          userInitials: resolvedInitials,
+          dateFrozen: matchedUpdate.dateFrozen ?? act.vialLabelData?.dateFrozen,
+          fullText: resolvedFullText,
+        }),
+        boxWellLocation: stripUndefinedFields({
+          ...(act.boxWellLocation || {}),
+          actionId: actId,
+          actionType,
+          row: rowLetter,
+          col: colNum,
+          coordinate,
+        }),
+        cellLineInfo: stripUndefinedFields({
+          ...(act.cellLineInfo || {}),
+          name: matchedUpdate.cellLineName,
+          boxId: matchedUpdate.boxId || act.cellLineInfo?.boxId || 'box_01',
+          lotNumber: matchedUpdate.lotNumber ?? act.cellLineInfo?.lotNumber,
+          passage: matchedUpdate.passage ?? act.cellLineInfo?.passage,
+          userInitials: resolvedInitials,
+          operatorInitials: resolvedInitials,
+          dateFrozen: matchedUpdate.dateFrozen ?? act.cellLineInfo?.dateFrozen,
+          fullText: resolvedFullText,
+          targetCoordinate: coordinate,
+        }),
+      });
+    });
+  };
+
+  // Helper to apply HITL edits onto a refinements list
+  const applyHitlUpdatesToRefinements = (rawRefinements: any[]): any[] => {
+    if (!Array.isArray(rawRefinements)) return rawRefinements;
+    return rawRefinements.map((ref, idx) => {
+      const matchedUpdate =
+        boxUpdates.find((u) => u.actionId && ref?.actionId && u.actionId === ref.actionId) ||
+        (boxUpdates.length === rawRefinements.length ? boxUpdates[idx] : undefined);
+      if (!matchedUpdate) return ref;
+
+      const rowLetter = String(matchedUpdate.row || 'A').toUpperCase();
+      const colNum = Number(matchedUpdate.col) || 1;
+      const coordinate = `${rowLetter}${colNum}`;
+      const isRemoval = matchedUpdate.status === 'EMPTY' || matchedUpdate.actionType === 'VIAL_REMOVAL';
+      const actionType = isRemoval ? 'VIAL_REMOVAL' : 'VIAL_INSERTION';
+      const resolvedInitials =
+        matchedUpdate.userInitials || matchedUpdate.operatorInitials || operatorInitials;
+      const resolvedFullText = matchedUpdate.fullText || matchedUpdate.cellLineName;
+
+      return stripUndefinedFields({
+        ...ref,
+        conflatedLabelText: resolvedFullText,
+        vialLabelData: stripUndefinedFields({
+          ...(ref.vialLabelData || {}),
+          cellLineName: matchedUpdate.cellLineName,
+          userInitials: resolvedInitials,
+          dateFrozen: matchedUpdate.dateFrozen ?? ref.vialLabelData?.dateFrozen,
+          fullText: resolvedFullText,
+        }),
+        boxWellLocation: stripUndefinedFields({
+          ...(ref.boxWellLocation || {}),
+          actionId: matchedUpdate.actionId || ref.actionId,
+          actionType,
+          row: rowLetter,
+          col: colNum,
+          coordinate,
+        }),
+        spatialResult: stripUndefinedFields({
+          ...(ref.spatialResult || {}),
+          row: rowLetter,
+          col: colNum,
+          cellLineName: matchedUpdate.cellLineName,
+        }),
+      });
+    });
+  };
+
+  // Update video_analyses/{videoId} with committed edits and mark isSignedOff = true
+  const syncVideoAnalysisDoc = async (firestoreInstance: Firestore) => {
+    try {
+      const analysisRef = firestoreInstance.collection('video_analyses').doc(videoId);
+      let existingAnalysis: Record<string, any> = {};
+      if (analysisRef && typeof analysisRef.get === 'function') {
+        const snap = await analysisRef.get();
+        if (snap && snap.exists) {
+          existingAnalysis = snap.data() || {};
+        }
+      }
+      const updatedAnalysisPayload: Record<string, any> = {
+        ...existingAnalysis,
         videoId,
+        inventoryId,
         isSignedOff: true,
         signedOffAt,
         updatedAt: signedOffAt,
-      },
-      { merge: true }
-    );
+        hitlBoxUpdates: boxUpdates,
+      };
+      if (Array.isArray(existingAnalysis.actions)) {
+        updatedAnalysisPayload.actions = applyHitlUpdatesToActions(existingAnalysis.actions);
+      }
+      if (Array.isArray(existingAnalysis.refinements)) {
+        updatedAnalysisPayload.refinements = applyHitlUpdatesToRefinements(existingAnalysis.refinements);
+      }
+      await analysisRef.set(stripUndefinedFields(updatedAnalysisPayload), { merge: true });
+    } catch {
+      // Ignore fallback write error
+    }
+  };
 
-  if (process.env.NODE_ENV !== 'test') {
-    await updateVideoPass(dbId, videoId, 'hitl', {
-      status: 'COMPLETED',
-      completedAt: signedOffAt,
-    });
+  await syncVideoAnalysisDoc(tenantDb);
+  if (db && db !== tenantDb) {
+    await syncVideoAnalysisDoc(db);
+  }
+
+  // Persist HITL data and updated pass1/pass3 actions into videos/{videoId}.passes across tenant & default DB
+  const persistHitlToVideoPasses = async (targetDatabaseId: string) => {
+    const existingPassInfo = await getVideoPasses(targetDatabaseId, videoId);
+    if (existingPassInfo?.passes) {
+      const p1 = existingPassInfo.passes.pass1;
+      if (p1?.data) {
+        const updatedP1Data = Array.isArray(p1.data)
+          ? applyHitlUpdatesToActions(p1.data)
+          : Array.isArray(p1.data.actions)
+          ? { ...p1.data, actions: applyHitlUpdatesToActions(p1.data.actions) }
+          : p1.data;
+        await updateVideoPass(targetDatabaseId, videoId, 'pass1', {
+          ...p1,
+          data: updatedP1Data,
+        });
+      }
+      const p3 = existingPassInfo.passes.pass3;
+      if (p3?.data && Array.isArray(p3.data)) {
+        await updateVideoPass(targetDatabaseId, videoId, 'pass3', {
+          ...p3,
+          data: applyHitlUpdatesToRefinements(p3.data),
+        });
+      }
+    }
+    await updateVideoPass(
+      targetDatabaseId,
+      videoId,
+      'hitl',
+      {
+        status: 'COMPLETED',
+        completedAt: signedOffAt,
+        data: {
+          inventoryId,
+          operatorInitials,
+          signedOffAt,
+          boxUpdates,
+        },
+      },
+      {
+        inventoryId,
+        updatedAt: signedOffAt,
+      }
+    );
+  };
+
+  await persistHitlToVideoPasses(dbId);
+  if (dbId !== '(default)') {
+    await persistHitlToVideoPasses('(default)');
   }
 
   return {

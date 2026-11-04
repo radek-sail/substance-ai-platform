@@ -73,6 +73,69 @@ export const BestFrameSchema = z.object({
 });
 export type BestFrame = z.infer<typeof BestFrameSchema>;
 
+export const VialLabelDataSchema = z.object({
+  cellLineName: z.string(),
+  userInitials: z.string().optional(),
+  dateFrozen: z.string().optional(),
+  fullText: z.string(),
+  lotNumber: z.string().optional(),
+  passage: z.union([z.number(), z.string()]).optional(),
+  boxId: z.string().optional(),
+  frame1Text: z.string().optional(),
+  frame2Text: z.string().optional(),
+  confidence: z.number().optional(),
+});
+export type VialLabelData = z.infer<typeof VialLabelDataSchema>;
+
+export const LabelTranscriptionRecordSchema = z.object({
+  eventId: z.string(),
+  eventClass: z.string().default('VIAL_LABEL_PRESENTATION_EVENT'),
+  eventType: z.string().optional(),
+  actionIds: z.array(z.string()).default([]),
+  isVialLabel: z.boolean().optional(),
+  cellLineName: z.string(),
+  userInitials: z.string().optional(),
+  dateFrozen: z.string().optional(),
+  fullText: z.string(),
+  frame1Text: z.string().optional(),
+  frame2Text: z.string().optional(),
+  highestContrastShotText: z.string().optional(),
+  minimalBlurShotText: z.string().optional(),
+  conflatedText: z.string().optional(),
+  vialLabelData: VialLabelDataSchema.optional(),
+  confidence: z.number().optional(),
+  boxId: z.string().optional(),
+  lotNumber: z.string().optional(),
+  passage: z.union([z.number(), z.string()]).optional(),
+  frameTranscriptions: z
+    .array(
+      z.object({
+        frameType: z.string().optional(),
+        timestampSeconds: z.number().optional(),
+        url: z.string().optional(),
+        gcsUri: z.string().optional(),
+        text: z.string(),
+      })
+    )
+    .optional(),
+  conflatedAt: z.string().optional(),
+});
+export type LabelTranscriptionRecord = z.infer<typeof LabelTranscriptionRecordSchema>;
+
+export const BoxWellLocationSchema = z.object({
+  actionId: z.string().optional(),
+  row: z.string().default('A'),
+  col: z.coerce.number().default(1),
+  coordinate: z.string().optional(),
+  boxId: z.string().optional(),
+  originCorner: z.string().optional().default('TOP_LEFT_BLACK'),
+  intervalStartSeconds: z.coerce.number().optional(),
+  intervalEndSeconds: z.coerce.number().optional(),
+  actionType: z.string().optional(),
+  confidence: z.coerce.number().optional(),
+});
+export type BoxWellLocation = z.infer<typeof BoxWellLocationSchema>;
+
 export const ActionIntervalSchema = z.object({
   actionId: z.string(),
   actionType: z.string(), // "VIAL_INSERTION" | "VIAL_REMOVAL" | "CAP_REMOVAL" | "BOX_MANIPULATION" | string
@@ -115,8 +178,18 @@ export const ActionIntervalSchema = z.object({
   cellLineName: z.string().optional(),
   cellLineInfo: z.record(z.any()).optional(),
   towerId: z.string().optional(),
+  boxId: z.string().optional(),
   boxRowId: z.string().optional(),
   boxColId: z.number().optional(),
+  userInitials: z.string().optional(),
+  operatorInitials: z.string().optional(),
+  dateFrozen: z.string().optional(),
+  fullText: z.string().optional(),
+  lotNumber: z.string().optional(),
+  passage: z.union([z.number(), z.string()]).optional(),
+  vialLabelData: VialLabelDataSchema.optional(),
+  boxWellLocation: BoxWellLocationSchema.optional(),
+  labelEventId: z.string().optional(),
   eventList: z.array(z.string()).optional(),
 });
 export type ActionInterval = z.infer<typeof ActionIntervalSchema>;
@@ -171,8 +244,21 @@ export const ActionSchema = z.object({
   cellLineName: z.string().optional(),
   cellLineInfo: z.record(z.any()).optional(),
   towerId: z.string().optional(),
+  boxId: z.string().optional(),
   boxRowId: z.string().optional(),
   boxColId: z.number().optional(),
+  targetRow: z.string().optional(),
+  targetCol: z.number().optional(),
+  userInitials: z.string().optional(),
+  operatorInitials: z.string().optional(),
+  dateFrozen: z.string().optional(),
+  fullText: z.string().optional(),
+  conflatedLabelText: z.string().optional(),
+  lotNumber: z.string().optional(),
+  passage: z.union([z.number(), z.string()]).optional(),
+  vialLabelData: VialLabelDataSchema.optional(),
+  boxWellLocation: BoxWellLocationSchema.optional(),
+  labelEventId: z.string().optional(),
   eventList: z.array(z.string()),
 });
 export type Action = z.infer<typeof ActionSchema>;
@@ -206,6 +292,11 @@ export const EventSchema = z.object({
   bestFrames: z.array(BestFrameSchema).optional(),
   highestContrastFrame: BestFrameSchema.optional(),
   minimalBlurFrame: BestFrameSchema.optional(),
+  highestContrastText: z.string().optional(),
+  minimalBlurText: z.string().optional(),
+  conflatedLabelText: z.string().optional(),
+  vialLabelData: VialLabelDataSchema.optional(),
+  labelTranscription: VialLabelDataSchema.optional(),
   refinementList: z.array(z.string()).default([]),
 });
 export type Event = z.infer<typeof EventSchema>;
@@ -245,25 +336,49 @@ export const EventDetectionPassResultSchema = z.object({
 export type EventDetectionPassResult = z.infer<typeof EventDetectionPassResultSchema>;
 
 export const RefinementSchema = z.object({
-  refinementId: z.string(),
-  eventId: z.string(),
-  refinementClass: z.string(),
+  refinementId: z.string().default('ref_001'),
+  eventId: z.string().default('evt_001'),
+  actionId: z.string().optional(),
+  actionIds: z.array(z.string()).optional(),
+  refinementClass: z.string().default('OCR_CONFLATION'),
   transcriptionText: z.string().optional(),
+  vialLabelData: VialLabelDataSchema.optional(),
+  boxWellLocation: BoxWellLocationSchema.optional(),
+  frameTranscriptions: z.array(z.any()).optional(),
   spatialResult: z
     .object({
-      row: z.string(),
-      col: z.number(),
+      row: z.string().default('A'),
+      col: z.coerce.number().default(1),
     })
     .optional(),
   conflationMetadata: z
     .object({
-      confidence: z.number(),
-      framesEvaluated: z.number(),
-      ocrEngine: z.string(),
+      confidence: z.coerce.number().default(0.95),
+      framesEvaluated: z.coerce.number().default(2),
+      ocrEngine: z.string().default('Gemini-DualShot-Conflation'),
     })
     .optional(),
 });
 export type Refinement = z.infer<typeof RefinementSchema>;
+
+export const AnalysisRefinementPassResultSchema = z.object({
+  videoId: z.string().optional(),
+  refinements: z.array(RefinementSchema),
+  labelTranscriptions: z.array(LabelTranscriptionRecordSchema).default([]),
+  actionWellLocations: z
+    .array(
+      BoxWellLocationSchema.extend({
+        actionId: z.string(),
+      })
+    )
+    .default([]),
+  enrichedActions: z.array(ActionSchema).optional(),
+  generatedAt: z.string().optional(),
+  modelUsed: z.string().optional(),
+  thinkingLevel: z.string().optional(),
+  executionAudit: ExecutionAuditSchema.optional(),
+});
+export type AnalysisRefinementPassResult = z.infer<typeof AnalysisRefinementPassResultSchema>;
 
 export const VideoStatusSchema = z.enum([
   'UPLOADING',
@@ -282,6 +397,8 @@ export type PassStatus = z.infer<typeof PassStatusSchema>;
 export const PassStepStateSchema = z.object({
   status: PassStatusSchema.default('PENDING'),
   data: z.any().optional(),
+  labelTranscriptions: z.array(LabelTranscriptionRecordSchema).optional(),
+  actionWellLocations: z.array(BoxWellLocationSchema).optional(),
   executionAudit: ExecutionAuditSchema.optional(),
   modelUsed: z.string().optional(),
   thinkingLevel: z.string().optional(),
@@ -415,9 +532,15 @@ export const BoxUpdateSchema = z.object({
   row: z.string(),
   col: z.number(),
   cellLineName: z.string(),
+  userInitials: z.string().optional(),
+  dateFrozen: z.string().optional(),
+  fullText: z.string().optional(),
   lotNumber: z.string().optional(),
   passage: z.number().optional(),
   operatorInitials: z.string().optional(),
+  actionId: z.string().optional(),
+  actionType: z.string().optional(),
+  highlighted: z.boolean().optional(),
   status: z.enum(['OCCUPIED', 'EMPTY', 'RESERVED']).default('OCCUPIED'),
   updatedAt: z.string().optional(),
 });
@@ -450,6 +573,8 @@ export const VideoAnalysisDocSchema = z.object({
   actions: z.array(ActionSchema),
   events: z.array(EventSchema),
   refinements: z.array(RefinementSchema),
+  labelTranscriptions: z.array(LabelTranscriptionRecordSchema).optional(),
+  actionWellLocations: z.array(BoxWellLocationSchema).optional(),
   isSignedOff: z.boolean().default(false),
   signedOffAt: z.string().optional(),
   updatedAt: z.string().optional(),

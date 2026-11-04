@@ -11,6 +11,11 @@ import {
   Clock,
   Contrast,
   Focus,
+  FileText,
+  User,
+  Calendar,
+  MapPin,
+  Database,
 } from 'lucide-react';
 import type { Action, Event, Refinement } from '@sail/shared';
 
@@ -20,16 +25,26 @@ export interface HumanEditedVialData {
   passage: number;
   operatorInitials: string;
   targetCoordinate: string; // e.g. "C4"
+  userInitials?: string;
+  dateFrozen?: string;
+  fullText?: string;
+  boxId?: string;
+  actionId?: string;
+  actionType?: 'VIAL_INSERTION' | 'VIAL_REMOVAL';
 }
 
 interface VialInspectorProps {
   action?: Action;
+  actions?: Action[];
+  selectedActionId?: string;
+  onSelectAction?: (actionId: string) => void;
   events?: Event[];
   refinements?: Refinement[];
   editedData: HumanEditedVialData;
   rawAiData: HumanEditedVialData;
   onChange: (field: keyof HumanEditedVialData, value: any) => void;
   onResetField?: (field: keyof HumanEditedVialData) => void;
+  onOpenSignOff?: () => void;
   readOnly?: boolean;
 }
 
@@ -60,12 +75,16 @@ function resolveFrameUrl(url?: string, fallbackTime?: number): string {
 
 export const VialInspector: React.FC<VialInspectorProps> = ({
   action,
+  actions = [],
+  selectedActionId,
+  onSelectAction,
   events = [],
   refinements = [],
   editedData,
   rawAiData,
   onChange,
   onResetField,
+  onOpenSignOff,
   readOnly = false,
 }) => {
   const [selectedImage, setSelectedImage] = useState<{
@@ -97,6 +116,7 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
     blurScore?: number;
     associatedActionIds: string[];
     spokenContext?: string;
+    extractedText?: string;
   }[] = [];
 
   displayEvents.forEach((ev) => {
@@ -110,16 +130,21 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
     if (Array.isArray(ev.bestFrames) && ev.bestFrames.length > 0) {
       ev.bestFrames.forEach((bf) => {
         const frameTime = bf.timestampSeconds ?? bf.timestamp ?? ev.startTime;
+        const fType = bf.frameType === 'MINIMAL_BLUR' ? 'MINIMAL_BLUR' : 'HIGHEST_CONTRAST';
         bestShots.push({
           url: resolveFrameUrl(bf.url || bf.gcsUri, frameTime),
           time: frameTime,
           label: ev.eventClass.replace(/_EVENT/g, ''),
           eventId: ev.eventId,
-          frameType: bf.frameType === 'MINIMAL_BLUR' ? 'MINIMAL_BLUR' : 'HIGHEST_CONTRAST',
+          frameType: fType,
           contrastScore: bf.contrastScore,
           blurScore: bf.blurScore ?? bf.sharpnessScore,
           associatedActionIds,
           spokenContext: ev.spokenContext,
+          extractedText:
+            fType === 'HIGHEST_CONTRAST'
+              ? ev.highestContrastText || ev.conflatedLabelText
+              : ev.minimalBlurText || ev.conflatedLabelText,
         });
       });
     } else if (ev.bestShotUrls && ev.bestShotUrls.length > 0) {
@@ -135,6 +160,10 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
           frameType: inferredType,
           associatedActionIds,
           spokenContext: ev.spokenContext,
+          extractedText:
+            inferredType === 'HIGHEST_CONTRAST'
+              ? ev.highestContrastText || ev.conflatedLabelText
+              : ev.minimalBlurText || ev.conflatedLabelText,
         });
       });
     }
@@ -151,6 +180,11 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
   const isFieldEdited = (field: keyof HumanEditedVialData) => {
     return editedData[field] !== rawAiData[field];
   };
+
+  const inventoryActions = actions.filter((a) => {
+    const cls = String(a.actionClass || '');
+    return cls.includes('INSERTION') || cls.includes('REMOVAL') || cls.includes('HANDLING');
+  });
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col gap-4">
@@ -178,6 +212,38 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
           <span>Multi-Pass Verified</span>
         </div>
       </div>
+
+      {/* Multi-Action Switcher for Inventory Update Actions */}
+      {inventoryActions.length > 1 && (
+        <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5 flex flex-wrap items-center gap-2">
+          <span className="text-[11px] font-mono text-slate-400 mr-1">
+            Inventory Update Actions ({inventoryActions.length}):
+          </span>
+          {inventoryActions.map((act) => {
+            const isSelected = (selectedActionId || action?.actionId) === act.actionId;
+            const wellCoord =
+              act.boxWellLocation?.coordinate ||
+              (act.targetRow && act.targetCol ? `${act.targetRow}${act.targetCol}` : 'C4');
+            return (
+              <button
+                key={act.actionId}
+                type="button"
+                onClick={() => onSelectAction?.(act.actionId)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-mono border transition-all flex items-center gap-1.5 ${
+                  isSelected
+                    ? 'bg-cyan-950 border-cyan-500 text-cyan-200 font-bold'
+                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700'
+                }`}
+              >
+                <span>{act.actionId}</span>
+                <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-emerald-300">
+                  Well {wellCoord}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {/* Selected Action & 4 FPS Refined Interval Summary */}
       {action &&
@@ -389,6 +455,52 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
         </div>
       </div>
 
+      {/* Pass 3 Dual-Shot Label Conflation & Top-Left Origin Well Summary */}
+      <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-3.5 space-y-2.5 text-xs">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-2">
+          <span className="font-semibold text-cyan-300 flex items-center gap-1.5 font-mono">
+            <FileText className="w-3.5 h-3.5 text-cyan-400" />
+            <span>Pass 3 Analysis Refinement (Full-Res Dual-Shot Conflation & Well Origin)</span>
+          </span>
+          <span className="px-2 py-0.5 rounded bg-black border border-slate-700 text-[10px] font-mono text-slate-300 flex items-center gap-1">
+            <MapPin className="w-3 h-3 text-emerald-400" />
+            <span>Origin A1: Top-Left Black Corner</span>
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 font-mono text-[11px]">
+          <div className="bg-slate-900/80 border border-slate-800 rounded-lg p-2 space-y-1">
+            <div className="text-amber-300 font-semibold flex items-center gap-1">
+              <Contrast className="w-3 h-3" />
+              <span>Shot 1 (Highest Contrast - Full Res) OCR:</span>
+            </div>
+            <div className="text-slate-300 truncate">
+              {displayEvents[0]?.highestContrastText ||
+                action?.vialLabelData?.fullText ||
+                action?.conflatedLabelText ||
+                editedData.fullText ||
+                editedData.cellLineName ||
+                '(no label text extracted)'}
+            </div>
+          </div>
+
+          <div className="bg-slate-900/80 border border-slate-800 rounded-lg p-2 space-y-1">
+            <div className="text-cyan-300 font-semibold flex items-center gap-1">
+              <Focus className="w-3 h-3" />
+              <span>Shot 2 (Minimal Blur - Full Res) OCR:</span>
+            </div>
+            <div className="text-slate-300 truncate">
+              {displayEvents[0]?.minimalBlurText ||
+                action?.vialLabelData?.fullText ||
+                action?.conflatedLabelText ||
+                editedData.fullText ||
+                editedData.cellLineName ||
+                '(no label text extracted)'}
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* Editable Extraction Form Fields */}
       <div className="space-y-3 pt-2 border-t border-slate-800">
         <div className="flex items-center justify-between">
@@ -402,10 +514,10 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-          {/* Cell Line Name */}
+          {/* Cell Line Name (Required) */}
           <div className="bg-slate-950 p-3 rounded-xl border border-slate-800/80 space-y-1">
             <div className="flex items-center justify-between">
-              <label className="text-slate-400 font-medium">Cell Line Identifier</label>
+              <label className="text-slate-400 font-medium">Cell Line Identifier *</label>
               {isFieldEdited('cellLineName') && (
                 <button
                   type="button"
@@ -425,6 +537,140 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
               onChange={(e) => onChange('cellLineName', e.target.value)}
               className={`w-full bg-slate-900 border rounded-lg px-3 py-1.5 font-mono text-slate-100 focus:outline-none ${
                 isFieldEdited('cellLineName')
+                  ? 'border-amber-500/80 text-amber-200'
+                  : 'border-slate-700 focus:border-cyan-500'
+              }`}
+            />
+          </div>
+
+          {/* User's Initials (Optional) */}
+          <div className="bg-slate-950 p-3 rounded-xl border border-slate-800/80 space-y-1">
+            <div className="flex items-center justify-between">
+              <label className="text-slate-400 font-medium flex items-center gap-1">
+                <User className="w-3 h-3 text-cyan-400" />
+                <span>User&apos;s Initials (Optional)</span>
+              </label>
+              {(isFieldEdited('userInitials') || isFieldEdited('operatorInitials')) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onResetField?.('userInitials');
+                    onResetField?.('operatorInitials');
+                  }}
+                  className="text-[10px] text-amber-400 hover:text-amber-300 flex items-center gap-1 font-mono"
+                >
+                  <RotateCcw className="w-2.5 h-2.5" />
+                  <span>Revert ({rawAiData.userInitials || rawAiData.operatorInitials || ''})</span>
+                </button>
+              )}
+            </div>
+            <input
+              type="text"
+              disabled={readOnly}
+              placeholder="e.g. JS"
+              value={editedData.userInitials ?? editedData.operatorInitials ?? ''}
+              onChange={(e) => {
+                onChange('userInitials', e.target.value);
+                onChange('operatorInitials', e.target.value);
+              }}
+              className={`w-full bg-slate-900 border rounded-lg px-3 py-1.5 font-mono text-slate-100 focus:outline-none ${
+                isFieldEdited('userInitials')
+                  ? 'border-amber-500/80 text-amber-200'
+                  : 'border-slate-700 focus:border-cyan-500'
+              }`}
+            />
+          </div>
+
+          {/* Date Frozen (Optional) */}
+          <div className="bg-slate-950 p-3 rounded-xl border border-slate-800/80 space-y-1">
+            <div className="flex items-center justify-between">
+              <label className="text-slate-400 font-medium flex items-center gap-1">
+                <Calendar className="w-3 h-3 text-cyan-400" />
+                <span>Date Frozen (Optional)</span>
+              </label>
+              {isFieldEdited('dateFrozen') && (
+                <button
+                  type="button"
+                  onClick={() => onResetField && onResetField('dateFrozen')}
+                  className="text-[10px] text-amber-400 hover:text-amber-300 flex items-center gap-1 font-mono"
+                >
+                  <RotateCcw className="w-2.5 h-2.5" />
+                  <span>Revert ({rawAiData.dateFrozen || ''})</span>
+                </button>
+              )}
+            </div>
+            <input
+              type="text"
+              disabled={readOnly}
+              placeholder="e.g. 2026-03-15"
+              value={editedData.dateFrozen ?? ''}
+              onChange={(e) => onChange('dateFrozen', e.target.value)}
+              className={`w-full bg-slate-900 border rounded-lg px-3 py-1.5 font-mono text-slate-100 focus:outline-none ${
+                isFieldEdited('dateFrozen')
+                  ? 'border-amber-500/80 text-amber-200'
+                  : 'border-slate-700 focus:border-cyan-500'
+              }`}
+            />
+          </div>
+
+          {/* Target Coordinate (Box Well Location: Row A.. + Col 1.. from Top-Right Black Corner) */}
+          <div className="bg-slate-950 p-3 rounded-xl border border-slate-800/80 space-y-1">
+            <div className="flex items-center justify-between">
+              <label className="text-slate-400 font-medium">Target Coordinate (Slot)</label>
+              {isFieldEdited('targetCoordinate') && (
+                <button
+                  type="button"
+                  onClick={() => onResetField && onResetField('targetCoordinate')}
+                  className="text-[10px] text-amber-400 hover:text-amber-300 flex items-center gap-1 font-mono"
+                >
+                  <RotateCcw className="w-2.5 h-2.5" />
+                  <span>Revert ({rawAiData.targetCoordinate})</span>
+                </button>
+              )}
+            </div>
+            <input
+              type="text"
+              maxLength={3}
+              disabled={readOnly}
+              value={editedData.targetCoordinate}
+              onChange={(e) => onChange('targetCoordinate', e.target.value.toUpperCase())}
+              className={`w-full bg-slate-900 border rounded-lg px-3 py-1.5 font-mono text-slate-100 uppercase focus:outline-none ${
+                isFieldEdited('targetCoordinate')
+                  ? 'border-amber-500/80 text-amber-200'
+                  : 'border-slate-700 focus:border-cyan-500'
+              }`}
+            />
+          </div>
+
+          {/* Full Text Extracted from Label (Required, spans 2 cols) */}
+          <div className="sm:col-span-2 bg-slate-950 p-3 rounded-xl border border-slate-800/80 space-y-1">
+            <div className="flex items-center justify-between">
+              <label className="text-slate-400 font-medium flex items-center gap-1.5">
+                <FileText className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Full Text Extracted from Vial Label *</span>
+              </label>
+              {isFieldEdited('fullText') && (
+                <button
+                  type="button"
+                  onClick={() => onResetField && onResetField('fullText')}
+                  className="text-[10px] text-amber-400 hover:text-amber-300 flex items-center gap-1 font-mono"
+                >
+                  <RotateCcw className="w-2.5 h-2.5" />
+                  <span>Revert to Conflated OCR</span>
+                </button>
+              )}
+            </div>
+            <input
+              type="text"
+              disabled={readOnly}
+              placeholder="Full conflated text extracted from the 2 best shots"
+              value={
+                editedData.fullText ??
+                `${editedData.cellLineName} | P${editedData.passage} | ${editedData.lotNumber}`
+              }
+              onChange={(e) => onChange('fullText', e.target.value)}
+              className={`w-full bg-slate-900 border rounded-lg px-3 py-1.5 font-mono text-slate-100 focus:outline-none ${
+                isFieldEdited('fullText')
                   ? 'border-amber-500/80 text-amber-200'
                   : 'border-slate-700 focus:border-cyan-500'
               }`}
@@ -488,36 +734,21 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
               }`}
             />
           </div>
-
-          {/* Target Coordinate */}
-          <div className="bg-slate-950 p-3 rounded-xl border border-slate-800/80 space-y-1">
-            <div className="flex items-center justify-between">
-              <label className="text-slate-400 font-medium">Target Coordinate (Slot)</label>
-              {isFieldEdited('targetCoordinate') && (
-                <button
-                  type="button"
-                  onClick={() => onResetField && onResetField('targetCoordinate')}
-                  className="text-[10px] text-amber-400 hover:text-amber-300 flex items-center gap-1 font-mono"
-                >
-                  <RotateCcw className="w-2.5 h-2.5" />
-                  <span>Revert ({rawAiData.targetCoordinate})</span>
-                </button>
-              )}
-            </div>
-            <input
-              type="text"
-              maxLength={3}
-              disabled={readOnly}
-              value={editedData.targetCoordinate}
-              onChange={(e) => onChange('targetCoordinate', e.target.value.toUpperCase())}
-              className={`w-full bg-slate-900 border rounded-lg px-3 py-1.5 font-mono text-slate-100 uppercase focus:outline-none ${
-                isFieldEdited('targetCoordinate')
-                  ? 'border-amber-500/80 text-amber-200'
-                  : 'border-slate-700 focus:border-cyan-500'
-              }`}
-            />
-          </div>
         </div>
+
+        {/* Commit Verified Actions to Database CTA */}
+        {onOpenSignOff && !readOnly && (
+          <div className="pt-2 flex justify-end">
+            <button
+              type="button"
+              onClick={onOpenSignOff}
+              className="flex items-center gap-2 px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white text-xs font-semibold shadow-md shadow-emerald-500/20 transition-all cursor-pointer"
+            >
+              <Database className="w-3.5 h-3.5" />
+              <span>Commit Verified Actions to Inventory Database</span>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Image Lightbox Modal */}

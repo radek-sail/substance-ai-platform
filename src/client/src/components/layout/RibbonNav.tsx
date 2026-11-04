@@ -7,7 +7,6 @@ import {
   Building,
   User,
   CheckCircle2,
-  AlertCircle,
   FileCheck2,
   Sliders,
   Sparkles,
@@ -37,7 +36,6 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
   onUpdateTenant,
   isSignedOff = false,
   onOpenSignOffModal,
-  videoTitle = 'vid_cryo_demo_01.mp4',
   userEmail,
   onSignOut,
   authControls,
@@ -192,19 +190,6 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
             </div>
           </div>
         </div>
-
-        {/* Sub-banner showing active record / video title */}
-        <div className="bg-slate-950/70 border-t border-slate-800/50 px-4 py-1 flex items-center justify-between text-[11px] text-slate-400 font-mono">
-          <div className="flex items-center gap-2">
-            <span className="text-slate-500">ACTIVE STREAM:</span>
-            <span className="text-slate-200">{videoTitle}</span>
-          </div>
-          <div className="flex items-center gap-3 text-slate-400">
-            <span>Passes: 0 (Audio) • 1 (Action) • 2 (Event) • 3 (Refinement)</span>
-            <span className="text-slate-600">|</span>
-            <span className="text-emerald-400">ISO-9001 Compliant</span>
-          </div>
-        </div>
       </header>
 
       {/* Tenant Context Configuration Modal */}
@@ -302,4 +287,3 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
 };
 
 export default RibbonNav;
-

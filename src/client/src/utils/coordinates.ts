@@ -105,6 +105,33 @@ export function computeGridCoordinateFromNormalized(
   };
 }
 
+export function computeBoxWellFromTopRightOrigin(
+  normX: number,
+  normY: number,
+  totalRows: number = 9,
+  totalCols: number = 9
+): {
+  row: string;
+  col: number;
+  coordinate: string;
+  originCorner: 'TOP_RIGHT_BLACK';
+} {
+  const boundedX = Math.max(0, Math.min(0.9999, normX));
+  const boundedY = Math.max(0, Math.min(0.9999, normY));
+
+  const rowIndex = Math.floor(boundedY * totalRows);
+  const colFromRight = Math.floor((1 - boundedX) * totalCols) + 1;
+  const clampedCol = Math.max(1, Math.min(totalCols, colFromRight));
+  const row = rowIndexToLetter(rowIndex);
+
+  return {
+    row,
+    col: clampedCol,
+    coordinate: `${row}${clampedCol}`,
+    originCorner: 'TOP_RIGHT_BLACK',
+  };
+}
+
 export function calculateSpatialDistance(
   coordA: { row: string; col: number },
   coordB: { row: string; col: number }

@@ -97,7 +97,7 @@ export function extractCandidateFrame(
         .inputOptions(['-nostdin'])
         .seekInput(seekSec)
         .frames(1)
-        .outputOptions(['-y', '-q:v 2'])
+        .outputOptions(['-y', '-q:v 1'])
         .output(outputPath)
         .on('end', () => {
           if (hasRealVideoFile && idx < uniqueAttempts.length - 1) {

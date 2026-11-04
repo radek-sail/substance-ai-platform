@@ -171,6 +171,26 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     title: string;
   } | null>(null);
   const [copiedPrompt, setCopiedPrompt] = useState<boolean>(false);
+  const [hitlActionEdits, setHitlActionEdits] = useState<
+    Record<
+      string,
+      {
+        actionId: string;
+        actionType: 'VIAL_INSERTION' | 'VIAL_REMOVAL';
+        boxId: string;
+        coordinate: string;
+        cellLineName: string;
+        userInitials: string;
+        dateFrozen: string;
+        fullText: string;
+        lotNumber: string;
+        passage: string;
+      }
+    >
+  >({});
+  const [isCommittingHitl, setIsCommittingHitl] = useState<boolean>(false);
+  const [hitlCommitError, setHitlCommitError] = useState<string | null>(null);
+  const [hitlCommitSuccess, setHitlCommitSuccess] = useState<string | null>(null);
 
   // Model & Thinking Level Selectors (Default: Pass 0 -> gemini-3.8-flash, Passes 1-3 -> gemini-1.5-pro, Passes 1-3 Thinking -> MEDIUM)
   const [pass0Model, setPass0Model] = useState<string>('gemini-3.8-flash');
@@ -1933,6 +1953,51 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                           </div>
                                         )}
 
+                                      {(actionItem.vialLabelData || actionItem.boxWellLocation || actionItem.cellLineName) && (
+                                        <div className="text-[10px] font-mono bg-emerald-950/35 border border-emerald-800/50 rounded-lg p-2 space-y-1">
+                                          <div className="text-emerald-300 font-semibold flex items-center justify-between">
+                                            <span>Pass 3 Appended Action JSON ({`action_${actId}.json`})</span>
+                                            {(actionItem.boxWellLocation?.coordinate || targetCoord) && (
+                                              <span className="px-1.5 py-0.5 rounded bg-emerald-900/60 border border-emerald-600/50 text-emerald-200">
+                                                Well {actionItem.boxWellLocation?.coordinate || targetCoord} (Origin: Top-Right Black A1)
+                                              </span>
+                                            )}
+                                          </div>
+                                          <div className="grid grid-cols-2 gap-1 text-slate-300">
+                                            <span>
+                                              Cell Line:{' '}
+                                              <strong className="text-white">
+                                                {actionItem.vialLabelData?.cellLineName || actionItem.cellLineName || 'N/A'}
+                                              </strong>
+                                            </span>
+                                            <span>
+                                              Initials:{' '}
+                                              <strong className="text-white">
+                                                {actionItem.vialLabelData?.userInitials ||
+                                                  actionItem.cellLineInfo?.userInitials ||
+                                                  '—'}
+                                              </strong>
+                                            </span>
+                                            <span>
+                                              Date Frozen:{' '}
+                                              <strong className="text-white">
+                                                {actionItem.vialLabelData?.dateFrozen ||
+                                                  actionItem.cellLineInfo?.dateFrozen ||
+                                                  '—'}
+                                              </strong>
+                                            </span>
+                                            <span className="truncate">
+                                              Full Text:{' '}
+                                              <strong className="text-cyan-200">
+                                                {actionItem.vialLabelData?.fullText ||
+                                                  actionItem.cellLineInfo?.fullText ||
+                                                  '—'}
+                                              </strong>
+                                            </span>
+                                          </div>
+                                        </div>
+                                      )}
+
                                       {/* Bottom Row: Metadata Chips + Seek Button */}
                                       <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-800/60 text-xs">
                                         <div className="flex flex-wrap items-center gap-2">
@@ -2383,6 +2448,326 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             </div>
                           );
                         })()
+                      ) : step.passKey === 'pass3' && hasJsonData && !showRawJsonMap[drawerKey] ? (
+                        (() => {
+                          const pass3Raw = passState.data as any;
+                          const cachedDoc = analysisCache[selectedVideo.videoId] as any;
+                          const refinementsList: any[] = Array.isArray(pass3Raw)
+                            ? pass3Raw
+                            : Array.isArray(pass3Raw?.refinements)
+                            ? pass3Raw.refinements
+                            : Array.isArray(cachedDoc?.refinements)
+                            ? cachedDoc.refinements
+                            : [];
+                          const labelTranscriptions: any[] = Array.isArray(
+                            (passState as any).labelTranscriptions
+                          )
+                            ? (passState as any).labelTranscriptions
+                            : Array.isArray(pass3Raw?.labelTranscriptions)
+                            ? pass3Raw.labelTranscriptions
+                            : Array.isArray(cachedDoc?.labelTranscriptions)
+                            ? cachedDoc.labelTranscriptions
+                            : refinementsList
+                                .filter((r: any) => r.vialLabelData || r.refinementClass === 'OCR_CONFLATION')
+                                .map((r: any) => ({
+                                  eventId: r.eventId,
+                                  actionIds: r.actionIds || (r.actionId ? [r.actionId] : []),
+                                  isVialLabel: true,
+                                  highestContrastShotText:
+                                    r.highestContrastShotText || r.frame1Text || r.transcriptionText,
+                                  minimalBlurShotText:
+                                    r.minimalBlurShotText || r.frame2Text || r.transcriptionText,
+                                  conflatedText:
+                                    r.vialLabelData?.fullText || r.fullText || r.transcriptionText,
+                                  vialLabelData: r.vialLabelData || {
+                                    cellLineName:
+                                      r.cellLineName || r.transcriptionText?.split(/\s+/)[0] || '',
+                                    userInitials: r.userInitials,
+                                    dateFrozen: r.dateFrozen,
+                                    fullText: r.fullText || r.transcriptionText || '',
+                                  },
+                                }));
+                          const actionWellLocations: any[] = Array.isArray(
+                            (passState as any).actionWellLocations
+                          )
+                            ? (passState as any).actionWellLocations
+                            : Array.isArray(pass3Raw?.actionWellLocations)
+                            ? pass3Raw.actionWellLocations
+                            : Array.isArray(cachedDoc?.actionWellLocations)
+                            ? cachedDoc.actionWellLocations
+                            : refinementsList
+                                .filter((r: any) => r.boxWellLocation || r.spatialResult)
+                                .map((r: any) =>
+                                  r.boxWellLocation || {
+                                    actionId: r.actionId || 'act_01',
+                                    actionType: 'VIAL_INSERTION',
+                                    row: r.spatialResult?.row || 'A',
+                                    col: r.spatialResult?.col || 1,
+                                    coordinate: `${r.spatialResult?.row || 'A'}${r.spatialResult?.col || 1}`,
+                                    originCorner: 'TOP_LEFT_BLACK',
+                                    confidence: r.conflationMetadata?.confidence || 0.98,
+                                  }
+                                );
+                          const pass1ActionsList: any[] = Array.isArray(selectedPasses.pass1?.data)
+                            ? selectedPasses.pass1.data
+                            : Array.isArray((selectedPasses.pass1?.data as any)?.actions)
+                            ? (selectedPasses.pass1.data as any).actions
+                            : Array.isArray(cachedDoc?.actions)
+                            ? cachedDoc.actions
+                            : [];
+
+                          return (
+                            <div className="space-y-4" data-testid="pass3-refinement-results">
+                              {/* 1. Dual-Shot Label Transcriptions & Conflation (label_transcriptions.json) */}
+                              <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-3">
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                                  <span className="font-semibold text-indigo-300 flex items-center gap-1.5">
+                                    <Sparkles className="w-3.5 h-3.5" />
+                                    1. Label Presentation Dual-Shot OCR & Conflation (label_transcriptions.json)
+                                  </span>
+                                  <span className="text-[10px] text-slate-400">
+                                    2 Full-Res Best Shots: Highest Contrast + Minimal Blur → Conflated JSON
+                                  </span>
+                                </div>
+
+                                {labelTranscriptions.length === 0 ? (
+                                  <div className="text-xs font-mono text-slate-400">
+                                    No label presentation events detected for transcription.
+                                  </div>
+                                ) : (
+                                  <div className="grid grid-cols-1 gap-2.5">
+                                    {labelTranscriptions.map((lt: any, idx: number) => {
+                                      const vData = lt.vialLabelData || {};
+                                      const actIds: string[] = Array.isArray(lt.actionIds)
+                                        ? lt.actionIds
+                                        : [];
+                                      const shot1Text =
+                                        lt.highestContrastShotText ||
+                                        lt.frame1Text ||
+                                        lt.conflatedText ||
+                                        lt.fullText ||
+                                        vData.fullText ||
+                                        '';
+                                      const shot2Text =
+                                        lt.minimalBlurShotText ||
+                                        lt.frame2Text ||
+                                        lt.conflatedText ||
+                                        lt.fullText ||
+                                        vData.fullText ||
+                                        '';
+                                      const resolvedCellLine =
+                                        vData.cellLineName || lt.cellLineName || '';
+                                      const resolvedInitials =
+                                        vData.userInitials || lt.userInitials || '';
+                                      const resolvedDate =
+                                        vData.dateFrozen || lt.dateFrozen || '';
+                                      const resolvedFullText =
+                                        vData.fullText || lt.fullText || lt.conflatedText || '';
+                                      return (
+                                        <div
+                                          key={lt.eventId || idx}
+                                          className="rounded-lg bg-slate-950 border border-slate-800 p-3 text-xs font-mono space-y-2"
+                                        >
+                                          <div className="flex flex-wrap items-center justify-between gap-2">
+                                            <div className="flex items-center gap-2">
+                                              <span className="font-bold text-cyan-300">
+                                                Event: {lt.eventId}
+                                              </span>
+                                              <span className="px-2 py-0.5 rounded bg-indigo-950/70 border border-indigo-700/60 text-indigo-300 text-[10px]">
+                                                label_transcription_{lt.eventId}.json
+                                              </span>
+                                            </div>
+                                            {actIds.length > 0 && (
+                                              <span className="text-[10px] text-emerald-300">
+                                                Appended to Actions: {actIds.join(', ')}
+                                              </span>
+                                            )}
+                                          </div>
+
+                                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px]">
+                                            <div className="p-2 rounded bg-slate-900/80 border border-slate-800">
+                                              <div className="text-[10px] text-amber-300 font-semibold">
+                                                Shot 1 (Highest Contrast OCR - Full Res):
+                                              </div>
+                                              <div className="text-slate-200 mt-0.5">
+                                                {shot1Text || '(not visible)'}
+                                              </div>
+                                            </div>
+                                            <div className="p-2 rounded bg-slate-900/80 border border-slate-800">
+                                              <div className="text-[10px] text-emerald-300 font-semibold">
+                                                Shot 2 (Minimal Blur OCR - Full Res):
+                                              </div>
+                                              <div className="text-slate-200 mt-0.5">
+                                                {shot2Text || '(not visible)'}
+                                              </div>
+                                            </div>
+                                          </div>
+
+                                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 pt-1 border-t border-slate-800/80 text-[11px]">
+                                            <div>
+                                              <span className="text-slate-400 block text-[10px]">
+                                                Cell Line Name (Required)
+                                              </span>
+                                              <span className="font-bold text-white">
+                                                {resolvedCellLine || '(none)'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-slate-400 block text-[10px]">
+                                                User Initials (Optional)
+                                              </span>
+                                              <span className="font-bold text-white">
+                                                {resolvedInitials || '—'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-slate-400 block text-[10px]">
+                                                Date Frozen (Optional)
+                                              </span>
+                                              <span className="font-bold text-white">
+                                                {resolvedDate || '—'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-slate-400 block text-[10px]">
+                                                Full Label Text (Required)
+                                              </span>
+                                              <span className="font-bold text-cyan-200">
+                                                {resolvedFullText || '(none)'}
+                                              </span>
+                                            </div>
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* 2. Vial Insertion/Removal Well Locations (Top-Left Black Corner Origin) */}
+                              <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-3">
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                                  <span className="font-semibold text-cyan-300 flex items-center gap-1.5">
+                                    <MapPin className="w-3.5 h-3.5" />
+                                    2. Vial Insertion/Removal Box Well Locations
+                                  </span>
+                                  <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-700 text-amber-300 text-[10px]">
+                                    Origin A1 (Row A, Col 1) = Top-Left Black Corner (TOP_LEFT_BLACK)
+                                  </span>
+                                </div>
+
+                                {actionWellLocations.length === 0 ? (
+                                  <div className="text-xs font-mono text-slate-400">
+                                    No vial insertion/removal well coordinates extracted.
+                                  </div>
+                                ) : (
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                                    {actionWellLocations.map((wl: any, idx: number) => (
+                                      <div
+                                        key={wl.actionId || idx}
+                                        className="rounded-lg bg-slate-950 border border-slate-800 p-3 text-xs font-mono flex items-center justify-between gap-3"
+                                      >
+                                        <div className="space-y-1">
+                                          <div className="flex items-center gap-2">
+                                            <span className="font-bold text-indigo-300">
+                                              {wl.actionId}
+                                            </span>
+                                            <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] text-slate-300">
+                                              {wl.actionType || 'VIAL_INSERTION'}
+                                            </span>
+                                          </div>
+                                          <div className="text-[11px] text-slate-400">
+                                            Row <strong className="text-white">{wl.row}</strong> • Col{' '}
+                                            <strong className="text-white">{wl.col}</strong> • Origin:{' '}
+                                            <span className="text-amber-300">
+                                              {wl.originCorner || 'TOP_LEFT_BLACK'}
+                                            </span>
+                                          </div>
+                                        </div>
+                                        <div className="px-3 py-1.5 rounded-lg bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 font-bold text-sm">
+                                          Well {wl.coordinate || `${wl.row}${wl.col}`}
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* 3. Appended Inventory Update Action JSONs (action_{id}.json) */}
+                              {pass1ActionsList.length > 0 && (
+                                <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-2.5">
+                                  <div className="text-xs font-mono font-semibold text-emerald-300 flex items-center justify-between">
+                                    <span>
+                                      3. Enriched Inventory Update Action JSON Files (action_*.json)
+                                    </span>
+                                    <span className="text-[10px] text-slate-400">
+                                      Appended with Conflated Label Text + Top-Left Black Origin Well Location
+                                    </span>
+                                  </div>
+                                  <div className="grid grid-cols-1 gap-2">
+                                    {pass1ActionsList.map((act: any, idx: number) => {
+                                      const actId = act.actionId || `act_${idx + 1}`;
+                                      return (
+                                        <div
+                                          key={actId}
+                                          className="rounded-lg bg-slate-950 border border-slate-800 p-2.5 text-[11px] font-mono flex flex-wrap items-center justify-between gap-2"
+                                        >
+                                          <div className="flex flex-wrap items-center gap-2">
+                                            <span className="px-2 py-0.5 rounded bg-emerald-950/70 border border-emerald-700/60 text-emerald-300 font-bold">
+                                              action_{actId}.json
+                                            </span>
+                                            <span className="text-slate-300">
+                                              Cell Line:{' '}
+                                              <strong className="text-white">
+                                                {act.vialLabelData?.cellLineName ||
+                                                  act.cellLineName ||
+                                                  act.cellLineInfo?.name ||
+                                                  '(untranscribed)'}
+                                              </strong>
+                                            </span>
+                                            <span className="text-slate-300">
+                                              Initials:{' '}
+                                              <strong className="text-white">
+                                                {act.vialLabelData?.userInitials ||
+                                                  act.cellLineInfo?.userInitials ||
+                                                  '—'}
+                                              </strong>
+                                            </span>
+                                            <span className="text-slate-300">
+                                              Date Frozen:{' '}
+                                              <strong className="text-white">
+                                                {act.vialLabelData?.dateFrozen ||
+                                                  act.cellLineInfo?.dateFrozen ||
+                                                  '—'}
+                                              </strong>
+                                            </span>
+                                            <span className="text-cyan-300">
+                                              Well:{' '}
+                                              <strong>
+                                                {act.boxWellLocation?.coordinate ||
+                                                  act.targetCoordinate ||
+                                                  (act.boxRowId
+                                                    ? `${act.boxRowId}${act.boxColId || 1}`
+                                                    : 'A1')}
+                                              </strong>
+                                            </span>
+                                          </div>
+                                          <span className="text-[10px] text-slate-400 truncate max-w-md">
+                                            Full Text:{' '}
+                                            {act.vialLabelData?.fullText ||
+                                              act.conflatedLabelText ||
+                                              act.cellLineInfo?.fullText ||
+                                              '—'}
+                                          </span>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()
                       ) : (
                         <pre className="p-3 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-cyan-200 overflow-x-auto max-h-72">
                           {hasJsonData
@@ -2397,27 +2782,472 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
             })}
 
             {/* Step 5: Human-in-the-Loop (HITL) Verification Card */}
-            <div className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 flex flex-wrap items-center justify-between gap-3">
-              <div className="space-y-0.5">
-                <div className="text-sm font-bold text-slate-100 flex items-center gap-2.5">
-                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                  <span>Human-in-the-Loop (HITL) Verification</span>
-                  {renderPassStatusBadge(selectedPasses.hitl?.status || 'PENDING', false)}
+            <div
+              className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 space-y-4"
+              data-testid="hitl-verification-card"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-0.5">
+                  <div className="text-sm font-bold text-slate-100 flex items-center gap-2.5">
+                    <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                    <span>Human-in-the-Loop (HITL) Verification</span>
+                    {renderPassStatusBadge(selectedPasses.hitl?.status || 'PENDING', isCommittingHitl)}
+                  </div>
+                  <p className="text-xs text-slate-400 font-mono">
+                    Inspect & edit refined Pass 3 label fields (cellLineName, userInitials, dateFrozen, fullText) and box well coordinates (Origin A1 = Top-Left Black Corner), then commit to the Cryo-Inventory database
+                  </p>
                 </div>
-                <p className="text-xs text-slate-400 font-mono">
-                  Inspect extracted cryo-inventory coordinates or experiment notebook entries and commit atomic sign-off
-                </p>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleInspectResults(selectedVideo, true)}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 transition-colors"
+                  >
+                    <Eye className="w-3.5 h-3.5 text-emerald-300" />
+                    <span>Review in Sign-Off Tab</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
 
-              <button
-                type="button"
-                onClick={() => handleInspectResults(selectedVideo, true)}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 transition-colors"
-              >
-                <Eye className="w-3.5 h-3.5 text-emerald-300" />
-                <span>Review in Sign-Off Tab</span>
-                <ArrowRight className="w-3.5 h-3.5" />
-              </button>
+              {/* Inline Editable HITL Inventory Update Actions Table */}
+              {(() => {
+                const rawPass1 = selectedPasses.pass1?.data as any;
+                const pass1Actions: any[] = Array.isArray(rawPass1)
+                  ? rawPass1
+                  : Array.isArray(rawPass1?.actions)
+                  ? rawPass1.actions
+                  : analysisCache[selectedVideo.videoId]?.actions || [];
+
+                if (pass1Actions.length === 0) return null;
+
+                const committedBoxUpdates: any[] = Array.isArray(
+                  (selectedPasses.hitl as any)?.data?.boxUpdates
+                )
+                  ? (selectedPasses.hitl as any).data.boxUpdates
+                  : Array.isArray((selectedVideo.passes?.hitl as any)?.data?.boxUpdates)
+                    ? (selectedVideo.passes?.hitl as any).data.boxUpdates
+                    : [];
+
+                const getActionEditState = (act: any, idx: number) => {
+                  const actId = act.actionId || `act_${idx + 1}`;
+                  const key = `${selectedVideo.videoId}_${actId}`;
+                  if (hitlActionEdits[key]) {
+                    return hitlActionEdits[key];
+                  }
+
+                  const committed =
+                    committedBoxUpdates.find((u: any) => u?.actionId === actId) ||
+                    committedBoxUpdates[idx];
+                  if (committed) {
+                    const committedRow = String(committed.row || 'A').toUpperCase();
+                    const committedCol = Number(committed.col) || 1;
+                    const committedCoord = `${committedRow}${committedCol}`;
+                    const committedIsRemoval =
+                      committed.actionType === 'VIAL_REMOVAL' ||
+                      committed.status === 'EMPTY';
+                    return {
+                      actionId: actId,
+                      actionType: (committedIsRemoval
+                        ? 'VIAL_REMOVAL'
+                        : 'VIAL_INSERTION') as 'VIAL_INSERTION' | 'VIAL_REMOVAL',
+                      boxId: String(committed.boxId || 'box_01'),
+                      coordinate: committedCoord,
+                      cellLineName: String(committed.cellLineName || ''),
+                      userInitials: String(
+                        committed.userInitials || committed.operatorInitials || ''
+                      ),
+                      dateFrozen: String(committed.dateFrozen || ''),
+                      fullText: String(
+                        committed.fullText || committed.cellLineName || ''
+                      ),
+                      lotNumber: String(committed.lotNumber || ''),
+                      passage: String(committed.passage ?? 1),
+                    };
+                  }
+
+                  const vLabel = act.vialLabelData || {};
+                  const cInfo = act.cellLineInfo || {};
+                  const wellLoc = act.boxWellLocation || {};
+                  const coord =
+                    wellLoc.coordinate ||
+                    act.targetCoordinate ||
+                    cInfo.targetCoordinate ||
+                    (act.boxRowId ? `${act.boxRowId}${act.boxColId ?? 1}` : 'A1');
+                  const isRemoval = String(act.actionType || act.actionClass || '')
+                    .toUpperCase()
+                    .includes('REMOVAL');
+
+                  return {
+                    actionId: actId,
+                    actionType: (isRemoval ? 'VIAL_REMOVAL' : 'VIAL_INSERTION') as
+                      | 'VIAL_INSERTION'
+                      | 'VIAL_REMOVAL',
+                    boxId: String(cInfo.boxId || 'box_01'),
+                    coordinate: String(coord).toUpperCase(),
+                    cellLineName: String(
+                      vLabel.cellLineName || act.cellLineName || cInfo.name || ''
+                    ),
+                    userInitials: String(
+                      vLabel.userInitials ||
+                        cInfo.userInitials ||
+                        cInfo.operatorInitials ||
+                        cInfo.operator ||
+                        ''
+                    ),
+                    dateFrozen: String(vLabel.dateFrozen || cInfo.dateFrozen || ''),
+                    fullText: String(
+                      vLabel.fullText ||
+                        act.conflatedLabelText ||
+                        cInfo.fullText ||
+                        vLabel.cellLineName ||
+                        act.cellLineName ||
+                        ''
+                    ),
+                    lotNumber: String(cInfo.lotNumber || cInfo.lot || ''),
+                    passage: String(cInfo.passage ?? 1),
+                  };
+                };
+
+                const updateHitlField = (
+                  act: any,
+                  idx: number,
+                  field: string,
+                  value: string
+                ) => {
+                  const current = getActionEditState(act, idx);
+                  const key = `${selectedVideo.videoId}_${current.actionId}`;
+                  setHitlCommitError(null);
+                  setHitlCommitSuccess(null);
+                  setHitlActionEdits((prev) => ({
+                    ...prev,
+                    [key]: {
+                      ...current,
+                      [field]: value,
+                    },
+                  }));
+                };
+
+                const handleDirectHitlCommit = async () => {
+                  setIsCommittingHitl(true);
+                  setHitlCommitError(null);
+                  setHitlCommitSuccess(null);
+                  try {
+                    const targetInventoryId =
+                      selectedVideo.inventoryId ||
+                      pass1Actions[0]?.inventoryId ||
+                      selectedPasses.pass0?.data?.inventoryName ||
+                      inventories[0]?.id ||
+                      'tank_alpha_01';
+
+                    const boxUpdates = pass1Actions.map((act, idx) => {
+                      const st = getActionEditState(act, idx);
+                      const m = st.coordinate
+                        .trim()
+                        .toUpperCase()
+                        .match(/^([A-Z])(\d+)$/);
+                      const row = m ? m[1] : 'A';
+                      const col = m ? Math.max(1, parseInt(m[2], 10)) : 1;
+                      const isRemoval = st.actionType === 'VIAL_REMOVAL';
+                      return {
+                        boxId: st.boxId || 'box_01',
+                        row,
+                        col,
+                        cellLineName: st.cellLineName || 'Unknown',
+                        userInitials: st.userInitials || undefined,
+                        dateFrozen: st.dateFrozen || undefined,
+                        fullText: st.fullText || st.cellLineName || 'Unknown',
+                        lotNumber: st.lotNumber || undefined,
+                        passage: Number(st.passage) || 1,
+                        operatorInitials: st.userInitials || tenant.operatorInitials || 'RS',
+                        actionId: st.actionId,
+                        actionType: st.actionType,
+                        highlighted: !isRemoval,
+                        status: (isRemoval ? 'EMPTY' : 'OCCUPIED') as 'EMPTY' | 'OCCUPIED',
+                        updatedAt: new Date().toISOString(),
+                      };
+                    });
+
+                    const res = await apiService.commitInventorySignOff(
+                      tenant.databaseId,
+                      selectedVideo.videoId,
+                      targetInventoryId,
+                      boxUpdates
+                    );
+
+                    const applyEditsToActions = (actions: any[]) =>
+                      actions.map((act: any, idx: number) => {
+                        const actId = act.actionId || `act_${idx + 1}`;
+                        const upd =
+                          boxUpdates.find((u) => u.actionId === actId) || boxUpdates[idx];
+                        if (!upd) return act;
+                        const coord = `${upd.row}${upd.col}`;
+                        return {
+                          ...act,
+                          actionId: actId,
+                          actionType: upd.actionType,
+                          actionClass: upd.actionType,
+                          targetCoordinate: coord,
+                          boxRowId: upd.row,
+                          boxColId: upd.col,
+                          cellLineName: upd.cellLineName,
+                          conflatedLabelText: upd.fullText,
+                          boxWellLocation: {
+                            ...(act.boxWellLocation || {}),
+                            row: upd.row,
+                            column: upd.col,
+                            coordinate: coord,
+                          },
+                          vialLabelData: {
+                            ...(act.vialLabelData || {}),
+                            cellLineName: upd.cellLineName,
+                            userInitials: upd.userInitials || act.vialLabelData?.userInitials,
+                            dateFrozen: upd.dateFrozen || act.vialLabelData?.dateFrozen,
+                            fullText: upd.fullText,
+                          },
+                          cellLineInfo: {
+                            ...(act.cellLineInfo || {}),
+                            boxId: upd.boxId,
+                            name: upd.cellLineName,
+                            targetCoordinate: coord,
+                            userInitials: upd.userInitials || act.cellLineInfo?.userInitials,
+                            operatorInitials: upd.operatorInitials,
+                            dateFrozen: upd.dateFrozen || act.cellLineInfo?.dateFrozen,
+                            fullText: upd.fullText,
+                            lotNumber: upd.lotNumber || act.cellLineInfo?.lotNumber,
+                            passage: upd.passage,
+                          },
+                        };
+                      });
+
+                    setPassesByVideo((prev) => {
+                      const cur = ensurePasses(
+                        prev[selectedVideo.videoId] || selectedVideo.passes
+                      );
+                      const updatedPass1Data = cur.pass1?.data
+                        ? {
+                            ...cur.pass1.data,
+                            actions: Array.isArray(cur.pass1.data.actions)
+                              ? applyEditsToActions(cur.pass1.data.actions)
+                              : cur.pass1.data.actions,
+                          }
+                        : cur.pass1?.data;
+                      return {
+                        ...prev,
+                        [selectedVideo.videoId]: {
+                          ...cur,
+                          pass1: cur.pass1
+                            ? { ...cur.pass1, data: updatedPass1Data }
+                            : cur.pass1,
+                          hitl: {
+                            status: 'COMPLETED',
+                            completedAt: res.signedOffAt,
+                            data: {
+                              inventoryId: targetInventoryId,
+                              signedOffAt: res.signedOffAt,
+                              boxUpdates,
+                            },
+                          } as any,
+                        },
+                      };
+                    });
+
+                    setVideos((prev) =>
+                      prev.map((v) => {
+                        if (v.videoId !== selectedVideo.videoId) return v;
+                        const cur = ensurePasses(v.passes);
+                        const updatedPass1Data = cur.pass1?.data
+                          ? {
+                              ...cur.pass1.data,
+                              actions: Array.isArray(cur.pass1.data.actions)
+                                ? applyEditsToActions(cur.pass1.data.actions)
+                                : cur.pass1.data.actions,
+                            }
+                          : cur.pass1?.data;
+                        return {
+                          ...v,
+                          passes: {
+                            ...cur,
+                            pass1: cur.pass1
+                              ? { ...cur.pass1, data: updatedPass1Data }
+                              : cur.pass1,
+                            hitl: {
+                              status: 'COMPLETED',
+                              completedAt: res.signedOffAt,
+                              data: {
+                                inventoryId: targetInventoryId,
+                                signedOffAt: res.signedOffAt,
+                                boxUpdates,
+                              },
+                            } as any,
+                          },
+                        };
+                      })
+                    );
+
+                    const successMsg = `Committed ${boxUpdates.length} verified inventory action(s) to Cryo-Inventory (${targetInventoryId}).`;
+                    setHitlCommitSuccess(successMsg);
+                    setStatusBanner(successMsg);
+                    onNavigateToInventory?.(targetInventoryId, selectedVideo.videoId);
+                  } catch (err: any) {
+                    const errMsg = `Failed to commit HITL inventory actions: ${err?.message || 'Unknown error'}`;
+                    setHitlCommitError(errMsg);
+                    setStatusBanner(errMsg);
+                  } finally {
+                    setIsCommittingHitl(false);
+                  }
+                };
+
+                return (
+                  <div className="space-y-3 pt-2 border-t border-slate-800/80">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                      <span className="text-emerald-300 font-semibold">
+                        Verify & Edit Refined Inventory Update Actions ({pass1Actions.length})
+                      </span>
+                      <span className="text-[10px] text-amber-300">
+                        Origin A1 = Top-Left Black Corner • Rows: A.. • Cols: 1..
+                      </span>
+                    </div>
+
+                    <div className="space-y-2.5">
+                      {pass1Actions.map((act: any, idx: number) => {
+                        const st = getActionEditState(act, idx);
+                        return (
+                          <div
+                            key={st.actionId}
+                            className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2.5 text-xs font-mono"
+                            data-testid={`hitl-action-editor-${st.actionId}`}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex items-center gap-2">
+                                <span className="font-bold text-cyan-300">{st.actionId}</span>
+                                <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-700 text-[10px] text-slate-300">
+                                  {st.actionType}
+                                </span>
+                              </div>
+                              <span className="text-[10px] text-slate-400">
+                                Well Coordinate (A1 = Top-Left Black Corner)
+                              </span>
+                            </div>
+
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5">
+                              <div>
+                                <label className="block text-[10px] text-slate-400 mb-1">
+                                  Well Coordinate (Row+Col)
+                                </label>
+                                <input
+                                  type="text"
+                                  value={st.coordinate}
+                                  onChange={(e) =>
+                                    updateHitlField(
+                                      act,
+                                      idx,
+                                      'coordinate',
+                                      e.target.value.toUpperCase()
+                                    )
+                                  }
+                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-emerald-300 font-bold text-xs focus:outline-none focus:border-cyan-500"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[10px] text-slate-400 mb-1">
+                                  Cell Line Name *
+                                </label>
+                                <input
+                                  type="text"
+                                  value={st.cellLineName}
+                                  onChange={(e) =>
+                                    updateHitlField(act, idx, 'cellLineName', e.target.value)
+                                  }
+                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-slate-100 text-xs focus:outline-none focus:border-cyan-500"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[10px] text-slate-400 mb-1">
+                                  User Initials
+                                </label>
+                                <input
+                                  type="text"
+                                  value={st.userInitials}
+                                  onChange={(e) =>
+                                    updateHitlField(act, idx, 'userInitials', e.target.value)
+                                  }
+                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-slate-100 text-xs focus:outline-none focus:border-cyan-500"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[10px] text-slate-400 mb-1">
+                                  Date Frozen
+                                </label>
+                                <input
+                                  type="text"
+                                  value={st.dateFrozen}
+                                  onChange={(e) =>
+                                    updateHitlField(act, idx, 'dateFrozen', e.target.value)
+                                  }
+                                  placeholder="YYYY-MM-DD"
+                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-slate-100 text-xs focus:outline-none focus:border-cyan-500"
+                                />
+                              </div>
+                              <div className="sm:col-span-2">
+                                <label className="block text-[10px] text-slate-400 mb-1">
+                                  Full Label Text *
+                                </label>
+                                <input
+                                  type="text"
+                                  value={st.fullText}
+                                  onChange={(e) =>
+                                    updateHitlField(act, idx, 'fullText', e.target.value)
+                                  }
+                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-cyan-200 text-xs focus:outline-none focus:border-cyan-500"
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {hitlCommitError && (
+                      <div
+                        data-testid="hitl-commit-error"
+                        className="flex items-start gap-2 p-3 rounded-lg bg-red-950/60 border border-red-800/80 text-red-200 text-xs font-mono"
+                      >
+                        <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                        <span>{hitlCommitError}</span>
+                      </div>
+                    )}
+
+                    {hitlCommitSuccess && (
+                      <div
+                        data-testid="hitl-commit-success"
+                        className="flex items-start gap-2 p-3 rounded-lg bg-emerald-950/60 border border-emerald-800/80 text-emerald-200 text-xs font-mono"
+                      >
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                        <span>{hitlCommitSuccess}</span>
+                      </div>
+                    )}
+
+                    <div className="flex justify-end pt-1">
+                      <button
+                        type="button"
+                        disabled={isCommittingHitl}
+                        onClick={handleDirectHitlCommit}
+                        data-testid="hitl-commit-inventory-btn"
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white shadow-lg shadow-emerald-600/20 transition-all"
+                      >
+                        {isCommittingHitl ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                        )}
+                        <span>Commit Verified Actions to Inventory Database</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>

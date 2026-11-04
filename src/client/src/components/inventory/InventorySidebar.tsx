@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Database,
   Loader2,
+  Trash2,
 } from 'lucide-react';
 import type { InventoryRecord, CreateInventoryInput } from '@sail/shared';
 
@@ -18,6 +19,7 @@ interface InventorySidebarProps {
   isLoading: boolean;
   onSelectInventory: (id: string) => void;
   onCreateInventory: (payload: CreateInventoryInput) => Promise<void>;
+  onEmptyInventory?: (id: string) => Promise<void> | void;
 }
 
 export const InventorySidebar: React.FC<InventorySidebarProps> = ({
@@ -26,9 +28,11 @@ export const InventorySidebar: React.FC<InventorySidebarProps> = ({
   isLoading,
   onSelectInventory,
   onCreateInventory,
+  onEmptyInventory,
 }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
+  const [emptyingId, setEmptyingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Form State for Add Inventory
@@ -129,25 +133,60 @@ export const InventorySidebar: React.FC<InventorySidebarProps> = ({
             const isSelected = inv.id === activeInventoryId;
             const endTowerLetter = String.fromCharCode(64 + inv.towersCount);
             const totalBoxes = inv.towersCount * inv.boxesPerTower;
+            const isEmptyingThis = emptyingId === inv.id;
 
             return (
-              <button
+              <div
                 key={inv.id}
-                type="button"
+                role="button"
+                tabIndex={0}
                 onClick={() => onSelectInventory(inv.id)}
-                className={`w-full text-left p-3 rounded-xl border transition-all duration-150 flex flex-col gap-1.5 relative ${
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    onSelectInventory(inv.id);
+                  }
+                }}
+                className={`w-full text-left p-3 rounded-xl border transition-all duration-150 flex flex-col gap-1.5 relative cursor-pointer ${
                   isSelected
                     ? 'bg-cyan-950/40 border-cyan-500 text-cyan-100 shadow-lg shadow-cyan-950/40 ring-1 ring-cyan-500/40'
                     : 'bg-slate-950/60 border-slate-800/80 text-slate-300 hover:border-slate-700 hover:bg-slate-800/40'
                 }`}
               >
-                <div className="flex items-start justify-between gap-1">
+                <div className="flex items-start justify-between gap-1.5">
                   <span className="text-xs font-bold font-mono truncate">{inv.name}</span>
-                  {isSelected && (
-                    <span className="shrink-0 p-0.5 rounded-full bg-cyan-400/20 text-cyan-300">
-                      <CheckCircle2 className="w-3.5 h-3.5 text-cyan-400" />
-                    </span>
-                  )}
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {onEmptyInventory && (
+                      <button
+                        type="button"
+                        disabled={isEmptyingThis}
+                        data-testid={`empty-inventory-btn-${inv.id}`}
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          setEmptyingId(inv.id);
+                          try {
+                            await onEmptyInventory(inv.id);
+                          } finally {
+                            setEmptyingId(null);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-mono font-semibold bg-rose-950/70 hover:bg-rose-900/80 text-rose-300 border border-rose-700/60 transition-colors disabled:opacity-50"
+                        title={`Empty all boxes in ${inv.name}`}
+                      >
+                        {isEmptyingThis ? (
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="w-2.5 h-2.5" />
+                        )}
+                        <span>empty</span>
+                      </button>
+                    )}
+                    {isSelected && (
+                      <span className="shrink-0 p-0.5 rounded-full bg-cyan-400/20 text-cyan-300">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-cyan-400" />
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 <div className="text-[11px] font-mono text-slate-400 flex flex-col gap-0.5">
@@ -162,7 +201,7 @@ export const InventorySidebar: React.FC<InventorySidebarProps> = ({
                     <span className="text-slate-500">{totalBoxes} total boxes</span>
                   </div>
                 </div>
-              </button>
+              </div>
             );
           })
         )}

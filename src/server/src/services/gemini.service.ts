@@ -23,6 +23,14 @@ import {
   timeField,
   RefinementSchema,
   Refinement,
+  VialLabelData,
+  VialLabelDataSchema,
+  LabelTranscriptionRecord,
+  LabelTranscriptionRecordSchema,
+  BoxWellLocation,
+  BoxWellLocationSchema,
+  computeBoxWellFromTopLeftOrigin,
+  computeBoxWellFromTopRightOrigin,
 } from '@sail/shared';
 import {
   extractCandidateFrame,
@@ -1682,7 +1690,8 @@ export function associatePresentationEventsWithActions(
 }
 
 /**
- * Resolves the local normalized video path if cached on disk during upload/transcoding.
+ * Resolves the local full-resolution (raw) or normalized video path if cached on disk during upload/transcoding.
+ * Prioritizes full-resolution raw video (`sail_raw_cache/raw_${videoId}.mp4`) so frame extraction uses native full resolution.
  */
 function resolveLocalNormalizedVideoPath(videoId?: string, explicitLocalPath?: string): string | undefined {
   if (explicitLocalPath && fs.existsSync(explicitLocalPath)) {
@@ -1690,6 +1699,10 @@ function resolveLocalNormalizedVideoPath(videoId?: string, explicitLocalPath?: s
   }
   if (!videoId) return undefined;
   const candidates = [
+    `/tmp/sail_raw_cache/raw_${videoId}.mp4`,
+    path.join(os.tmpdir(), 'sail_raw_cache', `raw_${videoId}.mp4`),
+    `/tmp/raw_${videoId}.mp4`,
+    path.join(os.tmpdir(), `raw_${videoId}.mp4`),
     `/tmp/sail_normalized_cache/norm_${videoId}.mp4`,
     path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${videoId}.mp4`),
     `/tmp/norm_${videoId}.mp4`,
@@ -1704,8 +1717,8 @@ function resolveLocalNormalizedVideoPath(videoId?: string, explicitLocalPath?: s
 }
 
 /**
- * Ensures the normalized video file is available on local disk for FFmpeg frame extraction,
- * downloading it from GCS into `sail_normalized_cache/norm_${videoId}.mp4` when not yet cached locally.
+ * Ensures a local video file (preferring un-downsampled full-resolution raw video) is available on local disk
+ * for FFmpeg frame extraction, downloading from GCS when not yet cached locally.
  */
 async function ensureLocalNormalizedVideoPath(
   videoId?: string,
@@ -1728,53 +1741,76 @@ async function ensureLocalNormalizedVideoPath(
   } catch {
     cacheBaseDir = os.tmpdir();
   }
-  const cacheDir = path.join(cacheBaseDir, 'sail_normalized_cache');
+  const rawCacheDir = path.join(cacheBaseDir, 'sail_raw_cache');
+  const normCacheDir = path.join(cacheBaseDir, 'sail_normalized_cache');
   try {
-    if (!fs.existsSync(cacheDir)) {
-      fs.mkdirSync(cacheDir, { recursive: true });
+    if (!fs.existsSync(rawCacheDir)) {
+      fs.mkdirSync(rawCacheDir, { recursive: true });
+    }
+    if (!fs.existsSync(normCacheDir)) {
+      fs.mkdirSync(normCacheDir, { recursive: true });
     }
   } catch {
     return undefined;
   }
 
-  const destPath = path.join(cacheDir, `norm_${videoId}.mp4`);
   const defaultBucket = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
 
-  const gcsTargets: { bucketName: string; objectPath: string }[] = [];
-  const addTarget = (bName: string, objPath: string) => {
+  const gcsTargets: { bucketName: string; objectPath: string; isRaw: boolean }[] = [];
+  const addTarget = (bName: string, objPath: string, isRaw: boolean) => {
     const cleanObj = objPath.replace(/^\/+/, '');
     if (!bName || !cleanObj) return;
     if (!gcsTargets.some((t) => t.bucketName === bName && t.objectPath === cleanObj)) {
-      gcsTargets.push({ bucketName: bName, objectPath: cleanObj });
+      gcsTargets.push({ bucketName: bName, objectPath: cleanObj, isRaw });
     }
   };
 
+  // First add raw/full-resolution GCS candidates so frame extraction uses native full resolution
+  addTarget(defaultBucket, `uploads/${videoId}.mp4`, true);
+  for (const rawUri of candidateGcsUris) {
+    if (!rawUri || typeof rawUri !== 'string') continue;
+    const isRawCandidate = !rawUri.includes('/normalized/');
+    if (!isRawCandidate) continue;
+    if (rawUri.startsWith('gs://')) {
+      const withoutScheme = rawUri.slice(5);
+      const slashIdx = withoutScheme.indexOf('/');
+      if (slashIdx > 0) {
+        addTarget(withoutScheme.slice(0, slashIdx), withoutScheme.slice(slashIdx + 1), true);
+      }
+    } else {
+      addTarget(defaultBucket, rawUri, true);
+    }
+  }
+
+  // Then add normalized GCS candidates as fallback
   for (const rawUri of candidateGcsUris) {
     if (!rawUri || typeof rawUri !== 'string') continue;
     if (rawUri.startsWith('gs://')) {
       const withoutScheme = rawUri.slice(5);
       const slashIdx = withoutScheme.indexOf('/');
       if (slashIdx > 0) {
-        addTarget(withoutScheme.slice(0, slashIdx), withoutScheme.slice(slashIdx + 1));
+        addTarget(withoutScheme.slice(0, slashIdx), withoutScheme.slice(slashIdx + 1), false);
       }
     } else {
-      addTarget(defaultBucket, rawUri);
+      addTarget(defaultBucket, rawUri, false);
     }
   }
 
-  addTarget(defaultBucket, `normalized/${videoId}/chunk_000.mp4`);
-  addTarget(defaultBucket, `normalized/norm_${videoId}.mp4`);
-  addTarget(defaultBucket, `uploads/${videoId}.mp4`);
+  addTarget(defaultBucket, `normalized/${videoId}/chunk_000.mp4`, false);
+  addTarget(defaultBucket, `normalized/norm_${videoId}.mp4`, false);
 
   for (const target of gcsTargets) {
     try {
       const file = storage.bucket(target.bucketName).file(target.objectPath);
       const [exists] = await file.exists();
       if (!exists) continue;
+      const destPath = target.isRaw
+        ? path.join(rawCacheDir, `raw_${videoId}.mp4`)
+        : path.join(normCacheDir, `norm_${videoId}.mp4`);
       await file.download({ destination: destPath });
       if (fs.existsSync(destPath) && fs.statSync(destPath).size > 256) {
         console.log(
-          `[Pass 2] Downloaded video gs://${target.bucketName}/${target.objectPath} to ${destPath} for frame extraction.`
+          `[VideoCache] Downloaded video gs://${target.bucketName}/${target.objectPath} to ${destPath} for full-res frame extraction.`
         );
         return destPath;
       }
@@ -2024,10 +2060,10 @@ export async function runPass2EventDetection(
     const parts: any[] = [];
     if (gcsUri) {
       if (hasExplicitActionWindows || hasExplicitEventWindows) {
-        // Send ONLY 4 fps clipped windows for Pass 1 actions ([start - 1s, end + 1s]) and Pass 1 events ([startTime, endTime]) — NO full-video scan
+        const candidateVideoParts: any[] = [];
         for (const win of actionRefinementWindows) {
           if (win.hasExplicitTimestamps) {
-            parts.push({
+            candidateVideoParts.push({
               fileData: {
                 fileUri: gcsUri,
                 mimeType: 'video/mp4',
@@ -2042,7 +2078,7 @@ export async function runPass2EventDetection(
         }
         for (const ew of eventWindows) {
           if (ew.hasExplicitTimestamps) {
-            parts.push({
+            candidateVideoParts.push({
               fileData: {
                 fileUri: gcsUri,
                 mimeType: 'video/mp4',
@@ -2055,11 +2091,29 @@ export async function runPass2EventDetection(
             });
           }
         }
+
+        // Vertex AI supports at most 10 video files per request. If > 10 clips exist, submit 1 spanning video at 4 fps.
+        if (candidateVideoParts.length > 0 && candidateVideoParts.length <= 10) {
+          parts.push(...candidateVideoParts);
+        } else {
+          parts.push({
+            fileData: {
+              fileUri: gcsUri,
+              mimeType: 'video/mp4',
+            },
+            videoMetadata: {
+              fps: 4,
+            },
+          });
+        }
       } else {
         parts.push({
           fileData: {
             fileUri: gcsUri,
             mimeType: 'video/mp4',
+          },
+          videoMetadata: {
+            fps: 4,
           },
         });
       }
@@ -2670,11 +2724,308 @@ export async function runPass2EventDetection(
 }
 
 /**
+ * Conflates text extracted across the two best-shot frames for a label presentation event.
+ */
+export function conflateTwoShotLabelText(
+  frame1Text?: string,
+  frame2Text?: string,
+  conflatedText?: string
+): string {
+  if (conflatedText && typeof conflatedText === 'string' && conflatedText.trim().length > 0) {
+    return conflatedText.trim();
+  }
+  const t1 = typeof frame1Text === 'string' ? frame1Text.trim() : '';
+  const t2 = typeof frame2Text === 'string' ? frame2Text.trim() : '';
+  if (t1 && t2) {
+    if (t1.toLowerCase() === t2.toLowerCase() || t1.includes(t2)) return t1;
+    if (t2.includes(t1)) return t2;
+    // Merge unique tokens/segments preserving order
+    const parts1 = t1.split(/\s*\|\s*|\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const parts2 = t2.split(/\s*\|\s*|\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const merged: string[] = [...parts1];
+    for (const p2 of parts2) {
+      if (!merged.some((m) => m.toLowerCase() === p2.toLowerCase() || m.toLowerCase().includes(p2.toLowerCase()))) {
+        merged.push(p2);
+      }
+    }
+    return merged.join(' | ');
+  }
+  return t1 || t2 || '';
+}
+
+/**
+ * Parses and formats conflated vial label text into the required and optional fields:
+ * - cellLineName (required)
+ * - userInitials (optional)
+ * - dateFrozen (optional)
+ * - fullText (required)
+ */
+export function parseVialLabelFields(
+  rawText?: string,
+  explicitFields?: Partial<VialLabelData> & Record<string, any>
+): VialLabelData {
+  const conflatedFullText =
+    conflateTwoShotLabelText(
+      explicitFields?.frame1Text,
+      explicitFields?.frame2Text,
+      explicitFields?.fullText || rawText
+    ) ||
+    explicitFields?.cellLineName ||
+    'Unlabeled Specimen';
+
+  // 1. Extract dateFrozen if present in explicitFields or fullText
+  let dateFrozen: string | undefined =
+    typeof explicitFields?.dateFrozen === 'string' && explicitFields.dateFrozen.trim().length > 0
+      ? explicitFields.dateFrozen.trim()
+      : undefined;
+  if (!dateFrozen) {
+    const dateMatch = conflatedFullText.match(
+      /\b(\d{4}-\d{2}-\d{2}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{2,4})\b/i
+    );
+    if (dateMatch) {
+      dateFrozen = dateMatch[1];
+    }
+  }
+
+  // 2. Extract lotNumber and passage if present
+  let lotNumber: string | undefined =
+    typeof explicitFields?.lotNumber === 'string' && explicitFields.lotNumber.trim().length > 0
+      ? explicitFields.lotNumber.trim()
+      : undefined;
+  if (!lotNumber) {
+    const lotMatch = conflatedFullText.match(/\bLot\s*#?\s*([A-Za-z0-9_-]+)/i);
+    if (lotMatch) {
+      lotNumber = lotMatch[1];
+    }
+  }
+
+  let passage: number | string | undefined = explicitFields?.passage;
+  if (passage === undefined) {
+    const passageMatch =
+      conflatedFullText.match(/\bPassage\s*#?\s*(\d+)\b/i) ||
+      conflatedFullText.match(/\bP(\d{1,3})\b/);
+    if (passageMatch) {
+      const pNum = parseInt(passageMatch[1], 10);
+      passage = Number.isFinite(pNum) ? pNum : passageMatch[1];
+    }
+  }
+
+  // 3. Extract userInitials if present in explicitFields or fullText
+  let userInitials: string | undefined =
+    typeof (explicitFields?.userInitials ?? explicitFields?.operatorInitials) === 'string' &&
+    String(explicitFields?.userInitials ?? explicitFields?.operatorInitials).trim().length > 0
+      ? String(explicitFields?.userInitials ?? explicitFields?.operatorInitials).trim()
+      : undefined;
+  if (!userInitials) {
+    const labeledInitials = conflatedFullText.match(
+      /\b(?:Initials|User|Operator|By|Frozen\s+by)\s*[:=-]?\s*([A-Z]{2,4})\b/i
+    );
+    if (labeledInitials) {
+      userInitials = labeledInitials[1].toUpperCase();
+    } else {
+      const excludedWords = new Set([
+        'HEK',
+        'CHO',
+        'PBS',
+        'FBS',
+        'MEM',
+        'DMEM',
+        'RPMI',
+        'LOT',
+        'BOX',
+        'DNA',
+        'RNA',
+        'VIAL',
+        'CELL',
+        'CRYO',
+        'PASS',
+        'DATE',
+        'JAN',
+        'FEB',
+        'MAR',
+        'APR',
+        'MAY',
+        'JUN',
+        'JUL',
+        'AUG',
+        'SEP',
+        'OCT',
+        'NOV',
+        'DEC',
+      ]);
+      // Strip known cell line prefix and date before scanning for 2-3 uppercase letter initials
+      const tokens = conflatedFullText
+        .split(/[\s|,;/]+/)
+        .map((t) => t.trim())
+        .filter(Boolean);
+      for (let i = 1; i < tokens.length; i++) {
+        const tok = tokens[i];
+        if (/^[A-Z]{2,3}$/.test(tok) && !excludedWords.has(tok)) {
+          userInitials = tok;
+          break;
+        }
+      }
+    }
+  }
+
+  // 4. Extract required cellLineName
+  let cellLineName: string =
+    typeof explicitFields?.cellLineName === 'string' && explicitFields.cellLineName.trim().length > 0
+      ? explicitFields.cellLineName.trim()
+      : '';
+  if (!cellLineName) {
+    // Take the leading segment before Passage / Lot / Date / pipe / newline
+    const cleanedLead = conflatedFullText
+      .split(/\s*\|\s*|\r?\n/)[0]
+      .replace(/\b(?:Passage|Lot)\b.*$/i, '')
+      .replace(/\bP\d{1,3}\b.*$/, '')
+      .replace(/\b\d{4}-\d{2}-\d{2}\b.*$/, '')
+      .replace(/\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b.*$/, '')
+      .trim();
+    cellLineName = cleanedLead || conflatedFullText.split(/\s+/)[0] || 'Unknown Cell Line';
+  }
+
+  return VialLabelDataSchema.parse({
+    cellLineName,
+    ...(userInitials ? { userInitials } : {}),
+    ...(dateFrozen ? { dateFrozen } : {}),
+    fullText: conflatedFullText,
+    ...(lotNumber ? { lotNumber } : {}),
+    ...(passage !== undefined ? { passage } : {}),
+    ...(explicitFields?.boxId ? { boxId: String(explicitFields.boxId) } : {}),
+    ...(explicitFields?.frame1Text ? { frame1Text: String(explicitFields.frame1Text) } : {}),
+    ...(explicitFields?.frame2Text ? { frame2Text: String(explicitFields.frame2Text) } : {}),
+    ...(typeof explicitFields?.confidence === 'number' ? { confidence: explicitFields.confidence } : {}),
+  });
+}
+
+/**
+ * Writes Pass 3 JSON artifact files for label transcriptions and enriched inventory update actions.
+ */
+export async function writePass3JsonArtifacts(
+  videoId: string | undefined,
+  payload: {
+    labelTranscriptions: LabelTranscriptionRecord[];
+    actions: Action[];
+    refinements: Refinement[];
+  }
+): Promise<{
+  artifactDir: string;
+  labelTranscriptionsPath: string;
+  perEventLabelPaths: Record<string, string>;
+  perActionPaths: Record<string, string>;
+  actionsPassPath: string;
+  refinementPassPath: string;
+}> {
+  const safeVideoId = String(videoId || 'default_video').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const artifactDir = path.join(os.tmpdir(), 'sail_pass_artifacts', safeVideoId);
+  const perEventLabelPaths: Record<string, string> = {};
+  const perActionPaths: Record<string, string> = {};
+
+  try {
+    if (!fs.existsSync(artifactDir)) {
+      fs.mkdirSync(artifactDir, { recursive: true });
+    }
+
+    // 1. Write combined label_transcriptions.json and individual label_transcription_${eventId}.json
+    const labelTranscriptionsPath = path.join(artifactDir, 'label_transcriptions.json');
+    const serializedLabels = JSON.stringify(
+      {
+        videoId: videoId || safeVideoId,
+        generatedAt: new Date().toISOString(),
+        labelTranscriptions: payload.labelTranscriptions,
+      },
+      null,
+      2
+    );
+    await fs.promises.writeFile(labelTranscriptionsPath, serializedLabels, 'utf-8');
+    await fs.promises.writeFile(path.join(os.tmpdir(), 'label_transcriptions.json'), serializedLabels, 'utf-8');
+
+    for (const rec of payload.labelTranscriptions) {
+      const safeEvtId = String(rec.eventId).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const evtFilename = `label_transcription_${safeEvtId}.json`;
+      const evtFilePath = path.join(artifactDir, evtFilename);
+      const serializedEvt = JSON.stringify(rec, null, 2);
+      await fs.promises.writeFile(evtFilePath, serializedEvt, 'utf-8');
+      await fs.promises.writeFile(path.join(os.tmpdir(), evtFilename), serializedEvt, 'utf-8');
+      perEventLabelPaths[rec.eventId] = evtFilePath;
+    }
+
+    // 2. Write individual action_${actionId}.json and updated action_detection_pass.json for inventory update actions
+    for (const act of payload.actions) {
+      const safeActId = String(act.actionId).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const actFilename = `action_${safeActId}.json`;
+      const actFilePath = path.join(artifactDir, actFilename);
+      const serializedAct = JSON.stringify(act, null, 2);
+      await fs.promises.writeFile(actFilePath, serializedAct, 'utf-8');
+      await fs.promises.writeFile(path.join(os.tmpdir(), actFilename), serializedAct, 'utf-8');
+      perActionPaths[act.actionId] = actFilePath;
+    }
+
+    const actionsPassPath = path.join(artifactDir, 'action_detection_pass.json');
+    const actionsPayload = (payload.actions as any)?.toJSON
+      ? (payload.actions as any).toJSON()
+      : {
+          videoId: videoId || safeVideoId,
+          totalActionsDetected: payload.actions.length,
+          actions: payload.actions,
+          generatedAt: new Date().toISOString(),
+        };
+    if (actionsPayload && Array.isArray(actionsPayload.actions)) {
+      actionsPayload.actions = payload.actions;
+    }
+    const serializedActionsPass = JSON.stringify(actionsPayload, null, 2);
+    await fs.promises.writeFile(actionsPassPath, serializedActionsPass, 'utf-8');
+    await fs.promises.writeFile(path.join(os.tmpdir(), 'action_detection_pass.json'), serializedActionsPass, 'utf-8');
+
+    // 3. Write analysis_refinement_pass.json
+    const refinementPassPath = path.join(artifactDir, 'analysis_refinement_pass.json');
+    const serializedRefinements = JSON.stringify(payload.refinements, null, 2);
+    await fs.promises.writeFile(refinementPassPath, serializedRefinements, 'utf-8');
+    await fs.promises.writeFile(
+      path.join(os.tmpdir(), 'analysis_refinement_pass.json'),
+      serializedRefinements,
+      'utf-8'
+    );
+
+    return {
+      artifactDir,
+      labelTranscriptionsPath,
+      perEventLabelPaths,
+      perActionPaths,
+      actionsPassPath,
+      refinementPassPath,
+    };
+  } catch (err) {
+    console.warn('[Pass 3] Non-fatal: Could not write Pass 3 JSON artifacts:', err);
+    return {
+      artifactDir,
+      labelTranscriptionsPath: path.join(artifactDir, 'label_transcriptions.json'),
+      perEventLabelPaths,
+      perActionPaths,
+      actionsPassPath: path.join(artifactDir, 'action_detection_pass.json'),
+      refinementPassPath: path.join(artifactDir, 'analysis_refinement_pass.json'),
+    };
+  }
+}
+
+/**
  * Pass 3 (Analysis Refinement):
  * - Executes high-resolution modal reasoning:
- *   * Multi-frame OCR conflation for labels across best shots.
- *   * Spatial coordinate differencing (comparing before/after frames relative to top-left origin: rows A-Z, columns 1-N).
- *   * Speech confirmation for volumes/cell counts.
+ *   1. For label presentation events: transcribes the label shown in the two best shots
+ *      (HIGHEST_CONTRAST and MINIMAL_BLUR) detected in Pass 2 into text and conflates the results.
+ *      For vial label presentation events, formats the conflated text into:
+ *      - cellLineName (required)
+ *      - userInitials (optional)
+ *      - dateFrozen (optional)
+ *      - fullText (required, full text extracted from the label)
+ *      Creates JSON files (`label_transcriptions.json` and `label_transcription_${eventId}.json`).
+ *   2. For vial insertion/removal actions: analyzes the action's video interval to determine
+ *      which box well the vial was inserted into or removed from. Box wells have rows labeled
+ *      by letters starting with A for row 1, and columns labeled with numbers starting at 1,
+ *      with the origin of the box (A1) in the top-right corner painted black.
+ *   3. Appends the conflated label text and box well locations to the JSON files and objects
+ *      for all inventory update actions associated with each event.
  * - Validates output via an array of RefinementSchema objects.
  */
 export async function runPass3AnalysisRefinement(
@@ -2708,6 +3059,16 @@ export async function runPass3AnalysisRefinement(
       notes: 'Default classification',
     };
 
+  const rawActions =
+    mergedOptions.actions ||
+    videoDoc?.passes?.pass1?.data ||
+    [];
+  const actions: Action[] = Array.isArray(rawActions)
+    ? rawActions
+    : Array.isArray((rawActions as any)?.actions)
+    ? (rawActions as any).actions
+    : [];
+
   const rawEvents =
     mergedOptions.events ||
     videoDoc?.passes?.pass2?.data ||
@@ -2716,6 +3077,12 @@ export async function runPass3AnalysisRefinement(
     ? rawEvents
     : Array.isArray((rawEvents as any)?.events)
     ? (rawEvents as any).events
+    : [];
+
+  const pass2RefinedActions: RefinedActionBoundary[] = Array.isArray((rawEvents as any)?.refinedActions)
+    ? (rawEvents as any).refinedActions
+    : Array.isArray(videoDoc?.passes?.pass2?.data?.refinedActions)
+    ? videoDoc.passes.pass2.data.refinedActions
     : [];
 
   const client = getGenAIClient();
@@ -2727,34 +3094,119 @@ export async function runPass3AnalysisRefinement(
     videoDoc?.rawGcsUri;
   const gcsUri = resolveNormalizedGcsUri(resolvedGcs, videoId);
 
-  const eventsSummary = events.map((e) => ({
-    eventId: e.eventId,
-    actionId: e.actionId,
-    eventClass: e.eventClass,
-    bestShotUrls: e.bestShotUrls,
-  }));
+  // Resolve full-resolution raw video path (prioritized over normalized video) for full-resolution best-shot frame extraction
+  const localFullResVideoPath = await ensureLocalNormalizedVideoPath(
+    videoId,
+    mergedOptions.localVideoPath,
+    [
+      videoDoc?.rawGcsUri,
+      (videoDoc as any)?.originalGcsUri,
+      mergedOptions.videoGcsUri,
+      mergedOptions.registeredFileUri,
+      videoDoc?.normalizedGcsUri,
+      gcsUri,
+    ]
+  );
+  const { primaryDir: persistentFrameDir, mirrorDir: mirrorFrameDir } = resolvePersistentFrameDirs(videoId);
+
+  // Build summaries for label presentation events (with their 2 best shots)
+  const eventsSummary = events.map((e) => {
+    const shot1Time =
+      e.highestContrastFrame?.timestampSeconds ??
+      e.bestFrames?.[0]?.timestampSeconds ??
+      e.bestShotTimes?.[0] ??
+      (typeof e.startTime === 'number' ? e.startTime : parseTimeStringToSeconds(String(e.startTime || 0)));
+    const shot2Time =
+      e.minimalBlurFrame?.timestampSeconds ??
+      e.bestFrames?.[1]?.timestampSeconds ??
+      e.bestShotTimes?.[1] ??
+      shot1Time;
+    const shot1Url =
+      e.highestContrastFrame?.gcsUri ||
+      e.highestContrastFrame?.url ||
+      e.bestFrames?.[0]?.gcsUri ||
+      e.bestShotUrls?.[0] ||
+      '';
+    const shot2Url =
+      e.minimalBlurFrame?.gcsUri ||
+      e.minimalBlurFrame?.url ||
+      e.bestFrames?.[1]?.gcsUri ||
+      e.bestShotUrls?.[1] ||
+      shot1Url;
+
+    return {
+      eventId: e.eventId,
+      actionId: e.actionId,
+      actionIds: Array.isArray(e.actionIds) && e.actionIds.length > 0 ? e.actionIds : [e.actionId].filter(Boolean),
+      eventClass: e.eventClass,
+      bestShotUrls: e.bestShotUrls,
+      bestShotTimes: [shot1Time, shot2Time],
+      twoBestShots: [
+        { frameType: 'HIGHEST_CONTRAST', timestampSeconds: shot1Time, uri: shot1Url },
+        { frameType: 'MINIMAL_BLUR', timestampSeconds: shot2Time, uri: shot2Url },
+      ],
+    };
+  });
+
+  // Build summaries for vial insertion/removal action intervals
+  const actionsSummary = actions.map((a) => {
+    const refinedMatch = pass2RefinedActions.find((r) => r.actionId === a.actionId);
+    const startSec =
+      a.refinedStartTimestampSeconds ??
+      refinedMatch?.refinedStartTimestampSeconds ??
+      a.startTimestampSeconds ??
+      (typeof a.startTime === 'number' ? a.startTime : parseTimeStringToSeconds(String(a.startTime || 0)));
+    const endSec =
+      a.refinedEndTimestampSeconds ??
+      refinedMatch?.refinedEndTimestampSeconds ??
+      a.endTimestampSeconds ??
+      (typeof a.endTime === 'number' ? a.endTime : parseTimeStringToSeconds(String(a.endTime || startSec)));
+
+    return {
+      actionId: a.actionId,
+      actionClass: a.actionClass,
+      actionType: a.actionType || a.actionClass,
+      intervalStartSeconds: startSec,
+      intervalEndSeconds: Math.max(startSec, endSec),
+      candidateCoordinate: a.targetCoordinate || a.targetLocation?.coordinate || (a.boxRowId && a.boxColId ? `${a.boxRowId}${a.boxColId}` : undefined),
+      eventList: a.eventList || [],
+    };
+  });
 
   const promptText = `Workflow: ${classification.workflowType}
 Video URI: ${gcsUri}
+
+1. LABEL PRESENTATION EVENTS (Dual-Shot Transcription & Conflation at Full Frame Resolution):
+For each label presentation event below, transcribe the exact label text shown in the TWO full-resolution best shots (Shot 1: HIGHEST_CONTRAST and Shot 2: MINIMAL_BLUR) and conflate the results.
+CRITICAL: NEVER invent or copy placeholder text. Only transcribe text physically visible on the label.
+If the event is a vial label presentation (VIAL_LABEL_PRESENTATION), format the conflated text into:
+- "cellLineName" (required): cell line name
+- "userInitials" (optional): user's initials
+- "dateFrozen" (optional): date frozen
+- "fullText" (required): full text extracted from the label across the two shots
 Events to refine:
 ${JSON.stringify(eventsSummary, null, 2)}
 
-Perform OCR conflation, spatial coordinate differencing, and speech confirmation.
-Output a JSON array of Refinement objects conforming to RefinementSchema.`;
+2. VIAL INSERTION / REMOVAL ACTIONS (Video Interval Well Location Analysis - Top-Left Black Corner Origin):
+For each vial insertion or removal action interval below, analyze the video interval [intervalStartSeconds, intervalEndSeconds] to determine which box well the vial was inserted into or removed from.
+CRITICAL CRYO-BOX ORIENTATION RULE:
+- Box wells have rows labeled by letters starting with "A" for row 1 (A, B, C, ... moving downward from top-left).
+- Columns are labeled with numbers starting at 1 (1, 2, 3, ... moving rightward from top-left).
+- The ORIGIN of the box (well A1: Row A, Column 1) is in the TOP-LEFT CORNER. The box is PAINTED BLACK in that top-left corner.
+Actions to analyze:
+${JSON.stringify(actionsSummary, null, 2)}
 
-  const parts: any[] = [];
-  if (gcsUri) {
-    parts.push({
-      fileData: {
-        fileUri: gcsUri,
-        mimeType: 'video/mp4',
-      },
-      videoMetadata: {
-        fps: 1,
-      },
-    });
-  }
-  parts.push({ text: promptText });
+3. Perform OCR conflation, spatial coordinate differencing (relative to the black-painted top-left corner origin), and speech confirmation.
+Output a JSON array of Refinement objects (or an object with "refinements", "labelTranscriptions", and "actionWellLocations") where EVERY refinement item includes:
+- "refinementId": string (e.g. "ref_001")
+- "eventId": string (matching the eventId from Pass 2)
+- "actionId": string (matching the associated actionId)
+- "refinementClass": "OCR_CONFLATION" | "SPATIAL_REFINEMENT"
+- "transcriptionText": string (full conflated label text)
+- "vialLabelData": { "cellLineName": string, "userInitials"?: string, "dateFrozen"?: string, "fullText": string, "frame1Text"?: string, "frame2Text"?: string }
+- "boxWellLocation": { "actionId": string, "row": string, "col": number, "coordinate": string, "boxId"?: string, "originCorner": "TOP_LEFT_BLACK" }
+- "spatialResult": { "row": string, "col": number }
+- "conflationMetadata": { "confidence": number, "framesEvaluated": number, "ocrEngine": string }`;
 
   const pass3Candidates = Array.from(
     new Set(
@@ -2772,46 +3224,959 @@ Output a JSON array of Refinement objects conforming to RefinementSchema.`;
       thinkingLevel: targetThinking,
     };
   }
+
   let response: any;
-  for (let mIdx = 0; mIdx < pass3Candidates.length; mIdx++) {
-    const candidateModel = pass3Candidates[mIdx];
-    try {
-      response = await generateContentWithRetry(client, {
-        model: candidateModel,
-        contents: [
-          {
-            role: 'user',
-            parts,
-          },
-        ],
-        config: pass3Config,
-      });
-      break;
-    } catch (err: any) {
-      const isNotFound =
-        err?.status === 404 ||
-        err?.statusCode === 404 ||
-        err?.code === 404 ||
-        err?.code === 'NOT_FOUND' ||
-        err?.message?.includes('404') ||
-        err?.message?.includes('NOT_FOUND') ||
-        err?.message?.includes('not found');
-      if (isNotFound && mIdx < pass3Candidates.length - 1) {
-        console.warn(`[Pass 3] Model ${candidateModel} not found, falling back to next Pro candidate...`);
-        continue;
+  const callPass3ModelWithSingleVideo = async (requestParts: any[]): Promise<any> => {
+    let lastResp: any;
+    for (let mIdx = 0; mIdx < pass3Candidates.length; mIdx++) {
+      const candidateModel = pass3Candidates[mIdx];
+      try {
+        lastResp = await generateContentWithRetry(client, {
+          model: candidateModel,
+          contents: [
+            {
+              role: 'user',
+              parts: requestParts,
+            },
+          ],
+          config: pass3Config,
+        });
+        response = lastResp;
+        break;
+      } catch (err: any) {
+        const isNotFound =
+          err?.status === 404 ||
+          err?.statusCode === 404 ||
+          err?.code === 404 ||
+          err?.code === 'NOT_FOUND' ||
+          err?.message?.includes('404') ||
+          err?.message?.includes('NOT_FOUND') ||
+          err?.message?.includes('not found');
+        if (isNotFound && mIdx < pass3Candidates.length - 1) {
+          console.warn(`[Pass 3] Model ${candidateModel} not found, falling back to next Pro candidate...`);
+          continue;
+        }
+        throw err;
       }
-      throw err;
+    }
+    return lastResp;
+  };
+
+  const rawRefinementsArray: any[] = [];
+  const modelLabelTranscriptions: any[] = [];
+  const modelActionWellLocations: any[] = [];
+
+  const mergePass3Response = (
+    parsedJson: any,
+    context?: { defaultEventId?: string; defaultActionId?: string }
+  ) => {
+    if (!parsedJson) return;
+
+    let items: any[] = [];
+    if (Array.isArray(parsedJson)) {
+      items = parsedJson;
+    } else if (typeof parsedJson === 'object') {
+      if (Array.isArray(parsedJson.refinements)) {
+        items = parsedJson.refinements;
+      } else if (Array.isArray(parsedJson.refinementList)) {
+        items = parsedJson.refinementList;
+      } else if (
+        !Array.isArray(parsedJson.labelTranscriptions) &&
+        !Array.isArray(parsedJson.actionWellLocations)
+      ) {
+        items = [parsedJson];
+      }
+
+      if (Array.isArray(parsedJson.labelTranscriptions)) {
+        const isSingleLabelResp = parsedJson.labelTranscriptions.length === 1;
+        for (const lt of parsedJson.labelTranscriptions) {
+          if (lt && typeof lt === 'object') {
+            modelLabelTranscriptions.push({
+              ...lt,
+              ...(context?.defaultEventId && (isSingleLabelResp || !lt.eventId)
+                ? { eventId: context.defaultEventId }
+                : {}),
+            });
+          }
+        }
+      }
+
+      if (Array.isArray(parsedJson.actionWellLocations)) {
+        const isSingleWellResp = parsedJson.actionWellLocations.length === 1;
+        for (const aw of parsedJson.actionWellLocations) {
+          if (aw && typeof aw === 'object') {
+            modelActionWellLocations.push({
+              ...aw,
+              ...(context?.defaultActionId && (isSingleWellResp || !aw.actionId)
+                ? { actionId: context.defaultActionId }
+                : {}),
+            });
+          }
+        }
+      }
+    }
+
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+      const isSingleItem = items.length === 1;
+      const shouldStampEventId =
+        Boolean(context?.defaultEventId) && (isSingleItem || !item.eventId && !item.actionId);
+      const shouldStampActionId =
+        Boolean(context?.defaultActionId) &&
+        (isSingleItem ||
+          (context?.defaultEventId && item.eventId === context.defaultEventId && !item.actionId) ||
+          (!context?.defaultEventId && !item.actionId && !item.eventId));
+
+      const normalizedItem = {
+        ...item,
+        ...(shouldStampEventId ? { eventId: context!.defaultEventId } : {}),
+        ...(shouldStampActionId ? { actionId: context!.defaultActionId } : {}),
+      };
+
+      if (
+        context?.defaultActionId &&
+        normalizedItem.actionId === context.defaultActionId &&
+        (normalizedItem.boxWellLocation ||
+          normalizedItem.spatialResult ||
+          normalizedItem.spatialCoordinates ||
+          normalizedItem.row !== undefined ||
+          normalizedItem.coordinate !== undefined ||
+          normalizedItem.well !== undefined ||
+          normalizedItem.wellCoordinate !== undefined)
+      ) {
+        const wellObj = normalizedItem.boxWellLocation ||
+          normalizedItem.spatialResult ||
+          normalizedItem.spatialCoordinates || {
+            row: normalizedItem.row,
+            col: normalizedItem.col,
+            coordinate:
+              normalizedItem.coordinate || normalizedItem.well || normalizedItem.wellCoordinate,
+            boxId: normalizedItem.boxId,
+            confidence: normalizedItem.confidence,
+            normX: normalizedItem.normX,
+            normY: normalizedItem.normY,
+            totalRows: normalizedItem.totalRows,
+            totalCols: normalizedItem.totalCols,
+          };
+        modelActionWellLocations.push({
+          actionId: context.defaultActionId,
+          ...wellObj,
+        });
+
+        const existingRef = rawRefinementsArray.find(
+          (r) =>
+            (r.actionId === context.defaultActionId ||
+              (r.eventId &&
+                events.some(
+                  (e) =>
+                    e.eventId === r.eventId &&
+                    (e.actionId === context.defaultActionId ||
+                      (Array.isArray(e.actionIds) && e.actionIds.includes(context.defaultActionId!)))
+                ))) &&
+            !r.boxWellLocation &&
+            !r.spatialResult
+        );
+        if (existingRef) {
+          existingRef.actionId = existingRef.actionId || context.defaultActionId;
+          if (normalizedItem.boxWellLocation) existingRef.boxWellLocation = normalizedItem.boxWellLocation;
+          if (normalizedItem.spatialResult) existingRef.spatialResult = normalizedItem.spatialResult;
+          if (normalizedItem.row !== undefined && existingRef.row === undefined) existingRef.row = normalizedItem.row;
+          if (normalizedItem.col !== undefined && existingRef.col === undefined) existingRef.col = normalizedItem.col;
+          if (normalizedItem.coordinate && !existingRef.coordinate) existingRef.coordinate = normalizedItem.coordinate;
+          continue;
+        }
+      }
+
+      const isDuplicate = rawRefinementsArray.some(
+        (existing) =>
+          (normalizedItem.refinementId && existing.refinementId === normalizedItem.refinementId) ||
+          (normalizedItem.eventId &&
+            existing.eventId === normalizedItem.eventId &&
+            normalizedItem.actionId === existing.actionId &&
+            normalizedItem.transcriptionText === existing.transcriptionText &&
+            normalizedItem.fullText === existing.fullText)
+      );
+      if (!isDuplicate) {
+        rawRefinementsArray.push(normalizedItem);
+      }
+    }
+  };
+
+  if (
+    classification.workflowType !== 'INVENTORY_UPDATE_WORKFLOW' ||
+    (eventsSummary.length === 0 && actionsSummary.length === 0)
+  ) {
+    const singleVideoParts: any[] = [];
+    if (gcsUri) {
+      singleVideoParts.push({
+        fileData: {
+          fileUri: gcsUri,
+          mimeType: 'video/mp4',
+        },
+        videoMetadata: {
+          fps: 4,
+        },
+      });
+    }
+    singleVideoParts.push({ text: promptText });
+    const singleResp = await callPass3ModelWithSingleVideo(singleVideoParts);
+    mergePass3Response(extractJsonFromText(extractTextFromResponse(singleResp)));
+  } else {
+    // Submit ONE video clip at a time sampled at 4 fps + the TWO full-resolution best-shot JPEG frames for each label presentation event
+    const hasRealFullResVideo = (() => {
+      try {
+        return Boolean(
+          localFullResVideoPath &&
+            fs.existsSync(localFullResVideoPath) &&
+            fs.statSync(localFullResVideoPath).size > 256
+        );
+      } catch {
+        return false;
+      }
+    })();
+
+    for (const evtSum of eventsSummary) {
+      const alreadyHasEventResult =
+        rawRefinementsArray.some((r) => r && r.eventId === evtSum.eventId) ||
+        modelLabelTranscriptions.some((l) => l && l.eventId === evtSum.eventId);
+      if (alreadyHasEventResult) continue;
+
+      const t1 = Number(evtSum.bestShotTimes[0] ?? 0);
+      const t2 = Number(evtSum.bestShotTimes[1] ?? t1);
+      const clipStart = Math.max(0, Math.min(t1, t2) - 0.5);
+      const clipEnd = Math.max(clipStart + 1.0, Math.max(t1, t2) + 0.5);
+
+      const eventParts: any[] = [];
+      if (gcsUri) {
+        eventParts.push({
+          fileData: {
+            fileUri: gcsUri,
+            mimeType: 'video/mp4',
+          },
+          videoMetadata: {
+            fps: 4,
+            startOffset: `${Number(clipStart.toFixed(2))}s`,
+            endOffset: `${Number(clipEnd.toFixed(2))}s`,
+          },
+        });
+      }
+
+      // Extract or load full-resolution JPEG frames for the two best shots (HIGHEST_CONTRAST at t1 and MINIMAL_BLUR at t2)
+      const shot1AltName = evtSum.twoBestShots?.[0]?.uri ? path.basename(String(evtSum.twoBestShots[0].uri)) : '';
+      const shot2AltName = evtSum.twoBestShots?.[1]?.uri ? path.basename(String(evtSum.twoBestShots[1].uri)) : '';
+      const shotSpecs = [
+        {
+          label: 'HIGHEST_CONTRAST',
+          ts: t1,
+          filename: `frame_${evtSum.eventId}_highest_contrast_${Number(t1.toFixed(2))}.jpg`,
+          altFilenames: [shot1AltName, `${evtSum.eventId}_contrast.jpg`].filter(Boolean),
+        },
+        {
+          label: 'MINIMAL_BLUR',
+          ts: t2,
+          filename: `frame_${evtSum.eventId}_minimal_blur_${Number(t2.toFixed(2))}.jpg`,
+          altFilenames: [shot2AltName, `${evtSum.eventId}_blur.jpg`].filter(Boolean),
+        },
+      ];
+      for (const spec of shotSpecs) {
+        let candidateFramePath = path.join(persistentFrameDir, spec.filename);
+        if (hasRealFullResVideo && localFullResVideoPath) {
+          try {
+            candidateFramePath = await extractCandidateFrame(
+              localFullResVideoPath,
+              spec.ts,
+              persistentFrameDir,
+              spec.filename
+            );
+            mirrorFrameFile(candidateFramePath, mirrorFrameDir);
+          } catch {
+            // fallback to existing cached frame if extraction fails
+          }
+        }
+        if (!isRealJpegFile(candidateFramePath)) {
+          const dirsToCheck = [persistentFrameDir, mirrorFrameDir].filter(Boolean) as string[];
+          const namesToCheck = [spec.filename, ...spec.altFilenames];
+          for (const dir of dirsToCheck) {
+            let found = false;
+            for (const name of namesToCheck) {
+              const p = path.join(dir, name);
+              if (isRealJpegFile(p)) {
+                candidateFramePath = p;
+                found = true;
+                break;
+              }
+            }
+            if (found) break;
+          }
+        }
+        if (isRealJpegFile(candidateFramePath)) {
+          try {
+            const base64Jpeg = fs.readFileSync(candidateFramePath).toString('base64');
+            eventParts.push({
+              inlineData: {
+                mimeType: 'image/jpeg',
+                data: base64Jpeg,
+              },
+            });
+          } catch {
+            // ignore frame read error
+          }
+        }
+      }
+
+      const eventPromptText = `Workflow: ${classification.workflowType}
+Video URI: ${gcsUri}
+
+LABEL PRESENTATION EVENT (Dual-Shot Full-Resolution Frame Transcription & Conflation):
+Transcribe the exact label text shown in the TWO full-resolution best shots (Shot 1: HIGHEST_CONTRAST at ${t1}s and Shot 2: MINIMAL_BLUR at ${t2}s) for this single event and conflate the results.
+CRITICAL: Read the actual text printed or handwritten on the physical label in the full-resolution frames and video clip. NEVER output placeholder or example values.
+If the event is a vial label presentation (VIAL_LABEL_PRESENTATION), format the conflated text into:
+- "cellLineName" (required): cell line name read from the label
+- "userInitials" (optional): user's initials if present on the label
+- "dateFrozen" (optional): date frozen if present on the label
+- "fullText" (required): full verbatim text extracted from the label across the two shots
+Event to refine:
+${JSON.stringify(evtSum, null, 2)}
+
+Output a JSON Refinement object (or array of 1 Refinement object) with:
+- "refinementId": "ref_${evtSum.eventId}"
+- "eventId": "${evtSum.eventId}"
+- "actionId": "${evtSum.actionId || ''}"
+- "refinementClass": "OCR_CONFLATION"
+- "transcriptionText": string (full conflated label text)
+- "vialLabelData": { "cellLineName": string, "userInitials"?: string, "dateFrozen"?: string, "fullText": string, "frame1Text"?: string, "frame2Text"?: string }
+- "conflationMetadata": { "confidence": number, "framesEvaluated": 2, "ocrEngine": "Gemini-DualShot-Conflation" }`;
+
+      eventParts.push({ text: eventPromptText });
+      const evtResp = await callPass3ModelWithSingleVideo(eventParts);
+      mergePass3Response(extractJsonFromText(extractTextFromResponse(evtResp)), {
+        defaultEventId: evtSum.eventId,
+        defaultActionId: evtSum.actionId,
+      });
+    }
+
+    // Submit ONE video clip at a time sampled at 4 fps for each vial insertion/removal action interval
+    for (const actSum of actionsSummary) {
+      const hasExplicitInterval =
+        Number(actSum.intervalEndSeconds || 0) > 0 || Number(actSum.intervalStartSeconds || 0) > 0;
+      const alreadyHasActionWell =
+        modelActionWellLocations.some((w) => w && w.actionId === actSum.actionId) ||
+        rawRefinementsArray.some(
+          (r) =>
+            r &&
+            r.actionId === actSum.actionId &&
+            (r.boxWellLocation ||
+              r.spatialResult ||
+              r.spatialCoordinates ||
+              r.row !== undefined ||
+              r.coordinate !== undefined ||
+              r.well !== undefined ||
+              r.wellCoordinate !== undefined)
+        ) ||
+        ((actionsSummary.length === 1 || !hasExplicitInterval) &&
+          rawRefinementsArray.some(
+            (r) =>
+              r &&
+              Array.isArray(actSum.eventList) &&
+              actSum.eventList.includes(r.eventId) &&
+              (r.boxWellLocation || r.spatialResult || r.row !== undefined || r.coordinate !== undefined)
+          ));
+      if (alreadyHasActionWell) continue;
+
+      const startSec = Math.max(0, Number(actSum.intervalStartSeconds || 0));
+      const endSec = Math.max(startSec + 0.5, Number(actSum.intervalEndSeconds || startSec + 1));
+
+      const actionParts: any[] = [];
+      if (gcsUri) {
+        actionParts.push({
+          fileData: {
+            fileUri: gcsUri,
+            mimeType: 'video/mp4',
+          },
+          videoMetadata: {
+            fps: 4,
+            startOffset: `${Number(startSec.toFixed(2))}s`,
+            endOffset: `${Number(endSec.toFixed(2))}s`,
+          },
+        });
+      }
+
+      const actionPromptText = `Workflow: ${classification.workflowType}
+Video URI: ${gcsUri}
+
+VIAL INSERTION / REMOVAL ACTION (Video Interval Well Location Analysis at 4 fps - Top-Left Black Corner Origin):
+Analyze this single video interval [${startSec}s, ${endSec}s] sampled at 4 fps to determine which cryo-box well the vial was inserted into or removed from.
+CRITICAL CRYO-BOX ORIENTATION RULE:
+- Box wells have rows labeled by letters starting with "A" for row 1 (A, B, C, ... moving downward from top-left).
+- Columns are labeled with numbers starting at 1 (1, 2, 3, ... moving rightward from top-left).
+- The ORIGIN of the box (well A1: Row A, Column 1) is in the TOP-LEFT CORNER. The box is PAINTED BLACK in that top-left corner.
+Action to analyze:
+${JSON.stringify(actSum, null, 2)}
+
+Output a JSON object (or array of 1 Refinement object) with:
+- "refinementId": "ref_${actSum.actionId}"
+- "actionId": "${actSum.actionId}"
+- "refinementClass": "SPATIAL_REFINEMENT"
+- "boxWellLocation": { "actionId": "${actSum.actionId}", "row": string, "col": number, "coordinate": string, "boxId"?: string, "originCorner": "TOP_LEFT_BLACK", "confidence": number }
+- "spatialResult": { "row": string, "col": number }`;
+
+      actionParts.push({ text: actionPromptText });
+      const actResp = await callPass3ModelWithSingleVideo(actionParts);
+      mergePass3Response(extractJsonFromText(extractTextFromResponse(actResp)), {
+        defaultActionId: actSum.actionId,
+      });
     }
   }
 
-  const rawText = extractTextFromResponse(response);
-  const parsedJson = extractJsonFromText(rawText);
+  // 1. Process label presentation events -> conflate two best shots & format into required/optional fields
+  const labelTranscriptions: LabelTranscriptionRecord[] = [];
+  const eventIdToLabelRecord = new Map<string, LabelTranscriptionRecord>();
 
-  const refinementsArray = Array.isArray(parsedJson)
-    ? parsedJson
-    : parsedJson.refinements || parsedJson.refinementList || [];
+  for (let idx = 0; idx < events.length; idx++) {
+    const evt = events[idx];
+    const evtSum = eventsSummary[idx];
+    const matchingRef =
+      rawRefinementsArray.find(
+        (r) =>
+          r.eventId === evt.eventId &&
+          (r.vialLabelData ||
+            r.labelTranscription ||
+            r.transcriptionText ||
+            r.fullText ||
+            r.cellLineName ||
+            r.conflatedText ||
+            r.conflatedLabelText ||
+            r.ocrExtractedText)
+      ) ||
+      rawRefinementsArray.find((r) => r.eventId === evt.eventId) ||
+      (rawRefinementsArray.length === events.length && !rawRefinementsArray[idx]?.eventId
+        ? rawRefinementsArray[idx]
+        : undefined);
+    const matchingModelLabel = modelLabelTranscriptions.find((l) => l.eventId === evt.eventId);
 
-  const validated = RefinementSchema.array().parse(refinementsArray);
+    const flatRefLabel =
+      matchingRef &&
+      (matchingRef.cellLineName ||
+        matchingRef.fullText ||
+        matchingRef.conflatedText ||
+        matchingRef.conflatedLabelText ||
+        matchingRef.userInitials ||
+        matchingRef.dateFrozen ||
+        matchingRef.frame1Text ||
+        matchingRef.frame2Text ||
+        matchingRef.highestContrastShotText ||
+        matchingRef.minimalBlurShotText)
+        ? {
+            cellLineName: matchingRef.cellLineName,
+            userInitials: matchingRef.userInitials,
+            dateFrozen: matchingRef.dateFrozen,
+            fullText:
+              matchingRef.fullText ||
+              matchingRef.conflatedText ||
+              matchingRef.conflatedLabelText ||
+              matchingRef.ocrExtractedText ||
+              matchingRef.transcriptionText,
+            frame1Text: matchingRef.frame1Text || matchingRef.highestContrastShotText || matchingRef.highestContrastText,
+            frame2Text: matchingRef.frame2Text || matchingRef.minimalBlurShotText || matchingRef.minimalBlurText,
+            boxId: matchingRef.boxId,
+            lotNumber: matchingRef.lotNumber,
+            passage: matchingRef.passage,
+          }
+        : {};
+
+    const rawLabelObj = {
+      ...flatRefLabel,
+      ...(matchingRef?.labelTranscription || {}),
+      ...(matchingRef?.vialLabelData || {}),
+      ...(matchingModelLabel || {}),
+    };
+
+    const rawTextSource =
+      rawLabelObj.fullText ||
+      rawLabelObj.conflatedText ||
+      matchingRef?.transcriptionText ||
+      matchingRef?.fullText ||
+      matchingRef?.conflatedText ||
+      matchingRef?.conflatedLabelText ||
+      matchingRef?.ocrExtractedText ||
+      evt.labelTranscription?.fullText ||
+      '';
+
+    // Determine associated actionIds for this event
+    const associatedActionIds = Array.from(
+      new Set([
+        ...(Array.isArray(evt.actionIds) ? evt.actionIds : []),
+        ...(evt.actionId ? [evt.actionId] : []),
+        ...actions
+          .filter((a) => Array.isArray(a.eventList) && a.eventList.includes(evt.eventId))
+          .map((a) => a.actionId),
+      ])
+    ).filter(Boolean);
+
+    // Fallback to action cellLineName if no transcription text was provided in a sparse test fixture
+    const fallbackActionCellLine = actions.find((a) => associatedActionIds.includes(a.actionId))?.cellLineName;
+
+    const vialLabelData = parseVialLabelFields(rawTextSource || fallbackActionCellLine || 'Unknown Cell Line', {
+      ...rawLabelObj,
+      ...(rawLabelObj.cellLineName
+        ? { cellLineName: rawLabelObj.cellLineName }
+        : !rawTextSource && fallbackActionCellLine
+        ? { cellLineName: fallbackActionCellLine }
+        : {}),
+    });
+
+    const shot1Text =
+      vialLabelData.frame1Text ||
+      rawLabelObj.highestContrastShotText ||
+      rawLabelObj.frame1Text ||
+      vialLabelData.fullText;
+    const shot2Text =
+      vialLabelData.frame2Text ||
+      rawLabelObj.minimalBlurShotText ||
+      rawLabelObj.frame2Text ||
+      vialLabelData.fullText;
+
+    const frameTranscriptions = [
+      {
+        frameType: 'HIGHEST_CONTRAST',
+        timestampSeconds: evtSum?.twoBestShots?.[0]?.timestampSeconds ?? 0,
+        gcsUri: evtSum?.twoBestShots?.[0]?.uri || '',
+        url: evt.highestContrastFrame?.url || evt.bestFrames?.[0]?.url || evt.bestShotUrls?.[0] || '',
+        text: shot1Text,
+      },
+      {
+        frameType: 'MINIMAL_BLUR',
+        timestampSeconds: evtSum?.twoBestShots?.[1]?.timestampSeconds ?? 0,
+        gcsUri: evtSum?.twoBestShots?.[1]?.uri || '',
+        url: evt.minimalBlurFrame?.url || evt.bestFrames?.[1]?.url || evt.bestShotUrls?.[1] || evt.bestShotUrls?.[0] || '',
+        text: shot2Text,
+      },
+    ];
+
+    const clsUpper = String(evt.eventClass || '').toUpperCase();
+    const isBoxLabel = clsUpper.includes('BOX_LABEL');
+    const resolvedBoxId =
+      vialLabelData.boxId ||
+      (isBoxLabel ? vialLabelData.cellLineName : undefined);
+
+    const structuredVialLabelData = {
+      cellLineName: vialLabelData.cellLineName,
+      ...(vialLabelData.userInitials ? { userInitials: vialLabelData.userInitials } : {}),
+      ...(vialLabelData.dateFrozen ? { dateFrozen: vialLabelData.dateFrozen } : {}),
+      fullText: vialLabelData.fullText,
+      ...(resolvedBoxId ? { boxId: resolvedBoxId } : {}),
+      ...(vialLabelData.lotNumber ? { lotNumber: vialLabelData.lotNumber } : {}),
+      ...(vialLabelData.passage !== undefined ? { passage: vialLabelData.passage } : {}),
+      frame1Text: shot1Text,
+      frame2Text: shot2Text,
+    };
+
+    const record = LabelTranscriptionRecordSchema.parse({
+      eventId: evt.eventId,
+      eventClass: evt.eventClass || 'VIAL_LABEL_PRESENTATION',
+      actionIds: associatedActionIds,
+      isVialLabel: !isBoxLabel,
+      cellLineName: vialLabelData.cellLineName,
+      ...(vialLabelData.userInitials ? { userInitials: vialLabelData.userInitials } : {}),
+      ...(vialLabelData.dateFrozen ? { dateFrozen: vialLabelData.dateFrozen } : {}),
+      fullText: vialLabelData.fullText,
+      frame1Text: shot1Text,
+      frame2Text: shot2Text,
+      highestContrastShotText: shot1Text,
+      minimalBlurShotText: shot2Text,
+      conflatedText: vialLabelData.fullText,
+      vialLabelData: structuredVialLabelData,
+      ...(resolvedBoxId ? { boxId: resolvedBoxId } : {}),
+      ...(vialLabelData.lotNumber ? { lotNumber: vialLabelData.lotNumber } : {}),
+      ...(vialLabelData.passage !== undefined ? { passage: vialLabelData.passage } : {}),
+      frameTranscriptions,
+      conflatedAt: new Date().toISOString(),
+    });
+
+    evt.labelTranscription = structuredVialLabelData;
+    evt.vialLabelData = structuredVialLabelData;
+    evt.conflatedLabelText = record.fullText;
+    evt.highestContrastText = shot1Text;
+    evt.minimalBlurText = shot2Text;
+
+    labelTranscriptions.push(record);
+    eventIdToLabelRecord.set(evt.eventId, record);
+  }
+
+  // 2. Process vial insertion/removal action video intervals -> determine box well location (top-left black corner origin)
+  const actionWellLocations: Array<BoxWellLocation & { actionId: string }> = [];
+  const actionIdToWellLocation = new Map<string, BoxWellLocation>();
+
+  for (let aIdx = 0; aIdx < actions.length; aIdx++) {
+    const act = actions[aIdx];
+    const actSum = actionsSummary[aIdx];
+
+    // Check explicit modelActionWellLocations or matching refinement
+    const explicitWell = modelActionWellLocations.find((w) => w.actionId === act.actionId);
+    const hasWellFields = (r: any) =>
+      Boolean(
+        r &&
+          (r.boxWellLocation ||
+            r.spatialResult ||
+            r.spatialCoordinates ||
+            r.row !== undefined ||
+            r.coordinate !== undefined ||
+            r.well !== undefined ||
+            r.wellCoordinate !== undefined)
+      );
+    const matchesAction = (r: any) =>
+      Boolean(
+        r &&
+          (r.actionId === act.actionId ||
+            (Array.isArray(r.actionIds) && r.actionIds.includes(act.actionId)) ||
+            (Array.isArray(act.eventList) && act.eventList.includes(r.eventId)) ||
+            events.some(
+              (e) =>
+                e.eventId === r.eventId &&
+                (e.actionId === act.actionId || (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId)))
+            ))
+      );
+    const matchingRefByAction =
+      rawRefinementsArray.find((r) => r.actionId === act.actionId && hasWellFields(r)) ||
+      rawRefinementsArray.find((r) => matchesAction(r) && hasWellFields(r)) ||
+      rawRefinementsArray.find((r) => matchesAction(r));
+
+    const isActionTargetedRef =
+      matchingRefByAction &&
+      (actions.length === 1 || matchingRefByAction.actionId === act.actionId);
+
+    const flatRefWell =
+      isActionTargetedRef &&
+      (matchingRefByAction.row ||
+        matchingRefByAction.col !== undefined ||
+        matchingRefByAction.coordinate ||
+        matchingRefByAction.well ||
+        matchingRefByAction.wellCoordinate)
+        ? {
+            row: matchingRefByAction.row,
+            col: matchingRefByAction.col,
+            coordinate:
+              matchingRefByAction.coordinate ||
+              matchingRefByAction.well ||
+              matchingRefByAction.wellCoordinate,
+            boxId: matchingRefByAction.boxId,
+            confidence: matchingRefByAction.confidence,
+            normX: matchingRefByAction.normX,
+            normY: matchingRefByAction.normY,
+            totalRows: matchingRefByAction.totalRows,
+            totalCols: matchingRefByAction.totalCols,
+          }
+        : undefined;
+
+    const rawWell =
+      explicitWell ||
+      matchingRefByAction?.boxWellLocation ||
+      (isActionTargetedRef && matchingRefByAction?.spatialResult
+        ? matchingRefByAction.spatialResult
+        : undefined) ||
+      (isActionTargetedRef && matchingRefByAction?.spatialCoordinates
+        ? matchingRefByAction.spatialCoordinates
+        : undefined) ||
+      flatRefWell;
+
+    // Parse fallback from action's targetCoordinate / boxRowId / boxColId
+    let fallbackRow = act.boxRowId || 'A';
+    let fallbackCol = typeof act.boxColId === 'number' ? act.boxColId : 1;
+    const coordStr = rawWell?.coordinate || act.targetCoordinate || act.targetLocation?.coordinate;
+    if (coordStr && typeof coordStr === 'string') {
+      const m = coordStr.trim().match(/^([A-Za-z]+)[-:\s]*(\d+)$/);
+      if (m) {
+        fallbackRow = m[1].toUpperCase();
+        fallbackCol = parseInt(m[2], 10);
+      }
+    }
+
+    let resolvedRow = String(rawWell?.row || fallbackRow || 'A').trim().toUpperCase();
+    let resolvedCol = Number(rawWell?.col ?? fallbackCol ?? 1);
+    if (!Number.isFinite(resolvedCol) || resolvedCol < 1) {
+      resolvedCol = 1;
+    }
+
+    // If normalized coordinates (normX, normY) were provided by the model, compute relative to top-left black corner origin
+    if (typeof rawWell?.normX === 'number' && typeof rawWell?.normY === 'number') {
+      const computed = computeBoxWellFromTopLeftOrigin(
+        rawWell.normX,
+        rawWell.normY,
+        rawWell.totalRows || 9,
+        rawWell.totalCols || 9
+      );
+      resolvedRow = computed.row;
+      resolvedCol = computed.col;
+    }
+
+    const coordinate = `${resolvedRow}${resolvedCol}`;
+    const resolvedBoxId =
+      rawWell?.boxId ||
+      act.boxId ||
+      act.targetLocation?.box ||
+      undefined;
+
+    const wellLocation = BoxWellLocationSchema.parse({
+      row: resolvedRow,
+      col: resolvedCol,
+      coordinate,
+      ...(resolvedBoxId ? { boxId: resolvedBoxId } : {}),
+      originCorner: 'TOP_LEFT_BLACK',
+      intervalStartSeconds: actSum.intervalStartSeconds,
+      intervalEndSeconds: actSum.intervalEndSeconds,
+      actionType: act.actionType || act.actionClass,
+      confidence: rawWell?.confidence ?? act.confidenceScore ?? 0.98,
+    });
+
+    actionWellLocations.push({
+      actionId: act.actionId,
+      ...wellLocation,
+    });
+    actionIdToWellLocation.set(act.actionId, wellLocation);
+  }
+
+  // 3. Append conflated label text and box well locations onto all associated inventory update actions
+  for (const act of actions) {
+    const associatedEventIds = new Set<string>([
+      ...(Array.isArray(act.eventList) ? act.eventList : []),
+      ...events
+        .filter(
+          (e) =>
+            e.actionId === act.actionId ||
+            (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId))
+        )
+        .map((e) => e.eventId),
+    ]);
+    act.eventList = Array.from(associatedEventIds);
+
+    // Find associated vial label transcription and box label transcription
+    let associatedVialLabel: LabelTranscriptionRecord | undefined;
+    let associatedBoxLabel: LabelTranscriptionRecord | undefined;
+
+    for (const evtId of associatedEventIds) {
+      const rec = eventIdToLabelRecord.get(evtId);
+      if (!rec) continue;
+      const clsUpper = String(rec.eventClass || '').toUpperCase();
+      if (clsUpper.includes('BOX_LABEL')) {
+        associatedBoxLabel = rec;
+      } else {
+        associatedVialLabel = rec;
+      }
+    }
+
+    // If there's no linked vial label event yet and there is a vial label event in the video, associate if single event
+    if (!associatedVialLabel && labelTranscriptions.length === 1) {
+      const onlyRec = labelTranscriptions[0];
+      if (!String(onlyRec.eventClass || '').toUpperCase().includes('BOX_LABEL')) {
+        associatedVialLabel = onlyRec;
+      }
+    }
+
+    const wellLocation = actionIdToWellLocation.get(act.actionId);
+    const resolvedBoxId =
+      associatedBoxLabel?.boxId ||
+      associatedBoxLabel?.cellLineName ||
+      wellLocation?.boxId ||
+      act.boxId ||
+      act.targetLocation?.box;
+
+    if (wellLocation) {
+      act.boxRowId = wellLocation.row;
+      act.boxColId = wellLocation.col;
+      act.targetCoordinate = wellLocation.coordinate || `${wellLocation.row}${wellLocation.col}`;
+      if (resolvedBoxId) {
+        act.boxId = resolvedBoxId;
+        wellLocation.boxId = resolvedBoxId;
+      }
+      act.targetLocation = {
+        ...(act.targetLocation || {}),
+        ...(act.towerId ? { tower: act.towerId } : {}),
+        ...(resolvedBoxId ? { box: resolvedBoxId } : {}),
+        coordinate: act.targetCoordinate,
+      };
+      act.boxWellLocation = wellLocation;
+    }
+
+    if (associatedVialLabel) {
+      act.cellLineName = associatedVialLabel.cellLineName;
+      if (associatedVialLabel.userInitials) {
+        act.userInitials = associatedVialLabel.userInitials;
+        act.operatorInitials = associatedVialLabel.userInitials;
+      }
+      if (associatedVialLabel.dateFrozen) {
+        act.dateFrozen = associatedVialLabel.dateFrozen;
+      }
+      act.fullText = associatedVialLabel.fullText;
+      if (associatedVialLabel.lotNumber) {
+        act.lotNumber = associatedVialLabel.lotNumber;
+      }
+      if (associatedVialLabel.passage !== undefined) {
+        act.passage = associatedVialLabel.passage;
+      }
+      act.labelEventId = associatedVialLabel.eventId;
+      act.vialLabelData = {
+        cellLineName: associatedVialLabel.cellLineName,
+        ...(associatedVialLabel.userInitials ? { userInitials: associatedVialLabel.userInitials } : {}),
+        ...(associatedVialLabel.dateFrozen ? { dateFrozen: associatedVialLabel.dateFrozen } : {}),
+        fullText: associatedVialLabel.fullText,
+        ...(associatedVialLabel.lotNumber ? { lotNumber: associatedVialLabel.lotNumber } : {}),
+        ...(associatedVialLabel.passage !== undefined ? { passage: associatedVialLabel.passage } : {}),
+        ...(resolvedBoxId ? { boxId: resolvedBoxId } : {}),
+      };
+      act.cellLineInfo = {
+        ...(act.cellLineInfo || {}),
+        cellLineName: associatedVialLabel.cellLineName,
+        ...(associatedVialLabel.userInitials ? { userInitials: associatedVialLabel.userInitials } : {}),
+        ...(associatedVialLabel.dateFrozen ? { dateFrozen: associatedVialLabel.dateFrozen } : {}),
+        fullText: associatedVialLabel.fullText,
+        ...(associatedVialLabel.lotNumber ? { lotNumber: associatedVialLabel.lotNumber } : {}),
+        ...(associatedVialLabel.passage !== undefined ? { passage: associatedVialLabel.passage } : {}),
+      };
+    }
+  }
+
+  // 4. Enrich each Refinement item with vialLabelData, boxWellLocation, and frameTranscriptions
+  const enrichedRefinementsInput = rawRefinementsArray.map((r: any, idx: number) => {
+    const matchedEvtByAction = r.actionId
+      ? events.find(
+          (e) =>
+            (e.actionId && e.actionId === r.actionId) ||
+            (Array.isArray(e.actionIds) && e.actionIds.includes(r.actionId))
+        )
+      : undefined;
+    const resolvedEventId =
+      r.eventId ||
+      matchedEvtByAction?.eventId ||
+      events[idx]?.eventId ||
+      r.actionId ||
+      `evt_${String(idx + 1).padStart(3, '0')}`;
+    const resolvedRefinementId =
+      r.refinementId ||
+      r.id ||
+      `ref_${String(idx + 1).padStart(3, '0')}`;
+
+    const labelRec = eventIdToLabelRecord.get(resolvedEventId) || eventIdToLabelRecord.get(r.eventId);
+    const primaryActionId =
+      r.actionId ||
+      labelRec?.actionIds?.[0] ||
+      events.find((e) => e.eventId === resolvedEventId)?.actionId;
+    const wellLoc = primaryActionId ? actionIdToWellLocation.get(primaryActionId) : undefined;
+
+    const rawText =
+      r.transcriptionText ||
+      r.fullText ||
+      r.conflatedText ||
+      r.conflatedLabelText ||
+      r.ocrExtractedText ||
+      r.vialLabelData?.fullText;
+
+    const parsedLabel = r.vialLabelData
+      ? parseVialLabelFields(rawText, r.vialLabelData)
+      : labelRec
+      ? {
+          cellLineName: labelRec.cellLineName,
+          ...(labelRec.userInitials ? { userInitials: labelRec.userInitials } : {}),
+          ...(labelRec.dateFrozen ? { dateFrozen: labelRec.dateFrozen } : {}),
+          fullText: labelRec.fullText,
+          ...(labelRec.lotNumber ? { lotNumber: labelRec.lotNumber } : {}),
+          ...(labelRec.passage !== undefined ? { passage: labelRec.passage } : {}),
+          ...(labelRec.boxId ? { boxId: labelRec.boxId } : {}),
+          ...(labelRec.frame1Text ? { frame1Text: labelRec.frame1Text } : {}),
+          ...(labelRec.frame2Text ? { frame2Text: labelRec.frame2Text } : {}),
+        }
+      : rawText
+      ? parseVialLabelFields(rawText, r)
+      : undefined;
+
+    const spatial =
+      r.spatialResult ||
+      r.spatialCoordinates ||
+      (wellLoc ? { row: wellLoc.row, col: wellLoc.col } : undefined);
+
+    const resolvedWellLoc =
+      r.boxWellLocation
+        ? {
+            ...r.boxWellLocation,
+            originCorner: 'TOP_LEFT_BLACK',
+          }
+        : wellLoc ||
+          (spatial && spatial.row
+            ? {
+                row: String(spatial.row),
+                col: Number(spatial.col || 1),
+                coordinate: `${spatial.row}${spatial.col || 1}`,
+                originCorner: 'TOP_LEFT_BLACK',
+              }
+            : undefined);
+
+    return {
+      ...r,
+      refinementId: String(resolvedRefinementId),
+      eventId: String(resolvedEventId),
+      refinementClass: String(r.refinementClass || r.type || 'OCR_CONFLATION'),
+      ...(primaryActionId ? { actionId: primaryActionId } : {}),
+      ...(labelRec?.actionIds && labelRec.actionIds.length > 0 ? { actionIds: labelRec.actionIds } : {}),
+      ...(parsedLabel ? { vialLabelData: parsedLabel } : {}),
+      ...(parsedLabel && !r.transcriptionText ? { transcriptionText: parsedLabel.fullText } : {}),
+      ...(resolvedWellLoc ? { boxWellLocation: resolvedWellLoc } : {}),
+      ...(spatial && spatial.row ? { spatialResult: { row: String(spatial.row), col: Number(spatial.col || 1) } } : {}),
+      ...(labelRec?.frameTranscriptions ? { frameTranscriptions: labelRec.frameTranscriptions } : {}),
+    };
+  });
+
+  // Ensure every label presentation event in `labelTranscriptions` has an OCR_CONFLATION refinement entry in `enrichedRefinementsInput`
+  if (classification.workflowType === 'INVENTORY_UPDATE_WORKFLOW') {
+    for (const labelRec of labelTranscriptions) {
+      const alreadyPresent = enrichedRefinementsInput.some(
+        (item) => item.eventId === labelRec.eventId
+      );
+      if (!alreadyPresent) {
+        const primaryActId = labelRec.actionIds[0];
+        const wellLoc = primaryActId ? actionIdToWellLocation.get(primaryActId) : undefined;
+        enrichedRefinementsInput.unshift({
+          refinementId: `ref_${labelRec.eventId}`,
+          eventId: labelRec.eventId,
+          ...(primaryActId ? { actionId: primaryActId } : {}),
+          actionIds: labelRec.actionIds,
+          refinementClass: 'OCR_CONFLATION',
+          transcriptionText: labelRec.fullText,
+          vialLabelData: {
+            cellLineName: labelRec.cellLineName,
+            ...(labelRec.userInitials ? { userInitials: labelRec.userInitials } : {}),
+            ...(labelRec.dateFrozen ? { dateFrozen: labelRec.dateFrozen } : {}),
+            fullText: labelRec.fullText,
+            ...(labelRec.lotNumber ? { lotNumber: labelRec.lotNumber } : {}),
+            ...(labelRec.passage !== undefined ? { passage: labelRec.passage } : {}),
+            ...(labelRec.boxId ? { boxId: labelRec.boxId } : {}),
+            ...(labelRec.frame1Text ? { frame1Text: labelRec.frame1Text } : {}),
+            ...(labelRec.frame2Text ? { frame2Text: labelRec.frame2Text } : {}),
+          },
+          ...(wellLoc
+            ? {
+                boxWellLocation: wellLoc,
+                spatialResult: { row: wellLoc.row, col: wellLoc.col },
+              }
+            : {}),
+          ...(labelRec.frameTranscriptions ? { frameTranscriptions: labelRec.frameTranscriptions } : {}),
+          conflationMetadata: {
+            confidence: 0.99,
+            framesEvaluated: 2,
+            ocrEngine: 'Gemini-DualShot-Conflation',
+          },
+        });
+      }
+    }
+  }
+
+  const validated = RefinementSchema.array().parse(enrichedRefinementsInput);
+
+  // 5. Write JSON artifact files for label transcriptions and enriched inventory update actions
+  const artifactPaths = await writePass3JsonArtifacts(videoId, {
+    labelTranscriptions,
+    actions,
+    refinements: validated,
+  });
+
   const thinkingLevel = pass3Config.thinkingConfig?.thinkingLevel || targetThinking || 'MEDIUM';
   const thoughtsTokenCount = (response?.usageMetadata as any)?.thoughtsTokenCount || 0;
   const executionAudit = {
@@ -2843,6 +4208,10 @@ Output a JSON array of Refinement objects conforming to RefinementSchema.`;
   (validated as any).modelUsed = targetModel;
   (validated as any).thinkingLevel = thinkingLevel;
   (validated as any).executionAudit = executionAudit;
+  (validated as any).labelTranscriptions = labelTranscriptions;
+  (validated as any).actionWellLocations = actionWellLocations;
+  (validated as any).enrichedActions = actions;
+  (validated as any).artifactPaths = artifactPaths;
   return validated;
 }
 

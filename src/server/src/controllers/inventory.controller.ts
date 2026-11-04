@@ -7,7 +7,7 @@ import {
   type CreateInventoryInput,
   CreateInventorySchema,
 } from '@sail/shared';
-import { db } from '../services/firestore.service';
+import { db, getTenantFirestore, normalizeDatabaseId } from '../services/firestore.service';
 
 /**
  * Generates all boxes and cells for an inventory given its dimensions.
@@ -240,7 +240,7 @@ export const getInventoryHandler = async (req: Request, res: Response): Promise<
 export const updateInventoryCellHandler = async (req: Request, res: Response): Promise<Response | void> => {
   try {
     const { id } = req.params;
-    const { boxId, cellCoordinate, occupied, vial } = req.body;
+    const { boxId, cellCoordinate, occupied, highlighted, lastActionType, vial } = req.body;
 
     if (!id || !boxId || !cellCoordinate) {
       return res.status(400).json({ error: 'id, boxId, and cellCoordinate are required' });
@@ -265,13 +265,24 @@ export const updateInventoryCellHandler = async (req: Request, res: Response): P
       occupied: false,
     };
 
+    const resolvedOccupied = typeof occupied === 'boolean' ? occupied : true;
+
     const updatedCell: InventoryCell = {
       ...existingCell,
-      occupied: typeof occupied === 'boolean' ? occupied : true,
+      occupied: resolvedOccupied,
+      highlighted:
+        typeof highlighted === 'boolean'
+          ? highlighted
+          : resolvedOccupied
+          ? existingCell.highlighted ?? true
+          : false,
+      ...(lastActionType ? { lastActionType } : {}),
       vial: vial
         ? {
             ...existingCell.vial,
             ...vial,
+            cellLineIdentifier: vial.cellLineIdentifier || vial.cellLineName || existingCell.vial?.cellLineIdentifier || 'Unknown',
+            cellLineName: vial.cellLineName || vial.cellLineIdentifier || existingCell.vial?.cellLineName,
             targetCoordinate: cellCoordinate,
             updatedAt: new Date().toISOString(),
           }
@@ -285,7 +296,7 @@ export const updateInventoryCellHandler = async (req: Request, res: Response): P
     box.cells[cellCoordinate] = updatedCell;
     data.boxes[boxId] = box;
 
-    await docRef.set(data, { merge: true });
+    await docRef.set(data);
 
     return res.status(200).json({
       success: true,
@@ -297,6 +308,123 @@ export const updateInventoryCellHandler = async (req: Request, res: Response): P
     console.error('[InventoryController] Error updating cell:', error);
     return res.status(500).json({
       error: 'Failed to update inventory cell',
+      message: error?.message || String(error),
+    });
+  }
+};
+
+/**
+ * POST /api/inventories/:id/empty
+ * Empties all boxes and cells of the specified cryo-inventory, resetting all wells to unoccupied.
+ */
+export const emptyInventoryHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  try {
+    const id = req.params.id as string;
+    if (!id) {
+      return res.status(400).json({ error: 'Missing required parameter: id' });
+    }
+
+    const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId || req.query?.databaseId) as
+      | string
+      | undefined;
+    const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
+    const tenantDb = getTenantFirestore(databaseId);
+
+    const docRef = db.collection('inventories').doc(id);
+    let doc = await docRef.get();
+    let data: InventoryRecord | undefined = doc && doc.exists ? (doc.data() as InventoryRecord) : undefined;
+
+    if (!data && databaseId !== '(default)') {
+      try {
+        const tenantDoc = await tenantDb.collection('inventories').doc(id).get();
+        if (tenantDoc && tenantDoc.exists) {
+          data = tenantDoc.data() as InventoryRecord;
+        }
+      } catch {
+        // Ignore tenant fallback error
+      }
+    }
+
+    if (!data) {
+      return res.status(404).json({ error: `Inventory '${id}' not found` });
+    }
+
+    const towersCount = data.towersCount || 3;
+    const boxesPerTower = data.boxesPerTower || 5;
+    const rowsPerBox = data.rowsPerBox || 9;
+    const colsPerBox = data.colsPerBox || 9;
+
+    const emptyBoxes = generateInventoryBoxes(towersCount, boxesPerTower, rowsPerBox, colsPerBox);
+    const nowIso = new Date().toISOString();
+
+    const updatedInventory: InventoryRecord & { updatedAt?: string } = {
+      ...data,
+      id: data.id || id,
+      towersCount,
+      boxesPerTower,
+      rowsPerBox,
+      colsPerBox,
+      boxes: emptyBoxes,
+      updatedAt: nowIso,
+    };
+
+    // Overwrite full inventory document (without merge so nested vial objects are completely removed)
+    await docRef.set(updatedInventory);
+    if (databaseId !== '(default)') {
+      try {
+        await tenantDb.collection('inventories').doc(id).set(updatedInventory);
+      } catch {
+        // Ignore if tenant DB mirrors default
+      }
+    }
+
+    // Clear any subcollection contents/{boxId} documents so commit sanity checks see empty wells
+    const clearContentsSubcollection = async (firestoreInstance: typeof db) => {
+      try {
+        const contentsCol = firestoreInstance.collection('inventories').doc(id).collection('contents');
+        if (contentsCol && typeof contentsCol.get === 'function') {
+          const snap = await contentsCol.get();
+          if (snap && Array.isArray(snap.docs)) {
+            for (const subDoc of snap.docs) {
+              await contentsCol.doc(subDoc.id).set({
+                inventoryId: id,
+                boxId: subDoc.id,
+                occupiedCells: {},
+                cells: [],
+                updatedAt: nowIso,
+              });
+            }
+          }
+        }
+        for (const boxKey of Object.keys(emptyBoxes)) {
+          if (contentsCol && typeof contentsCol.doc === 'function') {
+            await contentsCol.doc(boxKey).set({
+              inventoryId: id,
+              boxId: boxKey,
+              occupiedCells: {},
+              cells: [],
+              updatedAt: nowIso,
+            });
+          }
+        }
+      } catch {
+        // Non-fatal if subcollection does not exist
+      }
+    };
+
+    await clearContentsSubcollection(db);
+    if (databaseId !== '(default)') {
+      await clearContentsSubcollection(tenantDb);
+    }
+
+    return res.status(200).json({
+      success: true,
+      inventory: updatedInventory,
+    });
+  } catch (error: any) {
+    console.error('[InventoryController] Error emptying inventory:', error);
+    return res.status(500).json({
+      error: 'Failed to empty inventory',
       message: error?.message || String(error),
     });
   }

@@ -212,4 +212,248 @@ describe('Multi-Inventory Management & Endpoints', () => {
       server.close();
     }
   });
+
+  it('should empty all occupied cells in an inventory via POST /api/inventories/:id/empty', async () => {
+    const server = app.listen(0);
+    const port = server.address().port;
+
+    try {
+      const createRes = await fetch(`http://localhost:${port}/api/inventories`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Empty Test Tank',
+          towersCount: 2,
+          boxesPerTower: 2,
+          rowsPerBox: 9,
+          colsPerBox: 9,
+        }),
+      });
+      const created = await createRes.json();
+
+      // Populate two cells
+      await fetch(`http://localhost:${port}/api/inventories/${created.id}/cells`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          boxId: 'A-1',
+          cellCoordinate: 'B2',
+          occupied: true,
+          vial: {
+            cellLineIdentifier: 'K562',
+            lotNumber: 'LOT-111',
+            passageNumber: 2,
+          },
+        }),
+      });
+
+      const emptyRes = await fetch(`http://localhost:${port}/api/inventories/${created.id}/empty`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      assert.strictEqual(emptyRes.status, 200);
+      const emptyData = await emptyRes.json();
+      assert.strictEqual(emptyData.success, true);
+      assert.strictEqual(emptyData.inventory.boxes['A-1'].cells['B2'].occupied, false);
+      assert.strictEqual(emptyData.inventory.boxes['A-1'].cells['B2'].vial, undefined);
+
+      // Verify GET /api/inventories/:id returns emptied cells
+      const getRes = await fetch(`http://localhost:${port}/api/inventories/${created.id}`);
+      const fetched = await getRes.json();
+      assert.strictEqual(fetched.boxes['A-1'].cells['B2'].occupied, false);
+      assert.strictEqual(fetched.boxes['A-1'].cells['B2'].vial, undefined);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('should enforce sanity checks on POST /api/signoff/inventory (fail on inserting into occupied well or removing from empty well) and persist HITL edits across reloads', async () => {
+    const { getTenantFirestore } = require('../dist/services/firestore.service');
+    const server = app.listen(0);
+    const port = server.address().port;
+
+    try {
+      // 1. Create a clean inventory
+      const createRes = await fetch(`http://localhost:${port}/api/inventories`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Sanity Check Tank',
+          towersCount: 1,
+          boxesPerTower: 2,
+          rowsPerBox: 9,
+          colsPerBox: 9,
+        }),
+      });
+      const inv = await createRes.json();
+
+      // 2. Seed a video record with Pass 1 and Pass 3 actions so we can verify HITL persistence
+      const videoId = 'vid_hitl_persist_test_01';
+      const defaultDb = getTenantFirestore('(default)');
+      await defaultDb.collection('videos').doc(videoId).set({
+        videoId,
+        originalName: 'hitl_test.mp4',
+        status: 'ANALYSIS_COMPLETE',
+        inventoryId: inv.id,
+        passes: {
+          pass0: { status: 'COMPLETED', data: { workflowType: 'INVENTORY_UPDATE_WORKFLOW' } },
+          pass1: {
+            status: 'COMPLETED',
+            data: {
+              actions: [
+                {
+                  actionId: 'act_1',
+                  actionClass: 'VIAL_INSERTION',
+                  actionType: 'VIAL_INSERTION',
+                  startTime: 1,
+                  endTime: 5,
+                  description: 'Insert vial',
+                  targetCoordinate: 'A1',
+                  vialLabelData: {
+                    cellLineName: 'OLD_CELL_LINE',
+                    userInitials: 'OLD',
+                    dateFrozen: '2025-01-01',
+                    fullText: 'OLD_CELL_LINE OLD 2025-01-01',
+                  },
+                  boxWellLocation: {
+                    row: 'A',
+                    column: 1,
+                    coordinate: 'A1',
+                  },
+                },
+              ],
+            },
+          },
+          pass2: { status: 'COMPLETED', data: { events: [] } },
+          pass3: { status: 'COMPLETED', data: { refinements: [] } },
+          hitl: { status: 'PENDING' },
+        },
+      });
+
+      // 3. Sanity check 1: Removing a vial from an empty well (D4) must fail with HTTP 400
+      const failRemoveEmptyRes = await fetch(`http://localhost:${port}/api/signoff/inventory`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          databaseId: '(default)',
+          videoId,
+          inventoryId: inv.id,
+          operatorInitials: 'RK',
+          boxUpdates: [
+            {
+              boxId: 'A-1',
+              row: 'D',
+              col: 4,
+              cellLineName: 'GHOST_CELL',
+              actionId: 'act_1',
+              actionType: 'VIAL_REMOVAL',
+              status: 'EMPTY',
+            },
+          ],
+        }),
+      });
+      assert.strictEqual(failRemoveEmptyRes.status, 400);
+      const failRemoveBody = await failRemoveEmptyRes.json();
+      assert.ok(failRemoveBody.error.includes('Cannot remove vial'));
+      assert.ok(failRemoveBody.error.includes('empty'));
+
+      // 4. Valid insertion into empty well E5 with edited HITL fields
+      const validInsertRes = await fetch(`http://localhost:${port}/api/signoff/inventory`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          databaseId: '(default)',
+          videoId,
+          inventoryId: inv.id,
+          operatorInitials: 'RK',
+          boxUpdates: [
+            {
+              boxId: 'A-1',
+              row: 'E',
+              col: 5,
+              cellLineName: 'EDITED_HELA_V2',
+              userInitials: 'RK',
+              dateFrozen: '2026-11-03',
+              fullText: 'EDITED_HELA_V2 RK 2026-11-03',
+              actionId: 'act_1',
+              actionType: 'VIAL_INSERTION',
+              status: 'OCCUPIED',
+            },
+          ],
+        }),
+      });
+      assert.strictEqual(validInsertRes.status, 200);
+
+      // 5. Verify that reloading passes via GET /api/pipeline/passes/:videoId returns the edited HITL values!
+      const passesRes = await fetch(`http://localhost:${port}/api/pipeline/passes/${videoId}`);
+      assert.strictEqual(passesRes.status, 200);
+      const passesBody = await passesRes.json();
+      assert.strictEqual(passesBody.passes.hitl.status, 'COMPLETED');
+      assert.strictEqual(passesBody.passes.hitl.data.boxUpdates[0].cellLineName, 'EDITED_HELA_V2');
+      assert.strictEqual(passesBody.passes.hitl.data.boxUpdates[0].row, 'E');
+      assert.strictEqual(passesBody.passes.hitl.data.boxUpdates[0].col, 5);
+      assert.strictEqual(passesBody.passes.pass1.data.actions[0].vialLabelData.cellLineName, 'EDITED_HELA_V2');
+      assert.strictEqual(passesBody.passes.pass1.data.actions[0].boxWellLocation.coordinate, 'E5');
+
+      // 6. Sanity check 2: Attempting to insert another vial into already-occupied well E5 must fail with HTTP 400
+      const failInsertOccupiedRes = await fetch(`http://localhost:${port}/api/signoff/inventory`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          databaseId: '(default)',
+          videoId,
+          inventoryId: inv.id,
+          operatorInitials: 'RK',
+          boxUpdates: [
+            {
+              boxId: 'A-1',
+              row: 'E',
+              col: 5,
+              cellLineName: 'DUPLICATE_VIAL',
+              actionId: 'act_1',
+              actionType: 'VIAL_INSERTION',
+              status: 'OCCUPIED',
+            },
+          ],
+        }),
+      });
+      assert.strictEqual(failInsertOccupiedRes.status, 400);
+      const failInsertBody = await failInsertOccupiedRes.json();
+      assert.ok(failInsertBody.error.includes('Cannot insert vial'));
+      assert.ok(failInsertBody.error.includes('already occupied'));
+
+      // 7. Emptying the inventory via POST /api/inventories/:id/empty allows inserting into E5 again
+      const emptyRes = await fetch(`http://localhost:${port}/api/inventories/${inv.id}/empty`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      assert.strictEqual(emptyRes.status, 200);
+
+      const reInsertRes = await fetch(`http://localhost:${port}/api/signoff/inventory`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          databaseId: '(default)',
+          videoId,
+          inventoryId: inv.id,
+          operatorInitials: 'RK',
+          boxUpdates: [
+            {
+              boxId: 'A-1',
+              row: 'E',
+              col: 5,
+              cellLineName: 'FRESH_VIAL_AFTER_EMPTY',
+              actionId: 'act_1',
+              actionType: 'VIAL_INSERTION',
+              status: 'OCCUPIED',
+            },
+          ],
+        }),
+      });
+      assert.strictEqual(reInsertRes.status, 200);
+    } finally {
+      server.close();
+    }
+  });
 });
