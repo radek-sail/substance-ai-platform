@@ -148,21 +148,23 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
                 <Sliders className="w-3 h-3 text-slate-400 ml-0.5" />
               </button>
 
-              {/* Sign-off status & commit trigger */}
-              {isSignedOff ? (
-                <div className="flex items-center gap-1.5 bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm shadow-emerald-950">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                  <span>Signed Off</span>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={onOpenSignOffModal}
-                  className="flex items-center gap-2 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-400 hover:to-orange-500 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold shadow-md shadow-orange-500/20 active:scale-95 transition-all"
-                >
-                  <FileCheck2 className="w-4 h-4" />
-                  <span>Review & Sign Off</span>
-                </button>
+              {/* Sign-off status & commit trigger (only shown on Archive tab) */}
+              {activeTab === 'archive' && (
+                isSignedOff ? (
+                  <div className="flex items-center gap-1.5 bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm shadow-emerald-950">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                    <span>Signed Off</span>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={onOpenSignOffModal}
+                    className="flex items-center gap-2 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-400 hover:to-orange-500 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold shadow-md shadow-orange-500/20 active:scale-95 transition-all"
+                  >
+                    <FileCheck2 className="w-4 h-4" />
+                    <span>Review & Sign Off</span>
+                  </button>
+                )
               )}
 
               {/* Authenticated Operator Controls */}

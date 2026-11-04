@@ -11,6 +11,7 @@ import {
   listVideosHandler,
   associateInventoryHandler,
   getVideoFrameHandler,
+  deleteVideoHandler,
 } from './controllers/video.controller';
 import {
   analyzePipelineHandler,
@@ -60,6 +61,7 @@ app.use('/api/videos', videoRoutes);
 // Direct route registrations for video endpoints
 app.get('/api/videos', listVideosHandler);
 app.post('/api/videos/upload', uploadMiddleware, uploadVideoHandler);
+app.delete('/api/videos/:videoId', deleteVideoHandler);
 app.post('/api/videos/:videoId/associate-inventory', associateInventoryHandler);
 app.get('/api/videos/:videoId/frames/:filename', getVideoFrameHandler);
 

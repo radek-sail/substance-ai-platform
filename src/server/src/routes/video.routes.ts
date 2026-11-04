@@ -7,6 +7,7 @@ import {
   finalizeUploadHandler,
   associateInventoryHandler,
   getVideoFrameHandler,
+  deleteVideoHandler,
 } from '../controllers/video.controller';
 
 const router: Router = Router();
@@ -28,5 +29,8 @@ router.post('/:videoId/associate-inventory', associateInventoryHandler);
 
 // Serve extracted Pass 2 best-shot frame: GET /api/videos/:videoId/frames/:filename
 router.get('/:videoId/frames/:filename', getVideoFrameHandler);
+
+// Delete video record and analysis from database: DELETE /api/videos/:videoId
+router.delete('/:videoId', deleteVideoHandler);
 
 export default router;

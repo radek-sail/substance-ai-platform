@@ -17,7 +17,7 @@ Identify and segment EVERY individual vial insertion (`VIAL_INSERTION`) or remov
 
 ### Action Classes (Pass 1 @ 1 fps)
 - `VIAL_INSERTION_ACTION`: Placing a specimen cryovial into a cryo-box slot.
-- `VIAL_REMOVAL_ACTION`: Extracting a specimen cryovial from a cryo-box slot.
+- `VIAL_REMOVAL_ACTION`: Extracting a specimen cryovial from a cryo-box slot. (Note: During vial removal, the operator may glance at the label to verify they are taking out the right vial, or may not do so for every vial; Pass 3 skips vial label text transcription for `VIAL_REMOVAL` actions and leaves all label fields empty except for the well coordinate.)
 
 Extracted fields: `actionId`, `actionClass`, `inventoryId`, `cellLineName`, `cellLineInfo`, `towerId`, `boxRowId` (A–Z), `boxColId` (1–N), `eventList`.
 

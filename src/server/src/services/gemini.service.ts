@@ -3109,6 +3109,34 @@ export async function runPass3AnalysisRefinement(
   );
   const { primaryDir: persistentFrameDir, mirrorDir: mirrorFrameDir } = resolvePersistentFrameDirs(videoId);
 
+  const isVialRemovalAction = (act: any): boolean => {
+    const cls = String(act?.actionType || act?.actionClass || '').toUpperCase();
+    return cls.includes('REMOVAL');
+  };
+
+  const isVialLabelEventForRemovalOnly = (evt: any): boolean => {
+    const clsUpper = String(evt?.eventClass || '').toUpperCase();
+    if (clsUpper.includes('BOX_LABEL')) {
+      return false;
+    }
+    const linkedActionIds = new Set<string>([
+      ...(Array.isArray(evt?.actionIds) ? evt.actionIds : []),
+      ...(evt?.actionId ? [evt.actionId] : []),
+      ...actions
+        .filter((a) => Array.isArray(a.eventList) && a.eventList.includes(evt?.eventId))
+        .map((a) => a.actionId),
+    ].filter(Boolean));
+
+    const linkedActions = actions.filter((a) => linkedActionIds.has(a.actionId));
+    if (linkedActions.length > 0) {
+      return linkedActions.every(isVialRemovalAction);
+    }
+    if (actions.length > 0) {
+      return actions.every(isVialRemovalAction);
+    }
+    return false;
+  };
+
   // Build summaries for label presentation events (with their 2 best shots)
   const eventsSummary = events.map((e) => {
     const shot1Time =
@@ -3148,6 +3176,10 @@ export async function runPass3AnalysisRefinement(
     };
   });
 
+  const eventsForTranscriptionSummary = eventsSummary.filter(
+    (_, idx) => !isVialLabelEventForRemovalOnly(events[idx])
+  );
+
   // Build summaries for vial insertion/removal action intervals
   const actionsSummary = actions.map((a) => {
     const refinedMatch = pass2RefinedActions.find((r) => r.actionId === a.actionId);
@@ -3178,14 +3210,15 @@ Video URI: ${gcsUri}
 
 1. LABEL PRESENTATION EVENTS (Dual-Shot Transcription & Conflation at Full Frame Resolution):
 For each label presentation event below, transcribe the exact label text shown in the TWO full-resolution best shots (Shot 1: HIGHEST_CONTRAST and Shot 2: MINIMAL_BLUR) and conflate the results.
+NOTE: Vial label transcription is skipped for vial removal actions (VIAL_REMOVAL_ACTION / VIAL_REMOVAL), leaving all label fields empty except for the well coordinate.
 CRITICAL: NEVER invent or copy placeholder text. Only transcribe text physically visible on the label.
-If the event is a vial label presentation (VIAL_LABEL_PRESENTATION), format the conflated text into:
+If the event is a vial label presentation (VIAL_LABEL_PRESENTATION) for a vial insertion action, format the conflated text into:
 - "cellLineName" (required): cell line name
 - "userInitials" (optional): user's initials
 - "dateFrozen" (optional): date frozen
 - "fullText" (required): full text extracted from the label across the two shots
 Events to refine:
-${JSON.stringify(eventsSummary, null, 2)}
+${JSON.stringify(eventsForTranscriptionSummary, null, 2)}
 
 2. VIAL INSERTION / REMOVAL ACTIONS (Video Interval Well Location Analysis - Top-Left Black Corner Origin):
 For each vial insertion or removal action interval below, analyze the video interval [intervalStartSeconds, intervalEndSeconds] to determine which box well the vial was inserted into or removed from.
@@ -3435,7 +3468,13 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
       }
     })();
 
-    for (const evtSum of eventsSummary) {
+    for (let eIdx = 0; eIdx < eventsSummary.length; eIdx++) {
+      const evtSum = eventsSummary[eIdx];
+      const evtObj = events[eIdx];
+      if (isVialLabelEventForRemovalOnly(evtObj)) {
+        continue;
+      }
+
       const alreadyHasEventResult =
         rawRefinementsArray.some((r) => r && r.eventId === evtSum.eventId) ||
         modelLabelTranscriptions.some((l) => l && l.eventId === evtSum.eventId);
@@ -3635,6 +3674,16 @@ Output a JSON object (or array of 1 Refinement object) with:
   for (let idx = 0; idx < events.length; idx++) {
     const evt = events[idx];
     const evtSum = eventsSummary[idx];
+
+    if (isVialLabelEventForRemovalOnly(evt)) {
+      delete evt.labelTranscription;
+      delete evt.vialLabelData;
+      delete evt.conflatedLabelText;
+      delete evt.highestContrastText;
+      delete evt.minimalBlurText;
+      continue;
+    }
+
     const matchingRef =
       rawRefinementsArray.find(
         (r) =>
@@ -3702,8 +3751,11 @@ Output a JSON object (or array of 1 Refinement object) with:
       evt.labelTranscription?.fullText ||
       '';
 
-    // Determine associated actionIds for this event
-    const associatedActionIds = Array.from(
+    const clsUpper = String(evt.eventClass || '').toUpperCase();
+    const isBoxLabel = clsUpper.includes('BOX_LABEL');
+
+    // Determine associated actionIds for this event (excluding vial removal actions for vial labels)
+    const rawAssociatedActionIds = Array.from(
       new Set([
         ...(Array.isArray(evt.actionIds) ? evt.actionIds : []),
         ...(evt.actionId ? [evt.actionId] : []),
@@ -3712,9 +3764,16 @@ Output a JSON object (or array of 1 Refinement object) with:
           .map((a) => a.actionId),
       ])
     ).filter(Boolean);
+    const associatedActionIds = isBoxLabel
+      ? rawAssociatedActionIds
+      : rawAssociatedActionIds.filter(
+          (aId) => !actions.some((a) => a.actionId === aId && isVialRemovalAction(a))
+        );
 
     // Fallback to action cellLineName if no transcription text was provided in a sparse test fixture
-    const fallbackActionCellLine = actions.find((a) => associatedActionIds.includes(a.actionId))?.cellLineName;
+    const fallbackActionCellLine = actions.find(
+      (a) => associatedActionIds.includes(a.actionId) && !isVialRemovalAction(a)
+    )?.cellLineName;
 
     const vialLabelData = parseVialLabelFields(rawTextSource || fallbackActionCellLine || 'Unknown Cell Line', {
       ...rawLabelObj,
@@ -3753,8 +3812,6 @@ Output a JSON object (or array of 1 Refinement object) with:
       },
     ];
 
-    const clsUpper = String(evt.eventClass || '').toUpperCase();
-    const isBoxLabel = clsUpper.includes('BOX_LABEL');
     const resolvedBoxId =
       vialLabelData.boxId ||
       (isBoxLabel ? vialLabelData.cellLineName : undefined);
@@ -3949,6 +4006,8 @@ Output a JSON object (or array of 1 Refinement object) with:
     ]);
     act.eventList = Array.from(associatedEventIds);
 
+    const isRemovalAct = isVialRemovalAction(act);
+
     // Find associated vial label transcription and box label transcription
     let associatedVialLabel: LabelTranscriptionRecord | undefined;
     let associatedBoxLabel: LabelTranscriptionRecord | undefined;
@@ -3959,13 +4018,13 @@ Output a JSON object (or array of 1 Refinement object) with:
       const clsUpper = String(rec.eventClass || '').toUpperCase();
       if (clsUpper.includes('BOX_LABEL')) {
         associatedBoxLabel = rec;
-      } else {
+      } else if (!isRemovalAct) {
         associatedVialLabel = rec;
       }
     }
 
-    // If there's no linked vial label event yet and there is a vial label event in the video, associate if single event
-    if (!associatedVialLabel && labelTranscriptions.length === 1) {
+    // If there's no linked vial label event yet and there is a vial label event in the video, associate if single event (unless removal)
+    if (!isRemovalAct && !associatedVialLabel && labelTranscriptions.length === 1) {
       const onlyRec = labelTranscriptions[0];
       if (!String(onlyRec.eventClass || '').toUpperCase().includes('BOX_LABEL')) {
         associatedVialLabel = onlyRec;
@@ -3997,7 +4056,36 @@ Output a JSON object (or array of 1 Refinement object) with:
       act.boxWellLocation = wellLocation;
     }
 
-    if (associatedVialLabel) {
+    if (isRemovalAct) {
+      // Skip vial label transcription for vial removal actions and leave all label fields empty except well coordinate
+      act.cellLineName = '';
+      act.userInitials = '';
+      act.operatorInitials = '';
+      act.dateFrozen = '';
+      act.fullText = '';
+      act.conflatedLabelText = '';
+      act.lotNumber = '';
+      delete act.passage;
+      delete act.labelEventId;
+      act.vialLabelData = {
+        cellLineName: '',
+        userInitials: '',
+        dateFrozen: '',
+        fullText: '',
+        ...(resolvedBoxId ? { boxId: resolvedBoxId } : {}),
+      };
+      act.cellLineInfo = {
+        ...(resolvedBoxId ? { boxId: resolvedBoxId } : {}),
+        name: '',
+        cellLineName: '',
+        userInitials: '',
+        operatorInitials: '',
+        dateFrozen: '',
+        fullText: '',
+        lotNumber: '',
+        ...(act.targetCoordinate ? { targetCoordinate: act.targetCoordinate } : {}),
+      };
+    } else if (associatedVialLabel) {
       act.cellLineName = associatedVialLabel.cellLineName;
       if (associatedVialLabel.userInitials) {
         act.userInitials = associatedVialLabel.userInitials;
@@ -4060,17 +4148,30 @@ Output a JSON object (or array of 1 Refinement object) with:
       r.actionId ||
       labelRec?.actionIds?.[0] ||
       events.find((e) => e.eventId === resolvedEventId)?.actionId;
+    const primaryAction = primaryActionId
+      ? actions.find((a) => a.actionId === primaryActionId)
+      : undefined;
+    const isRemovalRef = primaryAction ? isVialRemovalAction(primaryAction) : false;
     const wellLoc = primaryActionId ? actionIdToWellLocation.get(primaryActionId) : undefined;
 
-    const rawText =
-      r.transcriptionText ||
-      r.fullText ||
-      r.conflatedText ||
-      r.conflatedLabelText ||
-      r.ocrExtractedText ||
-      r.vialLabelData?.fullText;
+    const rawText = isRemovalRef
+      ? ''
+      : r.transcriptionText ||
+        r.fullText ||
+        r.conflatedText ||
+        r.conflatedLabelText ||
+        r.ocrExtractedText ||
+        r.vialLabelData?.fullText;
 
-    const parsedLabel = r.vialLabelData
+    const parsedLabel = isRemovalRef
+      ? {
+          cellLineName: '',
+          userInitials: '',
+          dateFrozen: '',
+          fullText: '',
+          ...(wellLoc?.boxId ? { boxId: wellLoc.boxId } : {}),
+        }
+      : r.vialLabelData
       ? parseVialLabelFields(rawText, r.vialLabelData)
       : labelRec
       ? {
@@ -4113,14 +4214,22 @@ Output a JSON object (or array of 1 Refinement object) with:
       ...r,
       refinementId: String(resolvedRefinementId),
       eventId: String(resolvedEventId),
-      refinementClass: String(r.refinementClass || r.type || 'OCR_CONFLATION'),
+      refinementClass: String(
+        r.refinementClass || r.type || (isRemovalRef ? 'SPATIAL_REFINEMENT' : 'OCR_CONFLATION')
+      ),
       ...(primaryActionId ? { actionId: primaryActionId } : {}),
       ...(labelRec?.actionIds && labelRec.actionIds.length > 0 ? { actionIds: labelRec.actionIds } : {}),
       ...(parsedLabel ? { vialLabelData: parsedLabel } : {}),
-      ...(parsedLabel && !r.transcriptionText ? { transcriptionText: parsedLabel.fullText } : {}),
+      ...(isRemovalRef
+        ? { transcriptionText: '' }
+        : parsedLabel && !r.transcriptionText
+        ? { transcriptionText: parsedLabel.fullText }
+        : {}),
       ...(resolvedWellLoc ? { boxWellLocation: resolvedWellLoc } : {}),
       ...(spatial && spatial.row ? { spatialResult: { row: String(spatial.row), col: Number(spatial.col || 1) } } : {}),
-      ...(labelRec?.frameTranscriptions ? { frameTranscriptions: labelRec.frameTranscriptions } : {}),
+      ...(!isRemovalRef && labelRec?.frameTranscriptions
+        ? { frameTranscriptions: labelRec.frameTranscriptions }
+        : {}),
     };
   });
 
@@ -4163,6 +4272,45 @@ Output a JSON object (or array of 1 Refinement object) with:
             framesEvaluated: 2,
             ocrEngine: 'Gemini-DualShot-Conflation',
           },
+        });
+      }
+    }
+
+    // Ensure every action with a well location (especially VIAL_REMOVAL actions whose label transcription was skipped) has a refinement entry
+    for (const actWell of actionWellLocations) {
+      const alreadyPresentForAction = enrichedRefinementsInput.some(
+        (item) => item.actionId === actWell.actionId
+      );
+      if (!alreadyPresentForAction) {
+        const actObj = actions.find((a) => a.actionId === actWell.actionId);
+        const isRemovalAct = actObj ? isVialRemovalAction(actObj) : false;
+        const linkedEvt = events.find(
+          (e) =>
+            e.actionId === actWell.actionId ||
+            (Array.isArray(e.actionIds) && e.actionIds.includes(actWell.actionId)) ||
+            (Array.isArray(actObj?.eventList) && actObj.eventList.includes(e.eventId))
+        );
+        const evtId = linkedEvt?.eventId || actWell.actionId;
+        const { actionId, ...wellLocationFields } = actWell;
+        enrichedRefinementsInput.push({
+          refinementId: `ref_${actWell.actionId}`,
+          eventId: String(evtId),
+          actionId: actWell.actionId,
+          refinementClass: 'SPATIAL_REFINEMENT',
+          ...(isRemovalAct
+            ? {
+                transcriptionText: '',
+                vialLabelData: {
+                  cellLineName: '',
+                  userInitials: '',
+                  dateFrozen: '',
+                  fullText: '',
+                  ...(wellLocationFields.boxId ? { boxId: wellLocationFields.boxId } : {}),
+                },
+              }
+            : {}),
+          boxWellLocation: wellLocationFields,
+          spatialResult: { row: wellLocationFields.row, col: wellLocationFields.col },
         });
       }
     }

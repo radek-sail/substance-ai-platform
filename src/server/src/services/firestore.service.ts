@@ -42,6 +42,7 @@ export interface VideoRecord {
   organizationId?: string;
   uploadedBy?: string;
   uploadedAt: FirebaseFirestore.FieldValue | string;
+  capturedAt?: FirebaseFirestore.FieldValue | string;
   transcodedAt?: FirebaseFirestore.FieldValue | string;
 }
 
@@ -232,6 +233,10 @@ function createInMemoryCollectionFactory(dbId: string) {
               exists: existing !== undefined,
               data: () => (existing !== undefined ? { ...existing } : undefined),
             };
+          },
+          delete: async () => {
+            store.delete(fullDocPath);
+            return { writeTime: new Date() } as unknown as WriteResult;
           },
           collection: (subCollectionName: string) => {
             return makeCollection(`${fullDocPath}/${subCollectionName}`);
@@ -510,6 +515,31 @@ export async function getVideoPasses(
     pass3: data.passes?.pass3 || { status: 'PENDING' },
     hitl: data.passes?.hitl || { status: 'PENDING' },
   };
+  if (passes.hitl?.status !== 'COMPLETED') {
+    if (data.isSignedOff === true) {
+      passes.hitl = {
+        ...passes.hitl,
+        status: 'COMPLETED',
+        completedAt: passes.hitl?.completedAt || data.signedOffAt,
+      };
+    } else {
+      try {
+        const analysisSnap = await db.collection('video_analyses').doc(videoId).get();
+        if (analysisSnap && analysisSnap.exists) {
+          const analysisData = analysisSnap.data() || {};
+          if (analysisData.isSignedOff === true) {
+            passes.hitl = {
+              ...passes.hitl,
+              status: 'COMPLETED',
+              completedAt: passes.hitl?.completedAt || analysisData.signedOffAt,
+            };
+          }
+        }
+      } catch {
+        // Ignore analysis lookup errors
+      }
+    }
+  }
   return {
     videoId: data.videoId || videoId,
     status: data.status || 'READY_FOR_ANALYSIS',
@@ -532,11 +562,63 @@ export async function getVideoMetadata(
 }
 
 /**
+ * Deletes a video record and its associated analysis document from Firestore (`videos/{videoId}` and `video_analyses/{videoId}`)
+ * as well as the in-memory store.
+ */
+export async function deleteVideoRecord(
+  databaseId: string | undefined,
+  videoId: string
+): Promise<boolean> {
+  const dbId = normalizeDatabaseId(databaseId || '(default)');
+  const db = getTenantFirestore(dbId);
+
+  // Remove from in-memory store for both tenant and (default)
+  const memStore = getTenantMemoryStore(dbId);
+  memStore.delete(`videos/${videoId}`);
+  memStore.delete(`video_analyses/${videoId}`);
+
+  if (dbId !== '(default)') {
+    const defaultStore = getTenantMemoryStore('(default)');
+    defaultStore.delete(`videos/${videoId}`);
+    defaultStore.delete(`video_analyses/${videoId}`);
+  }
+
+  try {
+    const videosCol = db.collection('videos');
+    if (videosCol && typeof videosCol.doc === 'function') {
+      const videoDocRef = videosCol.doc(videoId) as any;
+      if (videoDocRef && typeof videoDocRef.delete === 'function') {
+        await videoDocRef.delete();
+      }
+    }
+  } catch (err) {
+    console.warn(`[FirestoreService] Could not delete videos/${videoId} from Firestore:`, err);
+  }
+
+  try {
+    const analysesCol = db.collection('video_analyses');
+    if (analysesCol && typeof analysesCol.doc === 'function') {
+      const analysisDocRef = analysesCol.doc(videoId) as any;
+      if (analysisDocRef && typeof analysisDocRef.delete === 'function') {
+        await analysisDocRef.delete();
+      }
+    }
+  } catch (err) {
+    console.warn(`[FirestoreService] Could not delete video_analyses/${videoId} from Firestore:`, err);
+  }
+
+  return true;
+}
+
+/**
  * Normalizes a raw Firestore/in-memory video document into a consistent VideoRecord object.
  */
 function formatVideoDocument(id: string, data: Record<string, any>): Record<string, any> {
   const videoId = data.videoId || id;
   const uploadedAtIso = serializeTimestampField(data.uploadedAt, data.createdAt || data.updatedAt);
+  const capturedAtIso = data.capturedAt
+    ? serializeTimestampField(data.capturedAt, uploadedAtIso)
+    : undefined;
   const transcodedAtIso = data.transcodedAt
     ? serializeTimestampField(data.transcodedAt, data.updatedAt || uploadedAtIso)
     : undefined;
@@ -574,6 +656,8 @@ function formatVideoDocument(id: string, data: Record<string, any>): Record<stri
     associatedAt: data.associatedAt !== undefined ? data.associatedAt : null,
     passes,
     uploadedAt: uploadedAtIso,
+    ...(capturedAtIso ? { capturedAt: capturedAtIso } : {}),
+    ...(typeof data.durationSeconds === 'number' ? { durationSeconds: data.durationSeconds } : {}),
     ...(transcodedAtIso ? { transcodedAt: transcodedAtIso } : {}),
   };
 }
@@ -1174,9 +1258,16 @@ export async function commitInventorySignOff(
       const isRemoval = matchedUpdate.status === 'EMPTY' || matchedUpdate.actionType === 'VIAL_REMOVAL';
       const actionType = isRemoval ? 'VIAL_REMOVAL' : 'VIAL_INSERTION';
       const actionClass = isRemoval ? 'VIAL_REMOVAL_ACTION' : 'VIAL_INSERTION_ACTION';
-      const resolvedInitials =
-        matchedUpdate.userInitials || matchedUpdate.operatorInitials || operatorInitials;
-      const resolvedFullText = matchedUpdate.fullText || matchedUpdate.cellLineName;
+      const resolvedCellLineName = isRemoval ? (matchedUpdate.cellLineName || '') : matchedUpdate.cellLineName;
+      const resolvedInitials = isRemoval
+        ? (matchedUpdate.userInitials || '')
+        : (matchedUpdate.userInitials || matchedUpdate.operatorInitials || operatorInitials);
+      const resolvedDateFrozen = isRemoval
+        ? (matchedUpdate.dateFrozen || '')
+        : (matchedUpdate.dateFrozen ?? act.vialLabelData?.dateFrozen);
+      const resolvedFullText = isRemoval
+        ? (matchedUpdate.fullText || '')
+        : (matchedUpdate.fullText || matchedUpdate.cellLineName);
 
       return stripUndefinedFields({
         ...act,
@@ -1184,16 +1275,16 @@ export async function commitInventorySignOff(
         inventoryId: inventoryId || act.inventoryId,
         actionType,
         actionClass,
-        cellLineName: matchedUpdate.cellLineName,
+        cellLineName: resolvedCellLineName,
         conflatedLabelText: resolvedFullText,
         targetCoordinate: coordinate,
         boxRowId: rowLetter,
         boxColId: colNum,
         vialLabelData: stripUndefinedFields({
           ...(act.vialLabelData || {}),
-          cellLineName: matchedUpdate.cellLineName,
+          cellLineName: resolvedCellLineName,
           userInitials: resolvedInitials,
-          dateFrozen: matchedUpdate.dateFrozen ?? act.vialLabelData?.dateFrozen,
+          dateFrozen: resolvedDateFrozen,
           fullText: resolvedFullText,
         }),
         boxWellLocation: stripUndefinedFields({
@@ -1206,13 +1297,13 @@ export async function commitInventorySignOff(
         }),
         cellLineInfo: stripUndefinedFields({
           ...(act.cellLineInfo || {}),
-          name: matchedUpdate.cellLineName,
+          name: resolvedCellLineName,
           boxId: matchedUpdate.boxId || act.cellLineInfo?.boxId || 'box_01',
-          lotNumber: matchedUpdate.lotNumber ?? act.cellLineInfo?.lotNumber,
-          passage: matchedUpdate.passage ?? act.cellLineInfo?.passage,
+          lotNumber: isRemoval ? (matchedUpdate.lotNumber || '') : (matchedUpdate.lotNumber ?? act.cellLineInfo?.lotNumber),
+          passage: isRemoval ? matchedUpdate.passage : (matchedUpdate.passage ?? act.cellLineInfo?.passage),
           userInitials: resolvedInitials,
           operatorInitials: resolvedInitials,
-          dateFrozen: matchedUpdate.dateFrozen ?? act.cellLineInfo?.dateFrozen,
+          dateFrozen: resolvedDateFrozen,
           fullText: resolvedFullText,
           targetCoordinate: coordinate,
         }),
@@ -1234,18 +1325,25 @@ export async function commitInventorySignOff(
       const coordinate = `${rowLetter}${colNum}`;
       const isRemoval = matchedUpdate.status === 'EMPTY' || matchedUpdate.actionType === 'VIAL_REMOVAL';
       const actionType = isRemoval ? 'VIAL_REMOVAL' : 'VIAL_INSERTION';
-      const resolvedInitials =
-        matchedUpdate.userInitials || matchedUpdate.operatorInitials || operatorInitials;
-      const resolvedFullText = matchedUpdate.fullText || matchedUpdate.cellLineName;
+      const resolvedCellLineName = isRemoval ? (matchedUpdate.cellLineName || '') : matchedUpdate.cellLineName;
+      const resolvedInitials = isRemoval
+        ? (matchedUpdate.userInitials || '')
+        : (matchedUpdate.userInitials || matchedUpdate.operatorInitials || operatorInitials);
+      const resolvedDateFrozen = isRemoval
+        ? (matchedUpdate.dateFrozen || '')
+        : (matchedUpdate.dateFrozen ?? ref.vialLabelData?.dateFrozen);
+      const resolvedFullText = isRemoval
+        ? (matchedUpdate.fullText || '')
+        : (matchedUpdate.fullText || matchedUpdate.cellLineName);
 
       return stripUndefinedFields({
         ...ref,
         conflatedLabelText: resolvedFullText,
         vialLabelData: stripUndefinedFields({
           ...(ref.vialLabelData || {}),
-          cellLineName: matchedUpdate.cellLineName,
+          cellLineName: resolvedCellLineName,
           userInitials: resolvedInitials,
-          dateFrozen: matchedUpdate.dateFrozen ?? ref.vialLabelData?.dateFrozen,
+          dateFrozen: resolvedDateFrozen,
           fullText: resolvedFullText,
         }),
         boxWellLocation: stripUndefinedFields({
@@ -1260,7 +1358,7 @@ export async function commitInventorySignOff(
           ...(ref.spatialResult || {}),
           row: rowLetter,
           col: colNum,
-          cellLineName: matchedUpdate.cellLineName,
+          cellLineName: resolvedCellLineName,
         }),
       });
     });

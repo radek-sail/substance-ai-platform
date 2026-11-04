@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   UploadCloud,
   FileVideo,
@@ -28,6 +28,7 @@ import {
   Sliders,
   Cpu,
   Terminal,
+  Trash2,
 } from 'lucide-react';
 import {
   type VideoAnalysisDoc,
@@ -119,6 +120,25 @@ function ensurePasses(passes?: VideoPasses): VideoPasses {
   };
 }
 
+function formatWorkflowClassificationLabel(workflowType?: string, pass0Status?: string): string {
+  if (workflowType === 'INVENTORY_UPDATE_WORKFLOW') {
+    return 'inventory update workflow';
+  }
+  if (workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW') {
+    return 'experiment updated workflow';
+  }
+  if (workflowType === 'UNCLASSIFIED_WORKFLOW') {
+    return 'unclassified workflow';
+  }
+  if (pass0Status === 'RUNNING') {
+    return 'Classifying workflow (Pass 0)...';
+  }
+  if (pass0Status === 'COMPLETED') {
+    return 'unclassified workflow';
+  }
+  return 'Pending Pass 0 classification';
+}
+
 export const VideoManager: React.FC<VideoManagerViewProps> = ({
   tenant,
   activeStreamId,
@@ -129,6 +149,9 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   currentTime,
 }) => {
   const [videos, setVideos] = useState<VideoRecord[]>([]);
+  const [deletingIds, setDeletingIds] = useState<Record<string, boolean>>({});
+  const deletedVideoIdsRef = useRef<Set<string>>(new Set());
+  const autoTriggeredPass0Ref = useRef<Set<string>>(new Set());
   const [loading, setLoading] = useState<boolean>(true);
   const isLoadingRegistry = loading;
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -247,25 +270,31 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       const res = await fetch('/api/videos');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
-      const list: VideoRecord[] = Array.isArray(json) ? json : (json.videos || []);
+      const rawList: VideoRecord[] = Array.isArray(json) ? json : (json.videos || []);
+      const list = rawList.filter((v) => v?.videoId && !deletedVideoIdsRef.current.has(v.videoId));
       console.log('[VideoManager] Loaded videos:', list.length);
       setVideos((prev) => {
         const mergedMap = new Map<string, VideoRecord>();
         for (const v of list) {
-          if (v?.videoId) {
+          if (v?.videoId && !deletedVideoIdsRef.current.has(v.videoId)) {
             mergedMap.set(v.videoId, v);
           }
         }
         for (const v of prev) {
-          if (v?.videoId && !mergedMap.has(v.videoId)) {
+          if (
+            v?.videoId &&
+            !mergedMap.has(v.videoId) &&
+            !deletedVideoIdsRef.current.has(v.videoId) &&
+            v.status === 'UPLOADING'
+          ) {
             mergedMap.set(v.videoId, v);
           }
         }
         const merged = Array.from(mergedMap.values());
         merged.sort(
           (a, b) =>
-            new Date(String(b.uploadedAt || 0)).getTime() -
-            new Date(String(a.uploadedAt || 0)).getTime()
+            new Date(String((b as any).capturedAt || b.uploadedAt || 0)).getTime() -
+            new Date(String((a as any).capturedAt || a.uploadedAt || 0)).getTime()
         );
         return merged;
       });
@@ -341,15 +370,58 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     }
   };
 
+  const handleDeleteVideo = async (video: VideoRecord) => {
+    const { videoId, originalName } = video;
+    setDeletingIds((prev) => ({ ...prev, [videoId]: true }));
+    deletedVideoIdsRef.current.add(videoId);
+    try {
+      await apiService.deleteVideo(videoId, {
+        customerId: tenant.customerId,
+        databaseId: tenant.databaseId,
+      });
+      setVideos((prev) => {
+        const remaining = prev.filter((v) => v.videoId !== videoId);
+        if (selectedVideoId === videoId) {
+          const nextId = remaining.length > 0 ? remaining[0].videoId : null;
+          setSelectedVideoId(nextId);
+          setActiveStreamState(nextId);
+        }
+        return remaining;
+      });
+      setPassesByVideo((prev) => {
+        const copy = { ...prev };
+        delete copy[videoId];
+        return copy;
+      });
+      setAnalysisCache((prev) => {
+        const copy = { ...prev };
+        delete copy[videoId];
+        return copy;
+      });
+      setStatusBanner(`Video "${originalName}" (${videoId}) removed from the database.`);
+    } catch (err: any) {
+      deletedVideoIdsRef.current.delete(videoId);
+      console.error(`[VideoManager] Failed to delete video ${videoId}:`, err);
+      setStatusBanner(`Failed to delete video "${originalName}": ${err?.message || 'Unknown error'}`);
+    } finally {
+      setDeletingIds((prev) => ({ ...prev, [videoId]: false }));
+    }
+  };
+
   /**
-   * Poll GET /api/videos every 3-5 seconds while any video has status === 'TRANSCODING'.
+   * Poll GET /api/videos every 4 seconds while any video has status === 'TRANSCODING'
+   * or Pass 0 is actively running in the background.
    * When the active video status becomes 'READY_FOR_ANALYSIS':
-   * - Stop polling.
-   * - Refresh the registry table so Pass 0 through Pass 3 can be executed.
+   * - Automatically trigger Pass 0 if still PENDING.
+   * - Once Pass 0 finishes, stop polling and refresh registry.
    */
   useEffect(() => {
-    const hasTranscodingVideos = videos.some((v) => v.status === 'TRANSCODING');
-    if (!hasTranscodingVideos || pollingStoppedForActive) {
+    const hasTranscodingOrPass0Running = videos.some(
+      (v) =>
+        v.status === 'TRANSCODING' ||
+        ensurePasses(passesByVideo[v.videoId] || v.passes).pass0.status === 'RUNNING'
+    );
+    if (!hasTranscodingOrPass0Running || pollingStoppedForActive) {
       return;
     }
 
@@ -360,22 +432,36 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         const activeVid = list.find((v) => v.videoId === currentActiveId);
 
         if (activeVid && activeVid.status === 'READY_FOR_ANALYSIS') {
-          console.log(
-            `[VideoManager] Active video ${currentActiveId} is now READY_FOR_ANALYSIS. Stopping polling.`
-          );
-          setPollingStoppedForActive(true);
           setTranscodingVideoId(null);
           setUploadStep('SAVED');
           setUploading(false);
           setUploadProgress('');
           setLatestUploadedVideo(activeVid);
-          setStatusBanner(
-            `Video "${activeVid.originalName}" is ready for analysis (${activeVid.totalChunks ?? activeVid.chunks?.length ?? 1} chunk(s)). Pass 0 through Pass 3 can now be executed.`
-          );
-          // Refresh registry table so Pass 0 through Pass 3 can be executed
-          await fetchVideos(false);
-          if (onSelectActiveStream) {
-            onSelectActiveStream(activeVid, analysisCache[activeVid.videoId]);
+
+          const p0Status = ensurePasses(activeVid.passes).pass0.status;
+          if (p0Status === 'PENDING' && !autoTriggeredPass0Ref.current.has(activeVid.videoId)) {
+            autoTriggeredPass0Ref.current.add(activeVid.videoId);
+            console.log(
+              `[VideoManager] Active video ${currentActiveId} finished transcoding. Automatically executing Pass 0...`
+            );
+            setStatusBanner(
+              `Video "${activeVid.originalName}" finished transcoding. Automatically executing Pass 0 (Workflow Classification)...`
+            );
+            void handleRunSinglePass(activeVid, 0);
+          } else if (p0Status === 'COMPLETED' || p0Status === 'ERROR') {
+            console.log(
+              `[VideoManager] Active video ${currentActiveId} is READY_FOR_ANALYSIS and Pass 0 is ${p0Status}. Stopping polling.`
+            );
+            setPollingStoppedForActive(true);
+            const wfType = activeVid.passes?.pass0?.data?.workflowType;
+            const wfLabel = formatWorkflowClassificationLabel(wfType, p0Status);
+            setStatusBanner(
+              `Video "${activeVid.originalName}" transcoding & Pass 0 classification complete (${wfLabel}).`
+            );
+            await fetchVideos(false);
+            if (onSelectActiveStream) {
+              onSelectActiveStream(activeVid, analysisCache[activeVid.videoId]);
+            }
           }
         } else if (activeVid && (activeVid.status === 'ERROR' || activeVid.status === 'FAILED')) {
           console.error(
@@ -399,6 +485,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     return () => clearInterval(intervalId);
   }, [
     videos,
+    passesByVideo,
     selectedVideoId,
     activeStreamId,
     transcodingVideoId,
@@ -412,6 +499,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
    * Whenever selectedVideoId changes, sync its passes from GET /api/pipeline/passes/:videoId.
    */
   useEffect(() => {
+    setHitlCommitError(null);
+    setHitlCommitSuccess(null);
     if (!selectedVideoId) return;
     let cancelled = false;
     (async () => {
@@ -441,6 +530,34 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       } catch {
         // Ignore pass fetch errors if video is brand new
       }
+      try {
+        const analysisDoc = await apiService.fetchVideoAnalysis(selectedVideoId, {
+          customerId: tenant.customerId,
+          databaseId: tenant.databaseId,
+        });
+        if (!cancelled && analysisDoc) {
+          setAnalysisCache((prev) => ({ ...prev, [selectedVideoId]: analysisDoc }));
+          if (analysisDoc.isSignedOff) {
+            setPassesByVideo((prev) => {
+              const cur = ensurePasses(prev[selectedVideoId]);
+              if (cur.hitl?.status === 'COMPLETED') return prev;
+              return {
+                ...prev,
+                [selectedVideoId]: {
+                  ...cur,
+                  hitl: {
+                    ...cur.hitl,
+                    status: 'COMPLETED',
+                    completedAt: (analysisDoc as any).signedOffAt || cur.hitl?.completedAt,
+                  },
+                },
+              };
+            });
+          }
+        }
+      } catch {
+        // Ignore analysis fetch errors if analysis does not exist yet
+      }
     })();
     return () => {
       cancelled = true;
@@ -465,24 +582,38 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     }));
   };
 
-  const probeVideoDuration = (file: File) => {
-    try {
-      const videoEl = document.createElement('video');
-      videoEl.preload = 'metadata';
-      const objectUrl = URL.createObjectURL(file);
-      videoEl.onloadedmetadata = () => {
-        URL.revokeObjectURL(objectUrl);
-        if (videoEl.duration && Number.isFinite(videoEl.duration)) {
-          setProbedDuration(Math.round(videoEl.duration));
-        }
-      };
-      videoEl.onerror = () => {
-        URL.revokeObjectURL(objectUrl);
-      };
-      videoEl.src = objectUrl;
-    } catch {
-      setProbedDuration(undefined);
-    }
+  const probeVideoDuration = (file: File): Promise<number | undefined> => {
+    return new Promise((resolve) => {
+      try {
+        const videoEl = document.createElement('video');
+        videoEl.preload = 'metadata';
+        const objectUrl = URL.createObjectURL(file);
+        const timeoutId = setTimeout(() => {
+          URL.revokeObjectURL(objectUrl);
+          resolve(undefined);
+        }, 2500);
+        videoEl.onloadedmetadata = () => {
+          clearTimeout(timeoutId);
+          URL.revokeObjectURL(objectUrl);
+          if (videoEl.duration && Number.isFinite(videoEl.duration)) {
+            const dur = Math.round(videoEl.duration * 100) / 100;
+            setProbedDuration(Math.round(videoEl.duration));
+            resolve(dur);
+          } else {
+            resolve(undefined);
+          }
+        };
+        videoEl.onerror = () => {
+          clearTimeout(timeoutId);
+          URL.revokeObjectURL(objectUrl);
+          resolve(undefined);
+        };
+        videoEl.src = objectUrl;
+      } catch {
+        setProbedDuration(undefined);
+        resolve(undefined);
+      }
+    });
   };
 
   /**
@@ -500,7 +631,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       console.log('[VideoManager] Starting direct-to-GCS upload for:', file.name, file.size);
 
       setSelectedFile(file);
-      probeVideoDuration(file);
+      const durationPromise = probeVideoDuration(file);
       setUploadError(null);
       setLatestUploadedVideo(null);
       setUploadStep('UPLOADING');
@@ -546,6 +677,12 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       setUploadProgress('Transcoding & segmenting video in background...');
       setStatusBanner('Transcoding & segmenting video in background...');
 
+      const browserDuration = await durationPromise;
+      const fallbackCapturedAt =
+        file.lastModified && file.lastModified > 0
+          ? new Date(file.lastModified).toISOString()
+          : undefined;
+
       const finalizeRes = await fetch('/api/videos/finalize-upload', {
         method: 'POST',
         headers: {
@@ -555,6 +692,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
           videoId,
           rawGcsUri,
           originalName: file.name,
+          ...(browserDuration !== undefined ? { durationSeconds: browserDuration } : {}),
+          ...(fallbackCapturedAt ? { capturedAt: fallbackCapturedAt } : {}),
         }),
       });
 
@@ -1304,7 +1443,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
               <thead>
                 <tr className="border-b border-slate-800 text-[11px] font-mono uppercase text-slate-400 bg-slate-900/80">
                   <th className="py-3 px-4">Video Filename & Stream ID</th>
-                  <th className="py-3 px-4">Upload Timestamp & Duration</th>
+                  <th className="py-3 px-4">Capture Timestamp & Duration</th>
                   <th className="py-3 px-4">Transcoding / Ingestion</th>
                   <th className="py-3 px-4">Pipeline Status</th>
                   <th className="py-3 px-4 text-right">Action Controls</th>
@@ -1321,6 +1460,15 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                   const vPasses = ensurePasses(passesByVideo[video.videoId] || video.passes);
                   const isAnalysisComplete =
                     video.status === 'ANALYSIS_COMPLETE' || vPasses.pass3.status === 'COMPLETED';
+                  const pass0WorkflowType =
+                    vPasses.pass0.data?.workflowType ||
+                    analysisCache[video.videoId]?.workflowClassification?.workflowType ||
+                    analysisCache[video.videoId]?.workloadClassification?.workflowType;
+                  const classificationResultText = formatWorkflowClassificationLabel(
+                    pass0WorkflowType,
+                    vPasses.pass0.status
+                  );
+                  const isDeleting = Boolean(deletingIds[video.videoId]);
 
                   return (
                     <tr
@@ -1333,7 +1481,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                       <td className="py-3.5 px-4">
                         <div className="flex items-start gap-2.5">
                           <FileVideo className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
-                          <div>
+                          <div className="w-full max-w-sm">
                             <div className="font-semibold text-slate-100 flex items-center gap-2">
                               <span>{video.originalName}</span>
                               {activeStreamId === video.videoId && (
@@ -1345,16 +1493,37 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             <div className="text-[11px] font-mono text-slate-400 mt-0.5">
                               ID: <span className="text-slate-300">{video.videoId}</span>
                             </div>
+                            <div
+                              className="mt-2 flex items-center gap-2"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 shrink-0">
+                                Classification:
+                              </span>
+                              <input
+                                type="text"
+                                readOnly
+                                aria-label={`Video classification for ${video.originalName}`}
+                                value={classificationResultText}
+                                className="w-full bg-slate-950 border border-slate-700 rounded-md px-2.5 py-1 text-[11px] font-mono text-cyan-300 focus:outline-none"
+                              />
+                            </div>
                             {renderInventoryBadge(video)}
                           </div>
                         </div>
                       </td>
 
                       <td className="py-3.5 px-4 font-mono">
-                        <div className="text-slate-200">{formatTimestamp(video.uploadedAt)}</div>
+                        <div className="text-slate-200">
+                          {formatTimestamp((video as any).capturedAt || video.uploadedAt)}
+                        </div>
                         <div className="text-[11px] text-slate-400 flex items-center gap-1.5 mt-0.5">
                           <Clock className="w-3 h-3 text-slate-500" />
-                          <span>Duration: {formatDuration(video.durationSeconds)}</span>
+                          <span>
+                            {video.durationSeconds !== undefined && video.durationSeconds > 0
+                              ? formatDuration(video.durationSeconds)
+                              : '--:--'}
+                          </span>
                           {video.fileSizeBytes ? (
                             <span>• {(video.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB</span>
                           ) : null}
@@ -1407,6 +1576,21 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             <Eye className="w-3.5 h-3.5" />
                             <span>Inspect Results</span>
                             <ArrowRight className="w-3.5 h-3.5" />
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={isDeleting}
+                            onClick={() => handleDeleteVideo(video)}
+                            title="Delete video from database"
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                          >
+                            {isDeleting ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Trash2 className="w-3.5 h-3.5" />
+                            )}
+                            <span>Delete</span>
                           </button>
                         </div>
                       </td>
@@ -2707,6 +2891,11 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                   <div className="grid grid-cols-1 gap-2">
                                     {pass1ActionsList.map((act: any, idx: number) => {
                                       const actId = act.actionId || `act_${idx + 1}`;
+                                      const isActRemoval = String(
+                                        act.actionType || act.actionClass || ''
+                                      )
+                                        .toUpperCase()
+                                        .includes('REMOVAL');
                                       return (
                                         <div
                                           key={actId}
@@ -2722,7 +2911,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 {act.vialLabelData?.cellLineName ||
                                                   act.cellLineName ||
                                                   act.cellLineInfo?.name ||
-                                                  '(untranscribed)'}
+                                                  (isActRemoval ? '—' : '(untranscribed)')}
                                               </strong>
                                             </span>
                                             <span className="text-slate-300">
@@ -2782,34 +2971,48 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
             })}
 
             {/* Step 5: Human-in-the-Loop (HITL) Verification Card */}
-            <div
-              className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 space-y-4"
-              data-testid="hitl-verification-card"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="space-y-0.5">
-                  <div className="text-sm font-bold text-slate-100 flex items-center gap-2.5">
-                    <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                    <span>Human-in-the-Loop (HITL) Verification</span>
-                    {renderPassStatusBadge(selectedPasses.hitl?.status || 'PENDING', isCommittingHitl)}
-                  </div>
-                  <p className="text-xs text-slate-400 font-mono">
-                    Inspect & edit refined Pass 3 label fields (cellLineName, userInitials, dateFrozen, fullText) and box well coordinates (Origin A1 = Top-Left Black Corner), then commit to the Cryo-Inventory database
-                  </p>
-                </div>
+            {(() => {
+              const isHitlCommitted =
+                selectedPasses.hitl?.status === 'COMPLETED' ||
+                selectedVideo.passes?.hitl?.status === 'COMPLETED' ||
+                Boolean((selectedPasses.hitl as any)?.data?.signedOffAt) ||
+                Boolean((selectedVideo.passes?.hitl as any)?.data?.signedOffAt) ||
+                Boolean((selectedVideo as any)?.isSignedOff) ||
+                Boolean(analysisCache[selectedVideo.videoId]?.isSignedOff) ||
+                Boolean(hitlCommitSuccess);
 
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => handleInspectResults(selectedVideo, true)}
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 transition-colors"
-                  >
-                    <Eye className="w-3.5 h-3.5 text-emerald-300" />
-                    <span>Review in Sign-Off Tab</span>
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
+              return (
+                <div
+                  className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 space-y-4"
+                  data-testid="hitl-verification-card"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="space-y-0.5">
+                      <div className="text-sm font-bold text-slate-100 flex items-center gap-2.5">
+                        <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                        <span>Human-in-the-Loop (HITL) Verification</span>
+                        {renderPassStatusBadge(
+                          isHitlCommitted ? 'COMPLETED' : selectedPasses.hitl?.status || 'PENDING',
+                          isCommittingHitl
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-400 font-mono">
+                        Inspect & edit refined Pass 3 label fields (cellLineName, userInitials, dateFrozen, fullText) and box well coordinates (Origin A1 = Top-Left Black Corner), then commit to the Cryo-Inventory database
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleInspectResults(selectedVideo, true)}
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 transition-colors"
+                      >
+                        <Eye className="w-3.5 h-3.5 text-emerald-300" />
+                        <span>Review in Sign-Off Tab</span>
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
 
               {/* Inline Editable HITL Inventory Update Actions Table */}
               {(() => {
@@ -2954,12 +3157,12 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                         boxId: st.boxId || 'box_01',
                         row,
                         col,
-                        cellLineName: st.cellLineName || 'Unknown',
+                        cellLineName: isRemoval ? (st.cellLineName || '') : (st.cellLineName || 'Unknown'),
                         userInitials: st.userInitials || undefined,
                         dateFrozen: st.dateFrozen || undefined,
-                        fullText: st.fullText || st.cellLineName || 'Unknown',
+                        fullText: isRemoval ? (st.fullText || '') : (st.fullText || st.cellLineName || 'Unknown'),
                         lotNumber: st.lotNumber || undefined,
-                        passage: Number(st.passage) || 1,
+                        passage: isRemoval ? undefined : (Number(st.passage) || 1),
                         operatorInitials: st.userInitials || tenant.operatorInitials || 'RS',
                         actionId: st.actionId,
                         actionType: st.actionType,
@@ -3229,29 +3432,43 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                       </div>
                     )}
 
-                    <div className="flex justify-end pt-1">
-                      <button
-                        type="button"
-                        disabled={isCommittingHitl}
-                        onClick={handleDirectHitlCommit}
-                        data-testid="hitl-commit-inventory-btn"
-                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white shadow-lg shadow-emerald-600/20 transition-all"
+                    {isHitlCommitted ? (
+                      <div
+                        data-testid="hitl-actions-committed-status"
+                        className="flex items-center justify-end pt-1"
                       >
-                        {isCommittingHitl ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                        )}
-                        <span>Commit Verified Actions to Inventory Database</span>
-                      </button>
-                    </div>
+                        <div className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-xs font-mono font-semibold">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                          <span>Inventory update actions have been committed.</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex justify-end pt-1">
+                        <button
+                          type="button"
+                          disabled={isCommittingHitl}
+                          onClick={handleDirectHitlCommit}
+                          data-testid="hitl-commit-inventory-btn"
+                          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white shadow-lg shadow-emerald-600/20 transition-all"
+                        >
+                          {isCommittingHitl ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                          )}
+                          <span>Commit Verified Actions to Inventory Database</span>
+                        </button>
+                      </div>
+                    )}
                   </div>
                 );
               })()}
             </div>
-          </div>
-        </div>
-      )}
+          );
+        })()}
+      </div>
+    </div>
+  )}
 
       {/* Pipeline Call & Prompt Inspector Modal */}
       {inspectionModal && (

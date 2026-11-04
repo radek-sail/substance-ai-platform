@@ -15,7 +15,14 @@ import {
   uploadToTenantStorage,
   getTenantGcsUri,
 } from '../services/storage.service';
-import { normalizeVideo, extractCandidateFrame } from '../services/ffmpeg.service';
+import {
+  normalizeVideo,
+  extractCandidateFrame,
+  probeVideoMetadata,
+  parseFfmpegStderrMetadata,
+} from '../services/ffmpeg.service';
+import { runPass0WorkflowClassification } from '../services/gemini.service';
+import { reconcileVideoInventoryAssociation } from './pipeline.controller';
 import * as firestoreService from '../services/firestore.service';
 import {
   db,
@@ -256,7 +263,9 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
         ? Number(req.body.duration)
         : undefined;
     const durationSeconds =
-      parsedDuration !== undefined && Number.isFinite(parsedDuration) ? parsedDuration : undefined;
+      parsedDuration !== undefined && Number.isFinite(parsedDuration) ? parsedDuration : (await probeVideoMetadata(inputLocalPath)).durationSeconds;
+    const probedMeta = await probeVideoMetadata(inputLocalPath);
+    const capturedAt = probedMeta.capturedAt || req.body?.capturedAt;
 
     const uploadedBy =
       (req.headers['x-operator-initials'] as string) ||
@@ -278,6 +287,7 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
       fileSizeBytes: stats.size,
       fileSize: stats.size,
       fileName: originalName,
+      ...(capturedAt ? { capturedAt } : {}),
       status: recordStatus,
       uploadedAt: nowIso,
       createdAt: nowIso,
@@ -319,6 +329,7 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
       originalGcsUri: rawGcsUri,
       normalizedGcsUri,
       ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+      ...(capturedAt ? { capturedAt } : {}),
       fileSizeBytes: stats.size,
       status: recordStatus,
       uploadedAt: nowIso,
@@ -393,6 +404,14 @@ export const listVideosHandler = async (req: Request, res: Response): Promise<Re
         passes: DEFAULT_VIDEO_PASSES,
         ...d,
         uploadedAt: uploadedAtStr,
+        ...(d.capturedAt
+          ? {
+              capturedAt:
+                typeof d.capturedAt.toDate === 'function'
+                  ? d.capturedAt.toDate().toISOString()
+                  : String(d.capturedAt),
+            }
+          : {}),
       };
     });
 
@@ -409,6 +428,160 @@ export const listVideosHandler = async (req: Request, res: Response): Promise<Re
               : new Date().toISOString(),
         });
       }
+    }
+
+    // Backfill capture timestamp (creation_time) and duration via ffprobe for any existing video records missing them
+    if (process.env.NODE_ENV !== 'test') {
+      const scratchDir = getScratchDir();
+      const defaultBucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
+      await Promise.all(
+        videos.map(async (v: any) => {
+          const hasDuration =
+            typeof v.durationSeconds === 'number' &&
+            Number.isFinite(v.durationSeconds) &&
+            v.durationSeconds > 0;
+          const hasCapturedAt = Boolean(v.capturedAt);
+          if ((hasDuration && hasCapturedAt) || (hasDuration && v.metadataProbed) || v.status === 'UPLOADING') {
+            return;
+          }
+
+          try {
+            const ext = path.extname(v.originalName || '') || '.mp4';
+            const localCandidates = [
+              path.join(scratchDir, 'sail_raw_cache', `raw_${v.videoId}.mp4`),
+              path.join(os.tmpdir(), 'sail_raw_cache', `raw_${v.videoId}.mp4`),
+              path.join(scratchDir, `raw_${v.videoId}${ext}`),
+              path.join(scratchDir, 'sail_normalized_cache', `norm_${v.videoId}.mp4`),
+              path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${v.videoId}.mp4`),
+            ];
+
+            let probed: { capturedAt?: string; durationSeconds?: number } = {};
+            for (const localPath of localCandidates) {
+              if (fs.existsSync(localPath)) {
+                const resMeta = await probeVideoMetadata(localPath);
+                if (!probed.capturedAt && resMeta.capturedAt) probed.capturedAt = resMeta.capturedAt;
+                if (
+                  (probed.durationSeconds === undefined || probed.durationSeconds <= 0) &&
+                  resMeta.durationSeconds !== undefined &&
+                  resMeta.durationSeconds > 0
+                ) {
+                  probed.durationSeconds = resMeta.durationSeconds;
+                }
+                if (probed.capturedAt && probed.durationSeconds && probed.durationSeconds > 0) {
+                  break;
+                }
+              }
+            }
+
+            // If still missing capturedAt or durationSeconds, probe the raw/normalized GCS object via V4 signed read URL or download
+            if (!probed.capturedAt || !probed.durationSeconds || probed.durationSeconds <= 0) {
+              const gcsUris: string[] = [
+                v.rawGcsUri,
+                v.originalGcsUri,
+                v.originalName ? `gs://${defaultBucketName}/raw/${v.videoId}/${v.originalName}` : '',
+                `gs://${defaultBucketName}/uploads/${v.videoId}.mp4`,
+                v.normalizedGcsUri,
+                v.chunks?.[0]?.gcsUri,
+                `gs://${defaultBucketName}/normalized/${v.videoId}/chunk_000.mp4`,
+                `gs://${defaultBucketName}/normalized/norm_${v.videoId}.mp4`,
+              ].filter((u): u is string => typeof u === 'string' && u.startsWith('gs://'));
+
+              const seenUris = new Set<string>();
+              for (const uri of gcsUris) {
+                if (seenUris.has(uri)) continue;
+                seenUris.add(uri);
+
+                const withoutScheme = uri.slice('gs://'.length);
+                const slashIdx = withoutScheme.indexOf('/');
+                if (slashIdx <= 0) continue;
+                const bName = withoutScheme.slice(0, slashIdx);
+                const objPath = withoutScheme.slice(slashIdx + 1);
+
+                try {
+                  const gcsFile = storage.bucket(bName).file(objPath);
+                  const [exists] = await gcsFile.exists();
+                  if (!exists) continue;
+
+                  // 1. Try fast ffprobe over V4 signed GET URL
+                  try {
+                    const [signedReadUrl] = await gcsFile.getSignedUrl({
+                      version: 'v4',
+                      action: 'read',
+                      expires: Date.now() + 15 * 60 * 1000,
+                    });
+                    if (signedReadUrl) {
+                      const remoteMeta = await probeVideoMetadata(signedReadUrl);
+                      if (!probed.capturedAt && remoteMeta.capturedAt) {
+                        probed.capturedAt = remoteMeta.capturedAt;
+                      }
+                      if (
+                        (!probed.durationSeconds || probed.durationSeconds <= 0) &&
+                        remoteMeta.durationSeconds &&
+                        remoteMeta.durationSeconds > 0
+                      ) {
+                        probed.durationSeconds = remoteMeta.durationSeconds;
+                      }
+                    }
+                  } catch {
+                    // Signed URL not available in current credentials; fall through to local download
+                  }
+
+                  // 2. If signed URL probe didn't yield duration/capturedAt, download to local raw cache and run ffprobe
+                  if (!probed.capturedAt || !probed.durationSeconds || probed.durationSeconds <= 0) {
+                    const rawCacheDir = path.join(scratchDir, 'sail_raw_cache');
+                    if (!fs.existsSync(rawCacheDir)) {
+                      fs.mkdirSync(rawCacheDir, { recursive: true });
+                    }
+                    const destPath = path.join(rawCacheDir, `raw_${v.videoId}.mp4`);
+                    if (!fs.existsSync(destPath)) {
+                      await gcsFile.download({ destination: destPath });
+                    }
+                    if (fs.existsSync(destPath)) {
+                      const dlMeta = await probeVideoMetadata(destPath);
+                      if (!probed.capturedAt && dlMeta.capturedAt) {
+                        probed.capturedAt = dlMeta.capturedAt;
+                      }
+                      if (
+                        (!probed.durationSeconds || probed.durationSeconds <= 0) &&
+                        dlMeta.durationSeconds &&
+                        dlMeta.durationSeconds > 0
+                      ) {
+                        probed.durationSeconds = dlMeta.durationSeconds;
+                      }
+                    }
+                  }
+
+                  if (probed.capturedAt && probed.durationSeconds && probed.durationSeconds > 0) {
+                    break;
+                  }
+                } catch {
+                  // try next GCS URI candidate
+                }
+              }
+            }
+
+            if (probed.capturedAt || (probed.durationSeconds !== undefined && probed.durationSeconds > 0)) {
+              const updates: Record<string, any> = { metadataProbed: true };
+              if (probed.capturedAt) {
+                v.capturedAt = probed.capturedAt;
+                updates.capturedAt = probed.capturedAt;
+              }
+              if (probed.durationSeconds !== undefined && probed.durationSeconds > 0) {
+                v.durationSeconds = probed.durationSeconds;
+                updates.durationSeconds = probed.durationSeconds;
+              }
+              await db
+                .collection('videos')
+                .doc(v.videoId)
+                .update(updates)
+                .catch(() => {});
+              firestoreService.mirrorVideoToMemory('(default)', v.videoId, updates);
+            }
+          } catch (probeErr) {
+            console.warn(`[VideoController] Metadata backfill skipped for ${v.videoId}:`, probeErr);
+          }
+        })
+      );
     }
 
     // In-memory sort by timestamp descending
@@ -480,7 +653,7 @@ export const requestUploadUrlHandler = async (req: Request, res: Response): Prom
  * 'READY_FOR_ANALYSIS' on success or 'ERROR' on failure, and cleans up `/tmp` files.
  */
 export const finalizeUploadHandler = async (req: Request, res: Response): Promise<Response | void> => {
-  const { videoId, rawGcsUri, originalName } = req.body || {};
+  const { videoId, rawGcsUri, originalName, durationSeconds: reqDurationSeconds, capturedAt: reqCapturedAt } = req.body || {};
 
   if (!videoId || !rawGcsUri || !originalName) {
     return res.status(400).json({
@@ -489,7 +662,7 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
   }
 
   const uploadedAt = new Date().toISOString();
-  const initialRecord = {
+  const initialRecord: Record<string, any> = {
     videoId,
     originalName,
     rawGcsUri,
@@ -505,6 +678,12 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
       hitl: { status: 'PENDING' as const },
     },
   };
+  if (typeof reqDurationSeconds === 'number' && Number.isFinite(reqDurationSeconds) && reqDurationSeconds > 0) {
+    initialRecord.durationSeconds = reqDurationSeconds;
+  }
+  if (typeof reqCapturedAt === 'string' && reqCapturedAt.trim()) {
+    initialRecord.capturedAt = reqCapturedAt.trim();
+  }
 
   try {
     // 1. Write an initial record to Firestore videos/{videoId}
@@ -563,6 +742,14 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
       }
 
       // Ensure /tmp/chunks_${videoId} is created before spawning FFmpeg
+      const probedMeta = await probeVideoMetadata(rawFilePath);
+      if (probedMeta.capturedAt || probedMeta.durationSeconds !== undefined) {
+        const earlyMetaUpdates: Record<string, any> = {};
+        if (probedMeta.capturedAt) earlyMetaUpdates.capturedAt = probedMeta.capturedAt;
+        if (probedMeta.durationSeconds !== undefined) earlyMetaUpdates.durationSeconds = probedMeta.durationSeconds;
+        await db.collection('videos').doc(videoId).update(earlyMetaUpdates).catch(() => {});
+        firestoreService.mirrorVideoToMemory('(default)', videoId, earlyMetaUpdates);
+      }
       fs.mkdirSync(chunksDir, { recursive: true });
 
       const ffmpegArgs = [
@@ -597,12 +784,17 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
 
       console.log(`[Transcode] Launching FFmpeg segmentation for ${videoId}...`);
       const ffmpegBinary = process.env.FFMPEG_PATH || 'ffmpeg';
+      let ffmpegStderr = '';
 
       await new Promise<void>((resolve, reject) => {
         const childProcess = spawn(ffmpegBinary, ffmpegArgs);
 
         childProcess.stdout?.on('data', (d) => console.log(`[FFmpeg ${videoId}]: ${d}`));
-        childProcess.stderr?.on('data', (d) => console.log(`[FFmpeg ${videoId}]: ${d}`));
+        childProcess.stderr?.on('data', (d) => {
+          const str = String(d);
+          ffmpegStderr += str;
+          console.log(`[FFmpeg ${videoId}]: ${str}`);
+        });
 
         childProcess.on('error', (err) => {
           console.error(`[FFmpeg ${videoId}] Spawn error:`, err);
@@ -618,6 +810,16 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
           }
         });
       });
+
+      if ((!probedMeta.capturedAt || probedMeta.durationSeconds === undefined) && ffmpegStderr) {
+        const stderrMeta = parseFfmpegStderrMetadata(ffmpegStderr);
+        if (!probedMeta.capturedAt && stderrMeta.capturedAt) {
+          probedMeta.capturedAt = stderrMeta.capturedAt;
+        }
+        if (probedMeta.durationSeconds === undefined && stderrMeta.durationSeconds !== undefined) {
+          probedMeta.durationSeconds = stderrMeta.durationSeconds;
+        }
+      }
 
       let chunkFiles = fs
         .readdirSync(chunksDir)
@@ -697,7 +899,63 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         transcodedAt,
         normalizedGcsUri,
       });
+      if (probedMeta.capturedAt || probedMeta.durationSeconds !== undefined) {
+        const metaUpdates: Record<string, any> = {};
+        if (probedMeta.capturedAt) metaUpdates.capturedAt = probedMeta.capturedAt;
+        if (probedMeta.durationSeconds !== undefined) metaUpdates.durationSeconds = probedMeta.durationSeconds;
+        await db.collection('videos').doc(videoId).update(metaUpdates);
+        firestoreService.mirrorVideoToMemory('(default)', videoId, metaUpdates);
+      }
       console.log(`[Transcode] Video ${videoId} successfully marked READY_FOR_ANALYSIS`);
+
+      // Automatically execute Pass 0 (Workflow Classification) once transcoding is finished
+      try {
+        console.log(`[Transcode] Automatically starting Pass 0 Workflow Classification for ${videoId}...`);
+        const pass0StartedAt = new Date().toISOString();
+        await firestoreService.updateVideoPass('(default)', videoId, 'pass0', {
+          status: 'RUNNING',
+          startedAt: pass0StartedAt,
+        });
+
+        const firstChunkLocalPath = path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}.mp4`);
+        const classification = await runPass0WorkflowClassification({
+          videoGcsUri: normalizedGcsUri,
+          localVideoPath: fs.existsSync(firstChunkLocalPath) ? firstChunkLocalPath : undefined,
+          customerId: 'customer-alpha',
+          videoId,
+          registeredFileUri: normalizedGcsUri,
+          videoRecord: {
+            videoId,
+            originalName,
+            rawGcsUri,
+            normalizedGcsUri,
+            chunks,
+            totalChunks: chunks.length,
+          },
+          databaseId: '(default)',
+        });
+
+        const pass0CompletedAt = new Date().toISOString();
+        const pass0Audit = (classification as any)?.executionAudit;
+        await firestoreService.updateVideoPass('(default)', videoId, 'pass0', {
+          status: 'COMPLETED',
+          data: classification,
+          executionAudit: pass0Audit,
+          error: null,
+          startedAt: pass0StartedAt,
+          completedAt: pass0CompletedAt,
+        });
+
+        await reconcileVideoInventoryAssociation('(default)', videoId, classification);
+        console.log(`[Transcode] Automatic Pass 0 completed for ${videoId}: ${classification.workflowType}`);
+      } catch (pass0Err: any) {
+        console.warn(`[Transcode] Automatic Pass 0 failed for ${videoId}:`, pass0Err);
+        await firestoreService.updateVideoPass('(default)', videoId, 'pass0', {
+          status: 'ERROR',
+          error: pass0Err?.message || 'Automatic Pass 0 classification failed',
+          completedAt: new Date().toISOString(),
+        });
+      }
     } catch (err: any) {
       console.error(`[Transcode Error] Video ${videoId} failed:`, err);
       try {
@@ -1071,5 +1329,66 @@ export const getVideoFrameHandler = async (req: Request, res: Response): Promise
     return res.status(200).send(svg);
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'Failed to serve frame' });
+  }
+};
+
+
+/**
+ * Controller for DELETE /api/videos/:videoId
+ * Removes the video record (`videos/{videoId}`) and its analysis (`video_analyses/{videoId}`) from Firestore
+ * and cleans up any local cache artifacts.
+ */
+export const deleteVideoHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const videoId = req.params.videoId || req.body?.videoId;
+  if (!videoId) {
+    return res.status(400).json({ error: 'Missing required parameter: videoId' });
+  }
+
+  const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
+
+  try {
+    await firestoreService.deleteVideoRecord(databaseId, videoId);
+    if (databaseId !== '(default)') {
+      await firestoreService.deleteVideoRecord('(default)', videoId);
+    }
+
+    // Also attempt direct deletion on the default Firestore instance if mocked or separate
+    try {
+      const vidRef = db.collection('videos')?.doc(videoId) as any;
+      if (vidRef && typeof vidRef.delete === 'function') {
+        await vidRef.delete();
+      }
+      const analysisRef = db.collection('video_analyses')?.doc(videoId) as any;
+      if (analysisRef && typeof analysisRef.delete === 'function') {
+        await analysisRef.delete();
+      }
+    } catch {
+      // Ignore direct delete errors if already handled by deleteVideoRecord
+    }
+
+    // Clean up local cache files if present
+    try {
+      const scratchDir = getScratchDir();
+      const rawCached = path.join(scratchDir, 'sail_raw_cache', `raw_${videoId}.mp4`);
+      const normCached = path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}.mp4`);
+      if (fs.existsSync(rawCached)) {
+        await fs.promises.unlink(rawCached).catch(() => {});
+      }
+      if (fs.existsSync(normCached)) {
+        await fs.promises.unlink(normCached).catch(() => {});
+      }
+    } catch {
+      // Ignore local cache cleanup errors
+    }
+
+    return res.status(200).json({
+      success: true,
+      videoId,
+      message: `Video ${videoId} removed from database.`,
+    });
+  } catch (err: any) {
+    console.error(`[VideoController] Error deleting video ${videoId}:`, err);
+    return res.status(500).json({ error: err?.message || 'Failed to delete video' });
   }
 };

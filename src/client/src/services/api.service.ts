@@ -1076,10 +1076,47 @@ export class ApiService {
       },
     };
   }
+
+  /**
+   * deleteVideo(videoId, options):
+   * Deletes the video record and its analysis from the database via DELETE /api/videos/:videoId.
+   */
+  public async deleteVideo(
+    videoId: string,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<{ success: boolean; videoId: string; message?: string }> {
+    const customerId = options?.customerId || this.tenant.customerId;
+    const databaseId = options?.databaseId || this.tenant.databaseId;
+    const headers = await this.getHeaders({
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+    });
+
+    const response = await fetch(`${this.baseUrl}/api/videos/${encodeURIComponent(videoId)}`, {
+      method: 'DELETE',
+      headers,
+    });
+
+    if (!response.ok) {
+      let errMsg = `HTTP ${response.status}`;
+      try {
+        const errBody = await response.json();
+        errMsg = errBody.error || errBody.message || errMsg;
+      } catch {
+        // ignore
+      }
+      throw new Error(`Failed to delete video: ${errMsg}`);
+    }
+
+    return (await response.json()) as { success: boolean; videoId: string; message?: string };
+  }
 }
 
 // Export singleton instance and convenience functions
 export const apiService = new ApiService();
+
+export const deleteVideo = (videoId: string, options?: { customerId?: string; databaseId?: string }) =>
+  apiService.deleteVideo(videoId, options);
 
 export const fetchVideos = (options?: { customerId?: string; databaseId?: string }) =>
   apiService.fetchVideos(options);
@@ -1256,28 +1293,34 @@ export function generateInventorySignOffPayload(
         const col = Number(
           act.boxWellLocation?.col ?? act.boxColId ?? spatialRef?.spatialResult?.col ?? 1
         );
-        const status =
-          act.actionClass === 'VIAL_REMOVAL_ACTION' ? 'EMPTY' : 'OCCUPIED';
+        const isRemoval = String(act.actionType || act.actionClass || '')
+          .toUpperCase()
+          .includes('REMOVAL');
+        const status = isRemoval ? 'EMPTY' : 'OCCUPIED';
 
         return BoxUpdateSchema.parse({
           boxId: act.cellLineInfo?.boxId || defaultBoxId,
           row,
           col,
-          cellLineName: act.vialLabelData?.cellLineName || act.cellLineName || 'Unknown',
-          userInitials:
-            act.vialLabelData?.userInitials ||
-            act.cellLineInfo?.userInitials ||
-            operatorInitials,
+          cellLineName: isRemoval
+            ? act.vialLabelData?.cellLineName || act.cellLineName || ''
+            : act.vialLabelData?.cellLineName || act.cellLineName || 'Unknown',
+          userInitials: isRemoval
+            ? act.vialLabelData?.userInitials || act.cellLineInfo?.userInitials || undefined
+            : act.vialLabelData?.userInitials ||
+              act.cellLineInfo?.userInitials ||
+              operatorInitials,
           dateFrozen:
             act.vialLabelData?.dateFrozen ||
             act.cellLineInfo?.dateFrozen ||
             undefined,
-          fullText:
-            act.vialLabelData?.fullText ||
-            act.cellLineInfo?.fullText ||
-            act.vialLabelData?.cellLineName ||
-            act.cellLineName ||
-            'Unknown',
+          fullText: isRemoval
+            ? act.vialLabelData?.fullText || act.cellLineInfo?.fullText || ''
+            : act.vialLabelData?.fullText ||
+              act.cellLineInfo?.fullText ||
+              act.vialLabelData?.cellLineName ||
+              act.cellLineName ||
+              'Unknown',
           lotNumber:
             act.cellLineInfo?.lotNumber || act.cellLineInfo?.lot || undefined,
           passage:
@@ -1286,10 +1329,7 @@ export function generateInventorySignOffPayload(
               : undefined,
           operatorInitials,
           actionId: act.actionId,
-          actionType:
-            act.actionClass === 'VIAL_REMOVAL_ACTION'
-              ? 'VIAL_REMOVAL'
-              : 'VIAL_INSERTION',
+          actionType: isRemoval ? 'VIAL_REMOVAL' : 'VIAL_INSERTION',
           highlighted: status === 'OCCUPIED',
           status,
           updatedAt: signedOffAt,

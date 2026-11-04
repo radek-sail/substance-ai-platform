@@ -63,7 +63,6 @@ function buildLocalDemoInventory(): InventoryRecord {
         line: 'HEK293T',
         lot: 'LOT-8841',
         p: 5,
-        highlighted: true,
         userInitials: 'JS',
         dateFrozen: '2026-03-15',
         fullText: 'HEK293T | P5 | LOT-8841 | JS | 2026-03-15',
@@ -168,15 +167,9 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
 
   // Selected Cell Coordinate State for the Right-Hand Cell Content Panel
   const [selectedCellCoord, setSelectedCellCoord] = useState<{ row: string; col: number }>({
-    row: targetRow || 'C',
-    col: targetCol || 4,
+    row: 'A',
+    col: 1,
   });
-
-  useEffect(() => {
-    if (targetRow && targetCol) {
-      setSelectedCellCoord({ row: targetRow, col: targetCol });
-    }
-  }, [targetRow, targetCol]);
 
   useEffect(() => {
     if (initialInventoryId) {
@@ -370,7 +363,7 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
     return activeInventory.boxes[selectedBoxId] || Object.values(activeInventory.boxes)[0] || null;
   }, [activeInventory, selectedBoxId]);
 
-  // Compute highlighted coordinates from inserted vials in box & analysis actions
+  // Compute highlighted coordinates from inserted vials in box
   const highlightedCoords = useMemo(() => {
     const coords = new Set<string>();
     if (activeBox?.cells) {
@@ -388,27 +381,8 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
         }
       });
     }
-    const actionsList = safeActions || (analysis?.actions ?? []);
-    actionsList.forEach((act) => {
-      const cls = String(act.actionClass || '');
-      if (cls.includes('INSERTION') || cls.includes('HANDLING')) {
-        const c =
-          act.boxWellLocation?.coordinate ||
-          (act.boxRowId && act.boxColId ? `${act.boxRowId}${act.boxColId}` : undefined) ||
-          (act.targetRow && act.targetCol ? `${act.targetRow}${act.targetCol}` : undefined);
-        if (c && (!activeBox?.cells || activeBox.cells[c]?.occupied)) {
-          coords.add(c);
-        }
-      }
-    });
-    if (targetRow && targetCol) {
-      const tc = `${targetRow}${targetCol}`;
-      if (!activeBox?.cells || activeBox.cells[tc]?.occupied) {
-        coords.add(tc);
-      }
-    }
     return Array.from(coords);
-  }, [activeBox, safeActions, analysis, targetRow, targetCol]);
+  }, [activeBox]);
 
   // Switch box selection
   const handleSelectBox = (boxId: string) => {
@@ -614,8 +588,6 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
       col: selectedCellCoord.col,
       targetRow: selectedCellCoord.row,
       targetCol: selectedCellCoord.col,
-      differencedRow: rawTargetRow,
-      differencedCol: rawTargetCol,
       highlightedCoords,
       searchMatchingCoords,
       cells: activeBox?.cells,
@@ -623,8 +595,6 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
   }, [
     selectedCellCoord.row,
     selectedCellCoord.col,
-    rawTargetRow,
-    rawTargetCol,
     highlightedCoords,
     searchMatchingCoords,
     activeBox?.cells,
@@ -731,13 +701,11 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
             cells={activeBox?.cells}
             targetRow={selectedCellCoord.row}
             targetCol={selectedCellCoord.col}
-            differencedRow={rawTargetRow}
-            differencedCol={rawTargetCol}
             highlightedCoords={highlightedCoords}
             searchMatchingCoords={searchMatchingCoords}
             onSelectSlot={handleSelectSlot}
             onUpdateCell={handleUpdateCell}
-            readOnly={isSignedOff}
+            readOnly={false}
           />
         </div>
 
@@ -747,7 +715,7 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
             boxId={displayBoxId}
             slot={selectedSlot}
             onUpdateCell={handleUpdateCell}
-            readOnly={isSignedOff}
+            readOnly={false}
           />
         </div>
       </div>

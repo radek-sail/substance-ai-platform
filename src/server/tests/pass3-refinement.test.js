@@ -508,6 +508,104 @@ describe('Pass 3 Analysis Refinement: Dual-Shot Label Conflation, Top-Right Blac
       assert.strictEqual(actions[0].cellLineName, 'CHO-K1');
       assert.strictEqual(actions[0].boxWellLocation.originCorner, 'TOP_LEFT_BLACK');
     });
+
+    it('should skip vial label transcription for VIAL_REMOVAL actions and leave all label fields empty except well coordinate', async () => {
+      const capturedRequests = [];
+      setGenAIClient({
+        models: {
+          generateContent: async (req) => {
+            capturedRequests.push(req);
+            const parts = req.contents?.[0]?.parts || [];
+            const textPart = parts.find((p) => typeof p.text === 'string')?.text || '';
+            assert.ok(
+              !textPart.includes('LABEL PRESENTATION EVENT'),
+              'Should NOT call Gemini for vial label presentation events associated with VIAL_REMOVAL actions'
+            );
+            return {
+              text: JSON.stringify({
+                actionId: 'act_remove_01',
+                refinementClass: 'SPATIAL_REFINEMENT',
+                boxWellLocation: {
+                  actionId: 'act_remove_01',
+                  row: 'D',
+                  col: 6,
+                  coordinate: 'D6',
+                  originCorner: 'TOP_LEFT_BLACK',
+                  confidence: 0.99,
+                },
+                spatialResult: {
+                  row: 'D',
+                  col: 6,
+                },
+              }),
+            };
+          },
+        },
+      });
+
+      const actions = [
+        {
+          actionId: 'act_remove_01',
+          actionType: 'VIAL_REMOVAL',
+          actionClass: 'VIAL_REMOVAL_ACTION',
+          startTime: 2.0,
+          endTime: 6.0,
+          cellLineName: 'ShouldBeCleared',
+          userInitials: 'RK',
+          dateFrozen: '2026-01-01',
+          fullText: 'ShouldBeCleared RK 2026-01-01',
+          eventList: ['evt_remove_label_01'],
+        },
+      ];
+      const events = [
+        {
+          eventId: 'evt_remove_label_01',
+          actionId: 'act_remove_01',
+          actionIds: ['act_remove_01'],
+          eventClass: 'VIAL_LABEL_PRESENTATION',
+          description: 'Operator glances at vial label after removing vial',
+          startTime: 4.5,
+          endTime: 5.5,
+          bestShotTimes: [4.8, 5.2],
+        },
+      ];
+
+      const refinements = await runPass3AnalysisRefinement({
+        videoId: 'vid_removal_skip_label',
+        videoGcsUri: 'gs://test-bucket/normalized/vid_removal_skip_label.mp4',
+        classification: { workflowType: 'INVENTORY_UPDATE_WORKFLOW', confidence: 0.99 },
+        actions,
+        events,
+      });
+
+      // Only 1 request should be made (for the action well coordinate interval), 0 for the vial label presentation event
+      assert.strictEqual(capturedRequests.length, 1);
+      assert.strictEqual(refinements.labelTranscriptions.length, 0);
+      assert.strictEqual(refinements.actionWellLocations.length, 1);
+
+      const act = actions[0];
+      assert.strictEqual(act.targetCoordinate, 'D6');
+      assert.strictEqual(act.boxRowId, 'D');
+      assert.strictEqual(act.boxColId, 6);
+      assert.strictEqual(act.boxWellLocation.coordinate, 'D6');
+      assert.strictEqual(act.cellLineName, '');
+      assert.strictEqual(act.userInitials, '');
+      assert.strictEqual(act.operatorInitials, '');
+      assert.strictEqual(act.dateFrozen, '');
+      assert.strictEqual(act.fullText, '');
+      assert.strictEqual(act.conflatedLabelText, '');
+      assert.strictEqual(act.lotNumber, '');
+      assert.strictEqual(act.vialLabelData.cellLineName, '');
+      assert.strictEqual(act.vialLabelData.userInitials, '');
+      assert.strictEqual(act.vialLabelData.dateFrozen, '');
+      assert.strictEqual(act.vialLabelData.fullText, '');
+      assert.strictEqual(act.cellLineInfo.name, '');
+      assert.strictEqual(act.cellLineInfo.cellLineName, '');
+      assert.strictEqual(act.cellLineInfo.userInitials, '');
+      assert.strictEqual(act.cellLineInfo.dateFrozen, '');
+      assert.strictEqual(act.cellLineInfo.fullText, '');
+      assert.strictEqual(act.cellLineInfo.targetCoordinate, 'D6');
+    });
   });
 
   describe('4. HITL Inventory Sign-Off & Cryo-Inventory Highlighted Well Persistence', () => {

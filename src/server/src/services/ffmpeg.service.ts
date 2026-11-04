@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import ffmpeg from 'fluent-ffmpeg';
 import fs from 'fs';
 import path from 'path';
@@ -517,6 +518,161 @@ export function segmentVideoToChunks(
 
     command.run();
   });
+}
+
+export interface ProbedVideoMetadata {
+  capturedAt?: string;
+  durationSeconds?: number;
+  rawOutput?: string;
+}
+
+/**
+ * Parses stdout from:
+ * ffprobe -v error -show_entries format_tags=creation_time:format=duration -of default=noprint_wrappers=1 <input>
+ */
+export function parseFfprobeOutput(output: string): ProbedVideoMetadata {
+  const result: ProbedVideoMetadata = { rawOutput: output };
+  if (!output) return result;
+
+  const lines = output.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const eqIdx = line.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = line.slice(0, eqIdx).trim().toLowerCase();
+    const val = line.slice(eqIdx + 1).trim();
+    if (!val || val.toLowerCase() === 'n/a') continue;
+
+    if (key === 'duration') {
+      const parsedDur = parseFloat(val);
+      if (Number.isFinite(parsedDur) && parsedDur > 0) {
+        const rounded = Number(parsedDur.toFixed(2));
+        if (result.durationSeconds === undefined || rounded > result.durationSeconds) {
+          result.durationSeconds = rounded;
+        }
+      }
+    } else if (
+      key === 'tag:creation_time' ||
+      key === 'creation_time' ||
+      key === 'tag:com.apple.quicktime.creationdate' ||
+      key === 'com.apple.quicktime.creationdate' ||
+      key === 'tag:date' ||
+      key === 'date'
+    ) {
+      if (!result.capturedAt) {
+        const parsedDate = new Date(val);
+        if (!Number.isNaN(parsedDate.getTime()) && parsedDate.getFullYear() > 1971) {
+          result.capturedAt = parsedDate.toISOString();
+        } else if (val.length >= 8 && !val.startsWith('1970-') && !val.startsWith('1904-')) {
+          result.capturedAt = val;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Fallback parser for FFmpeg stderr output (e.g. `Duration: 00:02:15.40` and `creation_time : 2026-03-15T...`).
+ */
+export function parseFfmpegStderrMetadata(stderrOutput: string): ProbedVideoMetadata {
+  const result: ProbedVideoMetadata = {};
+  if (!stderrOutput) return result;
+
+  const durMatch = stderrOutput.match(/Duration:\s*(\d{2,}):(\d{2}):(\d{2}(?:\.\d+)?)/i);
+  if (durMatch) {
+    const hours = parseFloat(durMatch[1]);
+    const mins = parseFloat(durMatch[2]);
+    const secs = parseFloat(durMatch[3]);
+    const total = hours * 3600 + mins * 60 + secs;
+    if (Number.isFinite(total) && total > 0) {
+      result.durationSeconds = Number(total.toFixed(2));
+    }
+  }
+
+  const creationMatch = stderrOutput.match(/creation_time\s*:\s*([^\r\n]+)/i);
+  if (creationMatch && creationMatch[1]) {
+    const rawVal = creationMatch[1].trim();
+    const parsedDate = new Date(rawVal);
+    if (!Number.isNaN(parsedDate.getTime()) && parsedDate.getFullYear() > 1971) {
+      result.capturedAt = parsedDate.toISOString();
+    }
+  }
+
+  return result;
+}
+
+function runFfprobeOnce(inputPath: string, showEntries: string): Promise<ProbedVideoMetadata> {
+  return new Promise((resolve) => {
+    const ffprobeBinary = process.env.FFPROBE_PATH || 'ffprobe';
+    const args = [
+      '-v',
+      'error',
+      '-show_entries',
+      showEntries,
+      '-of',
+      'default=noprint_wrappers=1',
+      inputPath,
+    ];
+
+    let stdout = '';
+    let stderr = '';
+    try {
+      const proc = spawn(ffprobeBinary, args);
+      proc.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      proc.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      proc.on('error', (err) => {
+        console.warn(`[FFprobe] Failed to spawn ffprobe on ${inputPath}:`, err.message);
+        resolve({});
+      });
+      proc.on('close', (code) => {
+        if (code !== 0 && !stdout.trim()) {
+          console.warn(`[FFprobe] Exited with code ${code} on ${inputPath}: ${stderr.trim()}`);
+          return resolve({});
+        }
+        resolve(parseFfprobeOutput(stdout));
+      });
+    } catch (err: any) {
+      console.warn(`[FFprobe] Exception probing ${inputPath}:`, err?.message || err);
+      resolve({});
+    }
+  });
+}
+
+/**
+ * Extracts video creation_time (capture timestamp) and duration using ffprobe:
+ * ffprobe -v error -show_entries format_tags=creation_time:format=duration -of default=noprint_wrappers=1 <inputPath>
+ */
+export async function probeVideoMetadata(inputPath: string): Promise<ProbedVideoMetadata> {
+  const isRemoteUrl = typeof inputPath === 'string' && /^https?:\/\//i.test(inputPath);
+  if (!inputPath || (!isRemoteUrl && !fs.existsSync(inputPath))) {
+    return {};
+  }
+
+  const primary = await runFfprobeOnce(inputPath, 'format_tags=creation_time:format=duration');
+  if (primary.capturedAt && primary.durationSeconds !== undefined && primary.durationSeconds > 0) {
+    return primary;
+  }
+
+  // Fallback check for stream-level tags or QuickTime creationdate if missing from primary format_tags/format
+  const fallback = await runFfprobeOnce(
+    inputPath,
+    'format_tags=creation_time,com.apple.quicktime.creationdate,date:stream_tags=creation_time:format=duration:stream=duration'
+  );
+
+  return {
+    capturedAt: primary.capturedAt || fallback.capturedAt,
+    durationSeconds:
+      primary.durationSeconds !== undefined && primary.durationSeconds > 0
+        ? primary.durationSeconds
+        : fallback.durationSeconds,
+    rawOutput: [primary.rawOutput, fallback.rawOutput].filter(Boolean).join('\n'),
+  };
 }
 
 export { ffmpeg };

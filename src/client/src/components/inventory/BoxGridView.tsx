@@ -57,10 +57,10 @@ export function resolveGridSlotData(params: {
   const {
     row,
     col,
-    targetRow = 'C',
-    targetCol = 4,
-    differencedRow = 'C',
-    differencedCol = 4,
+    targetRow = 'A',
+    targetCol = 1,
+    differencedRow,
+    differencedCol,
     highlightedCoords = [],
     searchMatchingCoords = [],
     slots = {},
@@ -69,7 +69,9 @@ export function resolveGridSlotData(params: {
 
   const key = `${row}${col}`;
   const isTarget = row === targetRow && col === targetCol;
-  const isDiff = row === differencedRow && col === differencedCol;
+  const isDiff = Boolean(
+    differencedRow && differencedCol !== undefined && row === differencedRow && col === differencedCol
+  );
   const isSearchMatch = Boolean(searchMatchingCoords.includes(key));
 
   if (cells && cells[key]) {
@@ -575,10 +577,10 @@ export const BoxGridView: React.FC<BoxGridViewProps> = ({
   rows = 9,
   cols = 9,
   boxId = 'Box_01',
-  targetRow = 'C',
-  targetCol = 4,
-  differencedRow = 'C',
-  differencedCol = 4,
+  targetRow = 'A',
+  targetCol = 1,
+  differencedRow,
+  differencedCol,
   highlightedCoords = [],
   searchMatchingCoords = [],
   slots = {},
@@ -656,10 +658,12 @@ export const BoxGridView: React.FC<BoxGridViewProps> = ({
             <span className="w-3 h-3 rounded bg-cyan-500/20 border-2 border-cyan-400 animate-pulse shadow-sm shadow-cyan-400" />
             <span className="text-cyan-300">Selected ({targetRow}{targetCol})</span>
           </div>
-          <div className="flex items-center gap-1.5">
-            <span className="w-3 h-3 rounded bg-amber-500/30 border border-amber-400" />
-            <span className="text-amber-300">Diff Change</span>
-          </div>
+          {differencedRow && differencedCol !== undefined && (
+            <div className="flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded bg-amber-500/30 border border-amber-400" />
+              <span className="text-amber-300">Diff Change</span>
+            </div>
+          )}
           <div className="flex items-center gap-1.5">
             <span className="w-3 h-3 rounded bg-slate-700 border border-slate-600" />
             <span className="text-slate-400">Occupied</span>
@@ -836,12 +840,14 @@ export const BoxGridView: React.FC<BoxGridViewProps> = ({
             </strong>
           </span>
         </div>
-        <div className="flex items-center gap-2 text-slate-400 font-mono text-[11px]">
-          <span className="bg-slate-800 px-2 py-0.5 rounded text-emerald-400">
-            Pass 3 Differencing Confirmed
-          </span>
-          <span>(Δ = 0.00 euclidean)</span>
-        </div>
+        {differencedRow && differencedCol !== undefined && (
+          <div className="flex items-center gap-2 text-slate-400 font-mono text-[11px]">
+            <span className="bg-slate-800 px-2 py-0.5 rounded text-emerald-400">
+              Pass 3 Differencing Confirmed
+            </span>
+            <span>(Δ = 0.00 euclidean)</span>
+          </div>
+        )}
       </div>
 
       {/* Optional Modal Fallback when showModalOnSelect is explicitly true */}

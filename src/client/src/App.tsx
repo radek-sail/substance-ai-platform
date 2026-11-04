@@ -70,48 +70,73 @@ function deriveInventoryDataFromAnalysis(
     labelRec?.vialLabelData ||
     ocrRef?.vialLabelData;
 
-  const cellLineName =
-    vialLabelData?.cellLineName ||
-    labelRec?.cellLineName ||
-    targetAction?.cellLineName ||
-    cellLineInfo.name ||
-    (isDemoDoc ? 'HEK293T' : '');
-  const userInitials = String(
-    vialLabelData?.userInitials ||
-      labelRec?.userInitials ||
-      cellLineInfo.userInitials ||
-      cellLineInfo.operatorInitials ||
-      cellLineInfo.operator ||
-      (isDemoDoc ? 'RS' : '')
-  );
-  const dateFrozen = String(
-    vialLabelData?.dateFrozen ||
-      labelRec?.dateFrozen ||
-      cellLineInfo.dateFrozen ||
-      (isDemoDoc ? '2026-03-15' : '')
-  );
-  const fullText = String(
-    vialLabelData?.fullText ||
-      labelRec?.fullText ||
-      labelRec?.conflatedText ||
-      targetAction?.conflatedLabelText ||
-      cellLineInfo.fullText ||
-      ocrRef?.transcriptionText ||
-      (isDemoDoc ? `${cellLineName} P5 Lot#8841 ${userInitials} ${dateFrozen}` : cellLineName)
-  );
   const isRemoval = String(
-    targetAction?.actionClass || ''
+    targetAction?.actionType || targetAction?.actionClass || ''
   )
     .toUpperCase()
     .includes('REMOVAL');
+
+  const cellLineName = isRemoval
+    ? String(
+        vialLabelData?.cellLineName ||
+          targetAction?.cellLineName ||
+          cellLineInfo.name ||
+          ''
+      )
+    : vialLabelData?.cellLineName ||
+      labelRec?.cellLineName ||
+      targetAction?.cellLineName ||
+      cellLineInfo.name ||
+      (isDemoDoc ? 'HEK293T' : '');
+  const userInitials = isRemoval
+    ? String(
+        vialLabelData?.userInitials ||
+          cellLineInfo.userInitials ||
+          cellLineInfo.operatorInitials ||
+          ''
+      )
+    : String(
+        vialLabelData?.userInitials ||
+          labelRec?.userInitials ||
+          cellLineInfo.userInitials ||
+          cellLineInfo.operatorInitials ||
+          cellLineInfo.operator ||
+          (isDemoDoc ? 'RS' : '')
+      );
+  const dateFrozen = isRemoval
+    ? String(vialLabelData?.dateFrozen || cellLineInfo.dateFrozen || '')
+    : String(
+        vialLabelData?.dateFrozen ||
+          labelRec?.dateFrozen ||
+          cellLineInfo.dateFrozen ||
+          (isDemoDoc ? '2026-03-15' : '')
+      );
+  const fullText = isRemoval
+    ? String(
+        vialLabelData?.fullText ||
+          targetAction?.conflatedLabelText ||
+          cellLineInfo.fullText ||
+          ''
+      )
+    : String(
+        vialLabelData?.fullText ||
+          labelRec?.fullText ||
+          labelRec?.conflatedText ||
+          targetAction?.conflatedLabelText ||
+          cellLineInfo.fullText ||
+          ocrRef?.transcriptionText ||
+          (isDemoDoc ? `${cellLineName} P5 Lot#8841 ${userInitials} ${dateFrozen}` : cellLineName)
+      );
 
   return {
     cellLineName,
     userInitials,
     dateFrozen,
     fullText,
-    lotNumber: String(cellLineInfo.lotNumber || cellLineInfo.lot || 'LOT-8841'),
-    passage: typeof cellLineInfo.passage === 'number' ? cellLineInfo.passage : 5,
+    lotNumber: isRemoval
+      ? String(cellLineInfo.lotNumber || cellLineInfo.lot || '')
+      : String(cellLineInfo.lotNumber || cellLineInfo.lot || 'LOT-8841'),
+    passage: typeof cellLineInfo.passage === 'number' ? cellLineInfo.passage : isRemoval ? 1 : 5,
     operatorInitials: userInitials,
     targetCoordinate: String(
       wellLoc?.coordinate || cellLineInfo.targetCoordinate || `${row}${col}`
@@ -546,7 +571,7 @@ export const App: React.FC = () => {
       {/* Main Workspace Body */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 space-y-6">
         {/* Signed-off Lock Banner */}
-        {isSignedOff && (
+        {isSignedOff && activeTab === 'archive' && (
           <div className="bg-emerald-950/70 border border-emerald-500/50 rounded-2xl p-4 flex items-center justify-between shadow-lg">
             <div className="flex items-center gap-3">
               <div className="p-2 rounded-xl bg-emerald-900 border border-emerald-600 text-emerald-300">

@@ -191,44 +191,53 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
             const rawActType =
               actEdit?.actionType ||
               act.boxWellLocation?.actionType ||
-              (String(act.actionClass || '').includes('REMOVAL')
+              (String(act.actionType || act.actionClass || '').toUpperCase().includes('REMOVAL')
                 ? 'VIAL_REMOVAL'
                 : 'VIAL_INSERTION');
             const actionType: 'VIAL_INSERTION' | 'VIAL_REMOVAL' =
               rawActType === 'VIAL_REMOVAL' ? 'VIAL_REMOVAL' : 'VIAL_INSERTION';
-            const cellLineName =
-              actEdit?.cellLineName ||
-              act.vialLabelData?.cellLineName ||
-              act.cellLineInfo?.name ||
-              activeEdited.cellLineName ||
-              'HEK293T';
-            const userInitials =
-              actEdit?.userInitials ||
-              act.vialLabelData?.userInitials ||
-              activeEdited.userInitials ||
-              operatorInitials;
-            const dateFrozen =
-              actEdit?.dateFrozen ||
-              act.vialLabelData?.dateFrozen ||
-              activeEdited.dateFrozen;
-            const fullText =
-              actEdit?.fullText ||
-              act.vialLabelData?.fullText ||
-              act.conflatedLabelText ||
-              activeEdited.fullText ||
-              `${cellLineName} | ${userInitials}${dateFrozen ? ` | ${dateFrozen}` : ''}`;
+            const isActRemoval = actionType === 'VIAL_REMOVAL';
+            const cellLineName = isActRemoval
+              ? (actEdit?.cellLineName ?? act.vialLabelData?.cellLineName ?? act.cellLineInfo?.name ?? '')
+              : (actEdit?.cellLineName ||
+                act.vialLabelData?.cellLineName ||
+                act.cellLineInfo?.name ||
+                activeEdited.cellLineName ||
+                'HEK293T');
+            const userInitials = isActRemoval
+              ? (actEdit?.userInitials ?? act.vialLabelData?.userInitials ?? '')
+              : (actEdit?.userInitials ||
+                act.vialLabelData?.userInitials ||
+                activeEdited.userInitials ||
+                operatorInitials);
+            const dateFrozen = isActRemoval
+              ? (actEdit?.dateFrozen ?? act.vialLabelData?.dateFrozen ?? '')
+              : (actEdit?.dateFrozen ||
+                act.vialLabelData?.dateFrozen ||
+                activeEdited.dateFrozen);
+            const fullText = isActRemoval
+              ? (actEdit?.fullText ?? act.vialLabelData?.fullText ?? act.conflatedLabelText ?? '')
+              : (actEdit?.fullText ||
+                act.vialLabelData?.fullText ||
+                act.conflatedLabelText ||
+                activeEdited.fullText ||
+                `${cellLineName} | ${userInitials}${dateFrozen ? ` | ${dateFrozen}` : ''}`);
 
             boxUpdates.push({
               boxId: actEdit?.boxId || activeEdited.boxId || 'box_01',
               row,
               col,
               cellLineName,
-              userInitials,
+              userInitials: userInitials || undefined,
               operatorInitials: userInitials || operatorInitials,
-              dateFrozen,
+              dateFrozen: dateFrozen || undefined,
               fullText,
-              lotNumber: actEdit?.lotNumber || act.cellLineInfo?.lotNumber || activeEdited.lotNumber,
-              passage: actEdit?.passage ?? act.cellLineInfo?.passage ?? activeEdited.passage,
+              lotNumber: isActRemoval
+                ? (actEdit?.lotNumber || act.cellLineInfo?.lotNumber || undefined)
+                : (actEdit?.lotNumber || act.cellLineInfo?.lotNumber || activeEdited.lotNumber),
+              passage: isActRemoval
+                ? (actEdit?.passage ?? act.cellLineInfo?.passage)
+                : (actEdit?.passage ?? act.cellLineInfo?.passage ?? activeEdited.passage),
               actionId: act.actionId,
               actionType,
               highlighted: actionType !== 'VIAL_REMOVAL',
@@ -243,21 +252,23 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
           const row = match ? match[1] : 'C';
           const col = match ? parseInt(match[2], 10) : 4;
           const actionType = activeEdited.actionType || 'VIAL_INSERTION';
+          const isActRemoval = actionType === 'VIAL_REMOVAL';
 
           boxUpdates.push({
             boxId,
             row,
             col,
-            cellLineName: activeEdited.cellLineName || 'HEK293T',
-            userInitials: activeEdited.userInitials || operatorInitials,
+            cellLineName: isActRemoval ? (activeEdited.cellLineName || '') : (activeEdited.cellLineName || 'HEK293T'),
+            userInitials: isActRemoval ? (activeEdited.userInitials || undefined) : (activeEdited.userInitials || operatorInitials),
             operatorInitials: activeEdited.userInitials || operatorInitials,
-            dateFrozen: activeEdited.dateFrozen,
-            fullText:
-              activeEdited.fullText ||
-              `${activeEdited.cellLineName || 'HEK293T'} | P${activeEdited.passage ?? 5} | ${
-                activeEdited.lotNumber || 'LOT-8841'
-              }`,
-            lotNumber: activeEdited.lotNumber,
+            dateFrozen: activeEdited.dateFrozen || undefined,
+            fullText: isActRemoval
+              ? (activeEdited.fullText || '')
+              : (activeEdited.fullText ||
+                `${activeEdited.cellLineName || 'HEK293T'} | P${activeEdited.passage ?? 5} | ${
+                  activeEdited.lotNumber || 'LOT-8841'
+                }`),
+            lotNumber: activeEdited.lotNumber || undefined,
             passage: activeEdited.passage,
             actionId: activeEdited.actionId,
             actionType,
