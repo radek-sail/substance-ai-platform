@@ -138,7 +138,7 @@ function formatWorkflowClassificationLabel(workflowType?: string, pass0Status?: 
     return 'inventory update workflow';
   }
   if (workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW') {
-    return 'experiment updated workflow';
+    return 'experiment update workflow';
   }
   if (workflowType === 'UNCLASSIFIED_WORKFLOW') {
     return 'unclassified workflow';
