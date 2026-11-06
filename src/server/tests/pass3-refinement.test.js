@@ -13,6 +13,11 @@ const {
   VialLabelDataSchema,
   LabelTranscriptionRecordSchema,
   BoxWellLocationSchema,
+  ArchiveReagentSchema,
+  generateReagentAcronym,
+  areSameReagent,
+  mergeReagentRecords,
+  parseReagentLabelFields,
 } = require('@sail/shared');
 
 const {
@@ -666,6 +671,337 @@ describe('Pass 3 Analysis Refinement: Dual-Shot Label Conflation, Top-Right Blac
       assert.strictEqual(cellB3.vial.userInitials, 'JD');
       assert.strictEqual(cellB3.vial.dateFrozen, '2026-04-10');
       assert.strictEqual(cellB3.vial.fullText, 'Jurkat-Edited E6-1 JD 2026-04-10');
+    });
+  });
+
+  describe('5. Distinction Between Vial Label Presentation & Reagent Label Presentation + Acronym Identity Resolution', () => {
+    it('should form reagent acronyms from the first letters of reagent names and leave missing label fields as N/A', () => {
+      assert.strictEqual(generateReagentAcronym('Fetal Bovine Serum'), 'FBS');
+      assert.strictEqual(generateReagentAcronym("Dulbecco's Modified Eagle Medium"), 'DMEM');
+      assert.strictEqual(generateReagentAcronym('Phosphate Buffered Saline'), 'PBS');
+      assert.strictEqual(generateReagentAcronym('Complete Growth Medium'), 'CGM');
+
+      // Full reagent label with all fields present
+      const fullReagent = parseReagentLabelFields(
+        'Fetal Bovine Serum\nGibco\nREF: A31605-01\nLOT: 2510492'
+      );
+      const validatedFull = ArchiveReagentSchema.parse(fullReagent);
+      assert.strictEqual(validatedFull.reagentName, 'Fetal Bovine Serum');
+      assert.strictEqual(validatedFull.reagentAcronym, 'FBS');
+      assert.strictEqual(validatedFull.manufacturer, 'Gibco');
+      assert.strictEqual(validatedFull.catalogNumber, 'A31605-01');
+      assert.strictEqual(validatedFull.lotNumber, '2510492');
+
+      // Partial reagent label where manufacturer and catalog # are not printed on the vessel
+      const partialReagent = parseReagentLabelFields('Complete Growth Medium\nLot # 99812');
+      const validatedPartial = ArchiveReagentSchema.parse(partialReagent);
+      assert.strictEqual(validatedPartial.reagentName, 'Complete Growth Medium');
+      assert.strictEqual(validatedPartial.reagentAcronym, 'CGM');
+      assert.strictEqual(validatedPartial.manufacturer, 'N/A');
+      assert.strictEqual(validatedPartial.catalogNumber, 'N/A');
+      assert.strictEqual(validatedPartial.lotNumber, '99812');
+
+      // Vessel label with ONLY the acronym printed on it
+      const acronymOnlyVessel = parseReagentLabelFields('CGM\nLot: 99812');
+      assert.strictEqual(acronymOnlyVessel.reagentName, 'N/A');
+      assert.strictEqual(acronymOnlyVessel.reagentAcronym, 'CGM');
+      assert.strictEqual(acronymOnlyVessel.manufacturer, 'N/A');
+      assert.strictEqual(acronymOnlyVessel.catalogNumber, 'N/A');
+      assert.strictEqual(acronymOnlyVessel.lotNumber, '99812');
+    });
+
+    it('should identify that two vessels/references refer to the same reagent regardless of whether full name or acronym is used', () => {
+      assert.strictEqual(areSameReagent('Fetal Bovine Serum', 'FBS'), true);
+      assert.strictEqual(areSameReagent("Dulbecco's Modified Eagle Medium", 'DMEM'), true);
+      assert.strictEqual(areSameReagent('Complete Growth Medium', 'CGM'), true);
+      assert.strictEqual(
+        areSameReagent(
+          { reagentName: 'Complete Growth Medium', reagentAcronym: 'CGM', manufacturer: 'Gibco' },
+          { reagentName: 'N/A', reagentAcronym: 'CGM', lotNumber: 'LOT-772' }
+        ),
+        true
+      );
+      assert.strictEqual(areSameReagent('Fetal Bovine Serum', 'DMEM'), false);
+
+      const merged = mergeReagentRecords(
+        {
+          reagentName: 'N/A',
+          reagentAcronym: 'CGM',
+          manufacturer: 'N/A',
+          catalogNumber: 'N/A',
+          lotNumber: 'LOT-772',
+        },
+        {
+          reagentName: 'Complete Growth Medium',
+          reagentAcronym: 'CGM',
+          manufacturer: 'Gibco',
+          catalogNumber: 'CAT-500',
+          lotNumber: 'N/A',
+        }
+      );
+      assert.strictEqual(merged.reagentName, 'Complete Growth Medium');
+      assert.strictEqual(merged.reagentAcronym, 'CGM');
+      assert.strictEqual(merged.manufacturer, 'Gibco');
+      assert.strictEqual(merged.catalogNumber, 'CAT-500');
+      assert.strictEqual(merged.lotNumber, 'LOT-772');
+    });
+
+    it('should extract reagent fields (defaulting missing to N/A) for REAGENT_LABEL_PRESENTATION and merge full-name and acronym vessels into the same reagent in Pass 3', async () => {
+      const mockArchivePass3Response = {
+        refinements: [
+          {
+            refinementId: 'ref_reagent_1',
+            eventId: 'evt_reagent_full',
+            actionId: 'act_mix_01',
+            refinementClass: 'OCR_CONFLATION',
+            transcriptionText: 'Dulbecco\'s Modified Eagle Medium | Gibco | REF 11965-092',
+            reagentData: {
+              reagentName: "Dulbecco's Modified Eagle Medium",
+              reagentAcronym: 'N/A',
+              manufacturer: 'Gibco',
+              catalogNumber: '11965-092',
+              lotNumber: 'N/A',
+            },
+          },
+          {
+            refinementId: 'ref_reagent_2',
+            eventId: 'evt_reagent_acronym_only',
+            actionId: 'act_mix_01',
+            refinementClass: 'OCR_CONFLATION',
+            transcriptionText: 'DMEM Lot: 2489103',
+            reagentData: {
+              reagentName: 'N/A',
+              reagentAcronym: 'DMEM',
+              manufacturer: 'N/A',
+              catalogNumber: 'N/A',
+              lotNumber: '2489103',
+            },
+          },
+          {
+            refinementId: 'ref_reagent_3',
+            eventId: 'evt_reagent_fbs',
+            actionId: 'act_mix_01',
+            refinementClass: 'OCR_CONFLATION',
+            transcriptionText: 'Fetal Bovine Serum Lot: 99120',
+            reagentData: {
+              reagentName: 'Fetal Bovine Serum',
+              reagentAcronym: 'FBS',
+              manufacturer: 'N/A',
+              catalogNumber: 'N/A',
+              lotNumber: '99120',
+            },
+          },
+        ],
+      };
+
+      setGenAIClient({
+        models: {
+          generateContent: async () => ({
+            text: JSON.stringify(mockArchivePass3Response),
+          }),
+        },
+      });
+
+      const pass0 = {
+        workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+        archiveName: 'Media Preparation Protocol',
+        transcribedAudio: 'Mixing 45 mL of DMEM with 5 mL of FBS.',
+      };
+
+      const actions = [
+        {
+          actionId: 'act_mix_01',
+          actionType: 'MIX_REAGENTS',
+          actionClass: 'REAGENT_MIXING_ACTION',
+          startTime: 1.0,
+          endTime: 20.0,
+          description: 'Operator mixes DMEM and FBS',
+          mixReagentsData: {
+            firstReagentName: 'DMEM',
+            firstReagentAmount: '45 mL',
+            secondReagentName: 'FBS',
+            secondReagentAmount: '5 mL',
+          },
+          eventList: ['evt_reagent_full', 'evt_reagent_acronym_only', 'evt_reagent_fbs'],
+        },
+      ];
+
+      // Note: fix typo in secondReagentName to 'FBS' to test acronym resolution to 'Fetal Bovine Serum (FBS)'
+      actions[0].mixReagentsData.secondReagentName = 'FBS';
+
+      const events = [
+        {
+          eventId: 'evt_reagent_full',
+          actionId: 'act_mix_01',
+          actionIds: ['act_mix_01'],
+          eventClass: 'REAGENT_LABEL_PRESENTATION_EVENT',
+          eventTrack: 'video',
+          startTime: 2.0,
+          endTime: 4.0,
+          bestShotTimes: [2.5, 3.0],
+        },
+        {
+          eventId: 'evt_reagent_acronym_only',
+          actionId: 'act_mix_01',
+          actionIds: ['act_mix_01'],
+          eventClass: 'REAGENT_LABEL_PRESENTATION_EVENT',
+          eventTrack: 'video',
+          startTime: 5.0,
+          endTime: 7.0,
+          bestShotTimes: [5.5, 6.0],
+        },
+        {
+          eventId: 'evt_reagent_fbs',
+          actionId: 'act_mix_01',
+          actionIds: ['act_mix_01'],
+          eventClass: 'REAGENT_LABEL_PRESENTATION',
+          eventTrack: 'video',
+          startTime: 8.0,
+          endTime: 10.0,
+          bestShotTimes: [8.5, 9.0],
+        },
+      ];
+
+      const refinements = await runPass3AnalysisRefinement({
+        videoId: 'vid_reagent_presentation_test',
+        videoGcsUri: 'gs://test-bucket/normalized/vid_reagent_presentation_test.mp4',
+        classification: pass0,
+        actions,
+        events,
+      });
+
+      assert.strictEqual(refinements.labelTranscriptions.length, 3);
+
+      // 1. First vessel had full name ("Dulbecco's Modified Eagle Medium"), manufacturer ("Gibco"), catalogNumber ("11965-092"), but no lotNumber ("N/A")
+      const lt1 = refinements.labelTranscriptions[0];
+      assert.strictEqual(lt1.isReagentLabel, true);
+      assert.strictEqual(lt1.isVialLabel, false);
+      assert.strictEqual(lt1.reagentName, "Dulbecco's Modified Eagle Medium");
+      assert.strictEqual(lt1.reagentAcronym, 'DMEM');
+      assert.strictEqual(lt1.manufacturer, 'Gibco');
+      assert.strictEqual(lt1.catalogNumber, '11965-092');
+      assert.strictEqual(lt1.lotNumber, 'N/A');
+
+      // 2. Second vessel had ONLY acronym ("DMEM") and lotNumber ("2489103"); missing fields are "N/A"
+      const lt2 = refinements.labelTranscriptions[1];
+      assert.strictEqual(lt2.isReagentLabel, true);
+      assert.strictEqual(lt2.reagentName, 'N/A');
+      assert.strictEqual(lt2.reagentAcronym, 'DMEM');
+      assert.strictEqual(lt2.manufacturer, 'N/A');
+      assert.strictEqual(lt2.catalogNumber, 'N/A');
+      assert.strictEqual(lt2.lotNumber, '2489103');
+
+      // Both DMEM vessels must be linked to the SAME canonical reagent ID
+      assert.ok(lt1.reagentData.id);
+      assert.strictEqual(lt1.reagentData.id, lt2.reagentData.id);
+
+      // 3. Synthesized reagents list must have deduplicated DMEM ("Dulbecco's Modified Eagle Medium" + "DMEM") into a single reagent entry
+      assert.strictEqual(refinements.reagents.length, 2);
+      const dmemReagent = refinements.reagents.find((r) => r.reagentAcronym === 'DMEM');
+      assert.ok(dmemReagent);
+      assert.strictEqual(dmemReagent.reagentName, "Dulbecco's Modified Eagle Medium");
+      assert.strictEqual(dmemReagent.reagentAcronym, 'DMEM');
+      assert.strictEqual(dmemReagent.manufacturer, 'Gibco');
+      assert.strictEqual(dmemReagent.catalogNumber, '11965-092');
+      assert.strictEqual(dmemReagent.lotNumber, '2489103');
+
+      const fbsReagent = refinements.reagents.find((r) => r.reagentAcronym === 'FBS');
+      assert.ok(fbsReagent);
+      assert.strictEqual(fbsReagent.reagentName, 'Fetal Bovine Serum');
+      assert.strictEqual(fbsReagent.manufacturer, 'N/A');
+      assert.strictEqual(fbsReagent.catalogNumber, 'N/A');
+      assert.strictEqual(fbsReagent.lotNumber, '99120');
+
+      // 4. Work step mixReagentsData resolved acronym references ("DMEM" and "FBS") to the canonical reagents
+      assert.strictEqual(refinements.workSteps.length, 1);
+      assert.strictEqual(
+        refinements.workSteps[0].mixReagentsData.firstReagentName,
+        "Dulbecco's Modified Eagle Medium (DMEM)"
+      );
+      assert.strictEqual(
+        refinements.workSteps[0].mixReagentsData.secondReagentName,
+        'Fetal Bovine Serum (FBS)'
+      );
+    });
+
+    it('should extract reagent bottle fields (and never cellLineName/vialLabelData) for Gibco Fetal Bovine Serum label presentation in Pass 3', async () => {
+      const shotText =
+        'gibco Fetal Bovine Serum Premium Heat Inactivated, 1X Origin: United States 2026-04-30 REF A38400-01 500 mL LOT 2472285P';
+      const conflatedPipeText =
+        'gibco | Fetal Bovine Serum, Premium Heat Inactivated, 1X | REF A38400-01 | LOT 2472285P | EXP 2026-04-30 | 500 mL | Origin: United States';
+
+      setGenAIClient({
+        models: {
+          generateContent: async () => ({
+            text: JSON.stringify([
+              {
+                refinementId: 'ref_evt_001',
+                eventId: 'evt_001',
+                actionId: 'act_001',
+                refinementClass: 'OCR_CONFLATION',
+                transcriptionText: conflatedPipeText,
+                vialLabelData: {
+                  cellLineName: 'gibco',
+                  userInitials: 'REF',
+                  dateFrozen: '2026-04-30',
+                  fullText: conflatedPipeText,
+                  frame1Text: shotText,
+                  frame2Text: shotText,
+                },
+              },
+            ]),
+          }),
+        },
+      });
+
+      const refinements = await runPass3AnalysisRefinement({
+        videoId: 'vid_gibco_fbs_reagent_test',
+        videoGcsUri: 'gs://test-bucket/normalized/vid_gibco_fbs_reagent_test.mp4',
+        classification: { workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW', confidence: 0.99 },
+        actions: [
+          {
+            actionId: 'act_001',
+            actionType: 'REAGENT_IDENTIFICATION',
+            actionClass: 'REAGENT_IDENTIFICATION_ACTION',
+            startTime: 0.0,
+            endTime: 5.0,
+            eventList: ['evt_001'],
+          },
+        ],
+        events: [
+          {
+            eventId: 'evt_001',
+            actionId: 'act_001',
+            actionIds: ['act_001'],
+            eventClass: 'REAGENT_LABEL_PRESENTATION_EVENT',
+            eventTrack: 'video',
+            startTime: 1.0,
+            endTime: 4.0,
+            bestShotTimes: [1.5, 2.5],
+          },
+        ],
+      });
+
+      assert.strictEqual(refinements.labelTranscriptions.length, 1);
+      const lt = refinements.labelTranscriptions[0];
+      assert.strictEqual(lt.isReagentLabel, true);
+      assert.strictEqual(lt.isVialLabel, false);
+      assert.strictEqual(lt.reagentName, 'Fetal Bovine Serum');
+      assert.strictEqual(lt.reagentAcronym, 'FBS');
+      assert.strictEqual(lt.manufacturer, 'Gibco');
+      assert.strictEqual(lt.catalogNumber, 'A38400-01');
+      assert.strictEqual(lt.lotNumber, '2472285P');
+      assert.strictEqual(lt.highestContrastShotText, shotText);
+      assert.strictEqual(lt.minimalBlurShotText, shotText);
+
+      // The refinement entry itself must carry reagentData and NOT vialLabelData
+      assert.strictEqual(refinements[0].vialLabelData, undefined);
+      assert.ok(refinements[0].reagentData);
+      assert.strictEqual(refinements[0].reagentData.reagentName, 'Fetal Bovine Serum');
+      assert.strictEqual(refinements[0].reagentData.reagentAcronym, 'FBS');
+      assert.strictEqual(refinements[0].reagentData.manufacturer, 'Gibco');
+      assert.strictEqual(refinements[0].reagentData.catalogNumber, 'A38400-01');
+      assert.strictEqual(refinements[0].reagentData.lotNumber, '2472285P');
     });
   });
 });

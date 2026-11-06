@@ -13,6 +13,7 @@ import {
 import {
   executeHierarchicalPipeline,
   runPass0WorkflowClassification,
+  normalizePass0ArchiveMetadata,
   runPass1ActionDetection,
   runPass2EventDetection,
   runPass3AnalysisRefinement,
@@ -123,6 +124,315 @@ export async function reconcileVideoInventoryAssociation(
     }
   }
   return { matched: false, inventoryId: null };
+}
+
+/**
+ * Helper to compute normalized forms of an archive name for case-insensitive and
+ * boilerplate-tolerant matching (stripping surrounding quotes/punctuation and optional
+ * leading/trailing words like "the", "experiment", "archive", "notebook", "protocol").
+ */
+function normalizeArchiveMatchForms(rawName: string): {
+  lower: string;
+  alnum: string;
+  coreLower: string;
+  coreAlnum: string;
+} {
+  const lower = String(rawName || '')
+    .trim()
+    .replace(/^["'“”‘’]+|["'“”‘’.,;]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const alnum = lower.replace(/[^a-z0-9]/g, '');
+  const stripped = lower
+    .replace(
+      /^(?:the|a|an|new|existing|experiment|notebook|archive|protocol)(?:\s+(?:the|a|an|new|existing|experiment|notebook|archive|protocol))*\s+/i,
+      ''
+    )
+    .replace(
+      /\s+(?:experiment|notebook|archive|protocol)(?:\s+(?:experiment|notebook|archive|protocol))*$/i,
+      ''
+    )
+    .trim();
+  const strippedAlnum = stripped.replace(/[^a-z0-9]/g, '');
+  return {
+    lower,
+    alnum,
+    coreLower: stripped.length >= 2 ? stripped : lower,
+    coreAlnum: strippedAlnum.length >= 2 ? strippedAlnum : alnum,
+  };
+}
+
+/**
+ * Reconciles video archive association or new archive initialization metadata
+ * when Pass 0 classifies a video as EXPERIMENT_NOTEBOOK_WORKFLOW.
+ */
+export async function reconcileVideoArchiveAssociation(
+  databaseId: string,
+  videoId: string,
+  classification: WorkflowClassification
+): Promise<{
+  matched: boolean;
+  archiveId: string | null;
+  archiveName?: string | null;
+  unmatchedArchiveName?: string | null;
+  archiveCreatorName?: string | null;
+  archiveCreationDate?: string | null;
+  archiveIntent?: 'CREATE' | 'APPEND' | null;
+  archiveAssociationType?: 'AUTOMATIC' | 'UNMATCHED' | 'PENDING_CONFIRMATION';
+}> {
+  if (classification.workflowType !== 'EXPERIMENT_NOTEBOOK_WORKFLOW') {
+    return { matched: false, archiveId: null };
+  }
+
+  // Ensure archive fields are normalized from classification / transcript
+  const normalizedCopy: Record<string, any> = { ...classification };
+  normalizePass0ArchiveMetadata(normalizedCopy, videoId || 'Untitled Experiment Archive');
+
+  const targetArchiveName = (normalizedCopy.archiveName || '').trim() || 'Untitled Experiment Archive';
+  const creatorName: string | null = normalizedCopy.creatorName || null;
+  const creationDate: string | null = normalizedCopy.creationDate || null;
+  const archiveIntent: 'CREATE' | 'APPEND' =
+    normalizedCopy.archiveIntent === 'APPEND' || normalizedCopy.isAppending === true
+      ? 'APPEND'
+      : 'CREATE';
+
+  // Propagate normalized fields back onto classification object in-memory
+  classification.archiveName = targetArchiveName;
+  classification.creatorName = creatorName;
+  classification.creationDate = creationDate;
+  classification.archiveIntent = archiveIntent;
+  classification.isAppending = archiveIntent === 'APPEND';
+
+  const transcriptText =
+    typeof classification.transcribedAudio === 'string' ? classification.transcribedAudio : '';
+  const hasExplicitCreateSpeech =
+    /\b(creat(?:e|ing)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:experiment\s+)?(?:archive|experiment|notebook)|initializ(?:e|ing)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:experiment\s+)?(?:archive|experiment|notebook)|start(?:ing)?\s+(?:a\s+|an\s+)?new\s+(?:experiment\s+)?(?:archive|experiment|notebook))\b/i.test(
+      transcriptText
+    );
+
+  // Search Firestore `archives` collection for a high-confidence match
+  const targetForms = normalizeArchiveMatchForms(targetArchiveName);
+  const rawTargetLower = targetForms.lower;
+  const normTarget = targetForms.alnum;
+  const dbTarget = getTenantFirestore(databaseId);
+  let snapshot: any;
+  try {
+    snapshot = await dbTarget.collection('archives').get();
+    if ((!snapshot || snapshot.empty) && db && db !== dbTarget) {
+      snapshot = await db.collection('archives').get();
+    }
+  } catch {
+    try {
+      snapshot = await db.collection('archives').get();
+    } catch (err) {
+      console.warn('[PipelineController] Could not fetch archives for reconciliation:', err);
+    }
+  }
+
+  let matchedDoc: any = null;
+  if (
+    snapshot &&
+    !snapshot.empty &&
+    Array.isArray(snapshot.docs) &&
+    (archiveIntent === 'APPEND' || !hasExplicitCreateSpeech)
+  ) {
+    // 1. Exact case-insensitive, alphanumeric-normalized, or core-name match
+    matchedDoc = snapshot.docs.find((d: any) => {
+      if (archiveIntent === 'CREATE' && d.id === 'demo-archive-01') {
+        return false;
+      }
+      const data = d.data() || {};
+      const candidateName = typeof data.name === 'string' ? data.name.trim() : '';
+      if (!candidateName) return false;
+      const candForms = normalizeArchiveMatchForms(candidateName);
+      return (
+        candForms.lower === rawTargetLower ||
+        (normTarget.length >= 2 && candForms.alnum === normTarget) ||
+        (targetForms.coreAlnum.length >= 3 && candForms.coreAlnum === targetForms.coreAlnum) ||
+        d.id.toLowerCase() === rawTargetLower
+      );
+    });
+
+    // 2. High-confidence fuzzy match if exact match not found (only when intent is APPEND)
+    if (!matchedDoc && archiveIntent === 'APPEND' && normTarget.length >= 3) {
+      matchedDoc = snapshot.docs.find((d: any) => {
+        const data = d.data() || {};
+        const candidateName = typeof data.name === 'string' ? data.name.trim() : '';
+        if (!candidateName) return false;
+        const candForms = normalizeArchiveMatchForms(candidateName);
+        const lower = candForms.lower;
+        const normCandidate = candForms.alnum;
+        if (normCandidate.length < 3) return false;
+        if (lower.includes(rawTargetLower) || rawTargetLower.includes(lower)) {
+          const minLen = Math.min(normCandidate.length, normTarget.length);
+          const maxLen = Math.max(normCandidate.length, normTarget.length);
+          return minLen / maxLen >= 0.5;
+        }
+        if (normCandidate.includes(normTarget) || normTarget.includes(normCandidate)) {
+          const minLen = Math.min(normCandidate.length, normTarget.length);
+          const maxLen = Math.max(normCandidate.length, normTarget.length);
+          return minLen / maxLen >= 0.5;
+        }
+        if (
+          candForms.coreAlnum.length >= 3 &&
+          targetForms.coreAlnum.length >= 3 &&
+          (candForms.coreAlnum.includes(targetForms.coreAlnum) ||
+            targetForms.coreAlnum.includes(candForms.coreAlnum))
+        ) {
+          const minLen = Math.min(candForms.coreAlnum.length, targetForms.coreAlnum.length);
+          const maxLen = Math.max(candForms.coreAlnum.length, targetForms.coreAlnum.length);
+          return minLen / maxLen >= 0.5;
+        }
+        return false;
+      });
+    }
+  }
+
+  if (matchedDoc) {
+    const matchedData = matchedDoc.data() || {};
+    const matchedName = matchedData.name || matchedDoc.id;
+    const resolvedCreator = matchedData.creatorName ?? creatorName ?? null;
+    const resolvedDate = matchedData.creationDate ?? creationDate ?? null;
+    const nowIso = new Date().toISOString();
+
+    // Update classification in-memory so Pass 0 data carries the canonical existing archive name
+    classification.archiveName = matchedName;
+    classification.creatorName = resolvedCreator;
+    classification.creationDate = resolvedDate;
+    classification.archiveIntent = 'APPEND';
+    classification.isAppending = true;
+    if (
+      classification.identificationEvent &&
+      typeof classification.identificationEvent.description === 'string' &&
+      targetArchiveName &&
+      matchedName !== targetArchiveName
+    ) {
+      classification.identificationEvent.description =
+        classification.identificationEvent.description.replace(targetArchiveName, matchedName);
+    }
+
+    const updatePayload = {
+      archiveId: matchedDoc.id,
+      archiveName: matchedName,
+      archiveCreatorName: resolvedCreator,
+      archiveCreationDate: resolvedDate,
+      archiveIntent: 'APPEND' as const,
+      unmatchedArchiveName: null,
+      archiveAssociationType: 'AUTOMATIC' as const,
+      associatedAt: nowIso,
+    };
+    await updateVideoRecord(databaseId, videoId, updatePayload);
+    if (databaseId !== '(default)') {
+      await updateVideoRecord('(default)', videoId, updatePayload);
+    }
+
+    // Best-effort: if passes.pass0 is already stored on videos/{videoId}, sync its data.archiveName
+    try {
+      const existingVid =
+        (await getVideoMetadata(databaseId, videoId)) ||
+        (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null);
+      if (existingVid?.passes?.pass0) {
+        const updatedPass0State = {
+          ...existingVid.passes.pass0,
+          data: {
+            ...(existingVid.passes.pass0.data || {}),
+            ...classification,
+            archiveName: matchedName,
+            creatorName: resolvedCreator,
+            creationDate: resolvedDate,
+            archiveIntent: 'APPEND',
+            isAppending: true,
+          },
+        };
+        await updateVideoPass(databaseId, videoId, 'pass0', updatedPass0State);
+        if (databaseId !== '(default)') {
+          await updateVideoPass('(default)', videoId, 'pass0', updatedPass0State);
+        }
+      }
+    } catch {
+      // ignore pass0 sync error on minimal mocks
+    }
+
+    // Best-effort: append videoId to archive's videoIds array
+    try {
+      const existingVideoIds = Array.isArray(matchedData.videoIds) ? matchedData.videoIds : [];
+      if (!existingVideoIds.includes(videoId)) {
+        await dbTarget
+          .collection('archives')
+          .doc(matchedDoc.id)
+          .set(
+            {
+              videoIds: [...existingVideoIds, videoId],
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          );
+      }
+    } catch {
+      // ignore archive videoIds update error
+    }
+
+    return {
+      matched: true,
+      archiveId: matchedDoc.id,
+      archiveName: matchedName,
+      archiveCreatorName: resolvedCreator,
+      archiveCreationDate: resolvedDate,
+      archiveIntent: 'APPEND',
+      archiveAssociationType: 'AUTOMATIC',
+    };
+  }
+
+  if (archiveIntent === 'CREATE') {
+    const pendingPayload = {
+      archiveId: null,
+      archiveName: null,
+      unmatchedArchiveName: targetArchiveName,
+      archiveCreatorName: creatorName,
+      archiveCreationDate: creationDate,
+      archiveIntent: 'CREATE' as const,
+      archiveAssociationType: 'PENDING_CONFIRMATION' as const,
+      associatedAt: null,
+    };
+    await updateVideoRecord(databaseId, videoId, pendingPayload);
+    if (databaseId !== '(default)') {
+      await updateVideoRecord('(default)', videoId, pendingPayload);
+    }
+    return {
+      matched: false,
+      archiveId: null,
+      unmatchedArchiveName: targetArchiveName,
+      archiveCreatorName: creatorName,
+      archiveCreationDate: creationDate,
+      archiveIntent: 'CREATE',
+      archiveAssociationType: 'PENDING_CONFIRMATION',
+    };
+  }
+
+  const unmatchedPayload = {
+    archiveId: null,
+    archiveName: null,
+    unmatchedArchiveName: targetArchiveName,
+    archiveCreatorName: creatorName,
+    archiveCreationDate: creationDate,
+    archiveIntent: 'APPEND' as const,
+    archiveAssociationType: 'UNMATCHED' as const,
+    associatedAt: null,
+  };
+  await updateVideoRecord(databaseId, videoId, unmatchedPayload);
+  if (databaseId !== '(default)') {
+    await updateVideoRecord('(default)', videoId, unmatchedPayload);
+  }
+  return {
+    matched: false,
+    archiveId: null,
+    unmatchedArchiveName: targetArchiveName,
+    archiveCreatorName: creatorName,
+    archiveCreationDate: creationDate,
+    archiveIntent: 'APPEND',
+    archiveAssociationType: 'UNMATCHED',
+  };
 }
 
 /**
@@ -241,6 +551,12 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
     const actionWellLocations = Array.isArray((refinements as any)?.actionWellLocations)
       ? (refinements as any).actionWellLocations
       : [];
+    const reagents = Array.isArray((refinements as any)?.reagents)
+      ? (refinements as any).reagents
+      : [];
+    const workSteps = Array.isArray((refinements as any)?.workSteps)
+      ? (refinements as any).workSteps
+      : [];
     const analysisPayload = {
       videoId,
       workloadClassification,
@@ -250,6 +566,8 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
       refinements,
       labelTranscriptions,
       actionWellLocations,
+      ...(reagents.length > 0 ? { reagents } : {}),
+      ...(workSteps.length > 0 ? { workSteps } : {}),
       isSignedOff: false,
       updatedAt: nowIso,
     };
@@ -344,8 +662,9 @@ export async function analyzePipelineHandler(req: Request, res: Response): Promi
       // Ignore direct update fallback error
     }
 
-    // Reconcile automatic inventory matching
+    // Reconcile automatic inventory or archive matching
     await reconcileVideoInventoryAssociation(databaseId, videoId, workloadClassification);
+    await reconcileVideoArchiveAssociation(databaseId, videoId, workloadClassification);
 
     return res.status(200).json({
       success: true,
@@ -489,6 +808,25 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
       }
     };
 
+    const syncClassificationWithVideoArchive = async (
+      cls: WorkflowClassification
+    ): Promise<WorkflowClassification> => {
+      const latestMeta =
+        (await getVideoMetadata(databaseId, videoId)) ||
+        (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null) ||
+        videoDoc;
+      if (latestMeta?.archiveId && latestMeta?.archiveName) {
+        cls.archiveName = latestMeta.archiveName;
+        if (latestMeta.archiveCreatorName !== undefined && latestMeta.archiveCreatorName !== null) {
+          cls.creatorName = latestMeta.archiveCreatorName;
+        }
+        if (latestMeta.archiveCreationDate !== undefined && latestMeta.archiveCreationDate !== null) {
+          cls.creationDate = latestMeta.archiveCreationDate;
+        }
+      }
+      return cls;
+    };
+
     const runStep0 = async (): Promise<WorkflowClassification> => {
       activePassKey = 'pass0';
       const startedAt = new Date().toISOString();
@@ -503,6 +841,13 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         databaseId,
         model,
       });
+
+      // Reconcile automatic inventory or archive matching BEFORE marking pass0 COMPLETED
+      // so that classification.archiveName has the canonical matched archive name and polling clients
+      // never observe pass0.status === 'COMPLETED' before archiveId/archiveName are written.
+      await reconcileVideoInventoryAssociation(databaseId, videoId, classification);
+      await reconcileVideoArchiveAssociation(databaseId, videoId, classification);
+
       await writePassArtifactJson(videoId, 'workflowClassification.json', classification);
       await writePassArtifactJson(videoId, 'workloadClassification.json', classification);
       const completedAt = new Date().toISOString();
@@ -538,17 +883,16 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         console.warn('[PipelineController] Could not directly update pass0 status/error:', directUpdErr);
       }
 
-      // Reconcile automatic inventory matching
-      await reconcileVideoInventoryAssociation(databaseId, videoId, classification);
       return classification;
     };
 
     const runStep1 = async (classificationInput?: WorkflowClassification): Promise<Action[]> => {
       activePassKey = 'pass1';
-      const classification: WorkflowClassification =
+      const classification: WorkflowClassification = await syncClassificationWithVideoArchive(
         classificationInput ||
-        currentPasses.pass0?.data ||
-        (await runStep0());
+          currentPasses.pass0?.data ||
+          (await runStep0())
+      );
       activePassKey = 'pass1';
       const startedAt = new Date().toISOString();
       await syncPassState('pass1', { status: 'RUNNING', startedAt });
@@ -596,10 +940,11 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
       actionsInput?: Action[]
     ): Promise<Event[]> => {
       activePassKey = 'pass2';
-      const classification: WorkflowClassification =
+      const classification: WorkflowClassification = await syncClassificationWithVideoArchive(
         classificationInput ||
-        currentPasses.pass0?.data ||
-        (await runStep0());
+          currentPasses.pass0?.data ||
+          (await runStep0())
+      );
       const rawActionsData =
         actionsInput ||
         currentPasses.pass1?.data ||
@@ -637,9 +982,15 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
       const resolvedPass2Thinking = (events as any)?.thinkingLevel || (eventsPayload as any)?.thinkingLevel || thinkingLevel || 'MEDIUM';
 
       // Sync updated Pass 1 actions (with 4 fps refined boundaries & eventList) back into pass1 state
+      const rawPass1Obj =
+        rawActionsData && typeof (rawActionsData as any).toJSON === 'function'
+          ? (rawActionsData as any).toJSON()
+          : rawActionsData;
       const updatedPass1Data =
-        rawActionsData && !Array.isArray(rawActionsData) && Array.isArray((rawActionsData as any).actions)
-          ? { ...(rawActionsData as any), actions }
+        rawPass1Obj && !Array.isArray(rawPass1Obj) && Array.isArray((rawPass1Obj as any).actions)
+          ? { ...(rawPass1Obj as any), actions, ...(pass1Events.length > 0 ? { events: pass1Events } : {}) }
+          : pass1Events.length > 0
+          ? { actions, events: pass1Events }
           : actions;
       currentPasses.pass1 = {
         ...currentPasses.pass1,
@@ -688,8 +1039,20 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
       }
 
       // Also persist intermediate analysis to video_analyses/{videoId} so CryoInventory can load after Pass 2
+      const latestVideoMetaPass2 =
+        (await getVideoMetadata(databaseId, videoId)) ||
+        (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null);
       const partialAnalysis = {
         videoId,
+        ...(latestVideoMetaPass2?.archiveId ? { archiveId: latestVideoMetaPass2.archiveId } : {}),
+        ...(latestVideoMetaPass2?.archiveName ? { archiveName: latestVideoMetaPass2.archiveName } : {}),
+        ...(latestVideoMetaPass2?.archiveCreatorName
+          ? { creatorName: latestVideoMetaPass2.archiveCreatorName }
+          : {}),
+        ...(latestVideoMetaPass2?.archiveCreationDate
+          ? { creationDate: latestVideoMetaPass2.archiveCreationDate }
+          : {}),
+        ...(latestVideoMetaPass2?.inventoryId ? { inventoryId: latestVideoMetaPass2.inventoryId } : {}),
         workloadClassification: classification,
         workflowClassification: classification,
         actions,
@@ -718,10 +1081,11 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
       analysisPayload: Record<string, any>;
     }> => {
       activePassKey = 'pass3';
-      const classification: WorkflowClassification =
+      const classification: WorkflowClassification = await syncClassificationWithVideoArchive(
         classificationInput ||
-        currentPasses.pass0?.data ||
-        (await runStep0());
+          currentPasses.pass0?.data ||
+          (await runStep0())
+      );
       const rawActionsData =
         actionsInput ||
         currentPasses.pass1?.data ||
@@ -731,10 +1095,18 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         : Array.isArray((rawActionsData as any)?.actions)
         ? (rawActionsData as any).actions
         : [];
+      const pass1EventsForPass3: Event[] = Array.isArray((rawActionsData as any)?.events)
+        ? (rawActionsData as any).events
+        : Array.isArray(currentPasses.pass1?.data?.events)
+        ? currentPasses.pass1.data.events
+        : [];
+      if (pass1EventsForPass3.length > 0) {
+        (actions as any).events = pass1EventsForPass3;
+      }
       const rawEventsData =
         eventsInput ||
         currentPasses.pass2?.data ||
-        (await runStep2(classification, actions));
+        (await runStep2(classification, rawActionsData));
       const events: Event[] = Array.isArray(rawEventsData)
         ? rawEventsData
         : Array.isArray((rawEventsData as any)?.events)
@@ -801,10 +1173,26 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
       const actionWellLocations = Array.isArray((refinements as any)?.actionWellLocations)
         ? (refinements as any).actionWellLocations
         : [];
+      const reagents = Array.isArray((refinements as any)?.reagents)
+        ? (refinements as any).reagents
+        : [];
+      const workSteps = Array.isArray((refinements as any)?.workSteps)
+        ? (refinements as any).workSteps
+        : [];
 
+      const rawPass1ObjForPass3 =
+        rawActionsData && typeof (rawActionsData as any).toJSON === 'function'
+          ? (rawActionsData as any).toJSON()
+          : rawActionsData;
       const updatedPass1Data =
-        rawActionsData && !Array.isArray(rawActionsData) && Array.isArray((rawActionsData as any).actions)
-          ? { ...(rawActionsData as any), actions: enrichedActions }
+        rawPass1ObjForPass3 && !Array.isArray(rawPass1ObjForPass3) && Array.isArray((rawPass1ObjForPass3 as any).actions)
+          ? {
+              ...(rawPass1ObjForPass3 as any),
+              actions: enrichedActions,
+              ...(pass1EventsForPass3.length > 0 ? { events: pass1EventsForPass3 } : {}),
+            }
+          : pass1EventsForPass3.length > 0
+          ? { actions: enrichedActions, events: pass1EventsForPass3 }
           : enrichedActions;
 
       const pass3Payload = (refinements as any)?.toJSON ? (refinements as any).toJSON() : refinements;
@@ -836,8 +1224,20 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         error: null,
       };
 
+      const latestVideoMetaPass3 =
+        (await getVideoMetadata(databaseId, videoId)) ||
+        (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null);
       const analysisPayload = {
         videoId,
+        ...(latestVideoMetaPass3?.archiveId ? { archiveId: latestVideoMetaPass3.archiveId } : {}),
+        ...(latestVideoMetaPass3?.archiveName ? { archiveName: latestVideoMetaPass3.archiveName } : {}),
+        ...(latestVideoMetaPass3?.archiveCreatorName
+          ? { creatorName: latestVideoMetaPass3.archiveCreatorName }
+          : {}),
+        ...(latestVideoMetaPass3?.archiveCreationDate
+          ? { creationDate: latestVideoMetaPass3.archiveCreationDate }
+          : {}),
+        ...(latestVideoMetaPass3?.inventoryId ? { inventoryId: latestVideoMetaPass3.inventoryId } : {}),
         workloadClassification: classification,
         workflowClassification: classification,
         actions: enrichedActions,
@@ -845,6 +1245,8 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         refinements,
         labelTranscriptions,
         actionWellLocations,
+        ...(reagents.length > 0 ? { reagents } : {}),
+        ...(workSteps.length > 0 ? { workSteps } : {}),
         isSignedOff: false,
         updatedAt: completedAt,
       };
@@ -862,6 +1264,8 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
           data: pass3Payload,
           labelTranscriptions,
           actionWellLocations,
+          ...(reagents.length > 0 ? { reagents } : {}),
+          ...(workSteps.length > 0 ? { workSteps } : {}),
           ...(pass3Audit ? { executionAudit: pass3Audit } : {}),
           ...(resolvedPass3Thinking ? { thinkingLevel: resolvedPass3Thinking } : {}),
           error: null,
@@ -916,7 +1320,10 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
       passResultData = res3.refinements;
       aggregatedAnalysis = res3.analysisPayload;
     } else if (pass === 'all') {
-      const c0 = await runStep0();
+      const c0 =
+        currentPasses.pass0?.status === 'COMPLETED' && currentPasses.pass0?.data
+          ? (currentPasses.pass0.data as WorkflowClassification)
+          : await runStep0();
       const a1 = await runStep1(c0);
       const e2 = await runStep2(c0, a1);
       const res3 = await runStep3(c0, a1, e2);
@@ -1107,8 +1514,23 @@ export async function inventorySignOffHandler(req: Request, res: Response): Prom
  */
 export async function archiveSignOffHandler(req: Request, res: Response): Promise<Response | void> {
   const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
-  const { videoId, archiveId, markdownDoc, analysis, description, reagents, steps, operatorInitials, signedOffAt } =
-    req.body || {};
+  const {
+    videoId,
+    archiveId,
+    markdownDoc,
+    analysis,
+    description,
+    reagents,
+    labelTranscriptions,
+    workSteps,
+    steps,
+    archiveName,
+    creatorName,
+    creationDate,
+    operatorInitials,
+    signedOffAt,
+    replaceArchiveContent,
+  } = req.body || {};
 
   if (!rawDatabaseId && process.env.NODE_ENV === 'test') {
     return res.status(400).json({ error: 'Missing required field or header: databaseId / x-database-id' });
@@ -1131,22 +1553,40 @@ export async function archiveSignOffHandler(req: Request, res: Response): Promis
       analysis,
       description,
       reagents,
+      labelTranscriptions,
+      workSteps,
       steps,
+      archiveName,
+      creatorName,
+      creationDate,
       operatorInitials,
       signedOffAt,
+      replaceArchiveContent,
     });
 
     return res.status(200).json({
       success: true,
-      message: `Successfully compiled and committed experiment archive to archives/${archiveId} and marked analysis ${videoId} as signed off.`,
+      message: `Successfully compiled and committed experiment archive to archives/${result.archiveId} and marked analysis ${videoId} as signed off.`,
+      archiveId: result.archiveId,
+      ...(result.archiveName ? { archiveName: result.archiveName } : {}),
       signedOffAt: result.signedOffAt,
       documentPath: result.documentPath,
       markdownDoc: result.markdownDoc,
+      reagents: result.reagents,
+      labelTranscriptions: result.labelTranscriptions,
+      workSteps: result.workSteps,
       details: {
-        archiveId,
+        archiveId: result.archiveId,
+        ...(result.archiveName ? { archiveName: result.archiveName } : {}),
         videoId,
         isSignedOff: result.isSignedOff,
         contentLength: result.markdownDoc.length,
+        reagentsCount: result.reagents.length,
+        workStepsCount: result.workSteps.length,
+        reagents: result.reagents,
+        labelTranscriptions: result.labelTranscriptions,
+        workSteps: result.workSteps,
+        markdownDoc: result.markdownDoc,
       },
     });
   } catch (error: any) {
@@ -1174,7 +1614,45 @@ export async function getVideoAnalysisHandler(req: Request, res: Response): Prom
     if (!analysis) {
       return res.status(404).json({ error: `Video analysis ${videoId} not found` });
     }
-    return res.status(200).json({ videoId, ...analysis });
+    let videoMeta: any = null;
+    try {
+      videoMeta =
+        (await getVideoMetadata(databaseId, videoId)) ||
+        (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null);
+    } catch {
+      // ignore metadata lookup error
+    }
+    const authoritativeArchiveId = videoMeta?.archiveId || analysis.archiveId;
+    const authoritativeArchiveName = videoMeta?.archiveName || analysis.archiveName;
+    const authoritativeCreatorName = videoMeta?.archiveCreatorName || analysis.creatorName;
+    const authoritativeCreationDate = videoMeta?.archiveCreationDate || analysis.creationDate;
+    const workflowClassification = analysis.workflowClassification
+      ? {
+          ...analysis.workflowClassification,
+          ...(authoritativeArchiveName ? { archiveName: authoritativeArchiveName } : {}),
+          ...(authoritativeCreatorName ? { creatorName: authoritativeCreatorName } : {}),
+          ...(authoritativeCreationDate ? { creationDate: authoritativeCreationDate } : {}),
+        }
+      : undefined;
+    const workloadClassification = analysis.workloadClassification
+      ? {
+          ...analysis.workloadClassification,
+          ...(authoritativeArchiveName ? { archiveName: authoritativeArchiveName } : {}),
+          ...(authoritativeCreatorName ? { creatorName: authoritativeCreatorName } : {}),
+          ...(authoritativeCreationDate ? { creationDate: authoritativeCreationDate } : {}),
+        }
+      : undefined;
+    return res.status(200).json({
+      videoId,
+      ...analysis,
+      ...(authoritativeArchiveId ? { archiveId: authoritativeArchiveId } : {}),
+      ...(authoritativeArchiveName ? { archiveName: authoritativeArchiveName } : {}),
+      ...(authoritativeCreatorName ? { creatorName: authoritativeCreatorName } : {}),
+      ...(authoritativeCreationDate ? { creationDate: authoritativeCreationDate } : {}),
+      ...(videoMeta?.inventoryId ? { inventoryId: videoMeta.inventoryId } : {}),
+      ...(workflowClassification ? { workflowClassification } : {}),
+      ...(workloadClassification ? { workloadClassification } : {}),
+    });
   } catch (error: any) {
     return res.status(500).json({ error: error?.message || 'Failed to retrieve video analysis' });
   }

@@ -7,6 +7,7 @@ import {
   type CreateInventoryInput,
   CreateInventorySchema,
 } from '@sail/shared';
+import * as firestoreService from '../services/firestore.service';
 import { db, getTenantFirestore, normalizeDatabaseId } from '../services/firestore.service';
 
 /**
@@ -415,6 +416,24 @@ export const emptyInventoryHandler = async (req: Request, res: Response): Promis
     await clearContentsSubcollection(db);
     if (databaseId !== '(default)') {
       await clearContentsSubcollection(tenantDb);
+    }
+
+    // Reset HITL commit on any videos linked to this emptied inventory
+    try {
+      const allVideos = await firestoreService.listVideos(databaseId);
+      for (const v of allVideos) {
+        if (
+          v.inventoryId === id ||
+          (v.passes?.hitl as any)?.data?.inventoryId === id
+        ) {
+          await firestoreService.resetVideoHitlCommit(databaseId, v.videoId);
+          if (databaseId !== '(default)') {
+            await firestoreService.resetVideoHitlCommit('(default)', v.videoId);
+          }
+        }
+      }
+    } catch {
+      // Ignore video reset scan error
     }
 
     return res.status(200).json({

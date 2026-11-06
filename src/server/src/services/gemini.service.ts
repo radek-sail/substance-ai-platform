@@ -31,7 +31,47 @@ import {
   BoxWellLocationSchema,
   computeBoxWellFromTopLeftOrigin,
   computeBoxWellFromTopRightOrigin,
+  generateReagentAcronym,
+  isLikelyReagentAcronym,
+  areSameReagent,
+  mergeReagentRecords,
+  parseReagentLabelFields,
+  isLikelyReagentBottleLabelText,
+  computeExpectedSeedingEvents,
+  parseColumnNumbersFromText,
+  resolveSeededColumnsAndWells,
+  render96WellPlateMarkdown,
+  extractCellsPerWellFromText,
+  extractCellsSeededFromText,
+  extractPlateTypeFromText,
+  extractPipetteTypeFromText,
+  resolveSeedReagentsDataFromContext,
+  ArchiveReagent,
+  ArchiveReagentSchema,
+  ArchiveWorkStep,
+  ArchiveWorkStepSchema,
+  MixReagentsActionData,
+  SeedReagentsActionData,
+  deduplicateReagentLabelPresentationEvents,
+  isReagentLabelPresentationEvent,
+  computeLabelVisibilityScore,
 } from '@sail/shared';
+
+export {
+  generateReagentAcronym,
+  isLikelyReagentAcronym,
+  areSameReagent,
+  mergeReagentRecords,
+  parseReagentLabelFields,
+  deduplicateReagentLabelPresentationEvents,
+  isReagentLabelPresentationEvent,
+  computeLabelVisibilityScore,
+  extractCellsPerWellFromText,
+  extractCellsSeededFromText,
+  extractPlateTypeFromText,
+  extractPipetteTypeFromText,
+  resolveSeedReagentsDataFromContext,
+};
 import {
   extractCandidateFrame,
   selectBestEventFrames,
@@ -167,6 +207,122 @@ export function loadGuideline(filename: string): string {
 }
 
 /**
+ * Attempts to repair truncated JSON from a model response that hit MAX_TOKENS.
+ * Handles both truncation after a completed object (`lastBraceIndex`) and truncation
+ * inside an unterminated string (including runaway comma-separated timestamp strings)
+ * before any closing brace `}` was emitted.
+ */
+export function tryRepairTruncatedJson(cleaned: string): any | undefined {
+  if (!cleaned || (cleaned[0] !== '{' && cleaned[0] !== '[')) {
+    return undefined;
+  }
+
+  // 1. Try truncating at the last completed object brace '}' first (preserves complete array items)
+  const lastBraceIndex = cleaned.lastIndexOf('}');
+  if (lastBraceIndex !== -1) {
+    const truncated = cleaned.substring(0, lastBraceIndex + 1);
+    const candidates = [
+      truncated + ']}',
+      truncated + ']',
+      truncated,
+      truncated + '}',
+      cleaned + '"}]}',
+      cleaned + '"}]',
+    ];
+    for (const candidate of candidates) {
+      try {
+        return JSON.parse(candidate);
+      } catch {
+        // continue
+      }
+    }
+  }
+
+  // 2. Stack-based repair for truncation inside an unterminated string or mid-object
+  const computeCloserAndState = (input: string) => {
+    const stack: string[] = [];
+    let inString = false;
+    let escaped = false;
+    let stringStartIdx = -1;
+    let lastCommaOutsideString = -1;
+
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+          stringStartIdx = -1;
+        }
+      } else {
+        if (ch === '"') {
+          inString = true;
+          stringStartIdx = i;
+        } else if (ch === '{') {
+          stack.push('}');
+        } else if (ch === '[') {
+          stack.push(']');
+        } else if (ch === '}' || ch === ']') {
+          if (stack.length > 0 && stack[stack.length - 1] === ch) {
+            stack.pop();
+          }
+        } else if (ch === ',') {
+          lastCommaOutsideString = i;
+        }
+      }
+    }
+
+    return {
+      stack,
+      inString,
+      stringStartIdx,
+      lastCommaOutsideString,
+      closingSuffix: stack.slice().reverse().join(''),
+    };
+  };
+
+  const state = computeCloserAndState(cleaned);
+  const stackCandidates: string[] = [];
+
+  if (state.inString && state.stringStartIdx !== -1) {
+    const rawStringContent = cleaned.substring(state.stringStartIdx + 1);
+    // If the string degenerated into a comma-separated repetition loop (e.g. "00:01.000,00:01,1.0s,..."),
+    // collapse it to the first token before closing the string and open containers.
+    if (rawStringContent.includes(',')) {
+      const firstToken = rawStringContent.split(',')[0].trim();
+      const collapsed = cleaned.substring(0, state.stringStartIdx + 1) + firstToken + '"';
+      const collapsedState = computeCloserAndState(collapsed);
+      stackCandidates.push(collapsed + collapsedState.closingSuffix);
+    }
+
+    // Close the string directly (removing any trailing lonely backslash) and close open containers
+    const safePrefix = cleaned.endsWith('\\') ? cleaned.slice(0, -1) : cleaned;
+    stackCandidates.push(safePrefix + '"' + state.closingSuffix);
+  }
+
+  if (state.lastCommaOutsideString !== -1) {
+    const beforeLastComma = cleaned.substring(0, state.lastCommaOutsideString);
+    const commaState = computeCloserAndState(beforeLastComma);
+    if (!commaState.inString && commaState.stack.length > 0) {
+      stackCandidates.push(beforeLastComma + commaState.closingSuffix);
+    }
+  }
+
+  for (const candidate of stackCandidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // continue
+    }
+  }
+
+  return undefined;
+}
+
+/**
  * Extracts and cleans JSON from raw LLM text responses, handling optional markdown code fences.
  */
 export function extractJsonFromText(rawText: string): any {
@@ -179,25 +335,9 @@ export function extractJsonFromText(rawText: string): any {
   try {
     return JSON.parse(cleaned);
   } catch (err: any) {
-    // Attempt best-effort repair if truncated
-    const lastBraceIndex = cleaned.lastIndexOf('}');
-    if (lastBraceIndex !== -1) {
-      const truncated = cleaned.substring(0, lastBraceIndex + 1);
-      const candidates = [
-        truncated + ']}',
-        truncated + ']',
-        truncated,
-        truncated + '}',
-        cleaned + '"}]}',
-        cleaned + '"}]',
-      ];
-      for (const candidate of candidates) {
-        try {
-          return JSON.parse(candidate);
-        } catch {
-          // continue
-        }
-      }
+    const repaired = tryRepairTruncatedJson(cleaned);
+    if (repaired !== undefined) {
+      return repaired;
     }
 
     const payloadPreview = cleaned.slice(0, 500);
@@ -331,7 +471,9 @@ export function formatSecondsToTimeString(totalSeconds: number): string {
  */
 export function parseTimeStringToSeconds(timeStr: string): number {
   if (!timeStr || typeof timeStr !== 'string') return 0;
-  const parts = timeStr.trim().split(':').map((p) => parseFloat(p));
+  const firstSegment = timeStr.split(',')[0].trim().replace(/s$/i, '');
+  if (!firstSegment) return 0;
+  const parts = firstSegment.split(':').map((p) => parseFloat(p));
   if (parts.some((p) => isNaN(p))) return 0;
   if (parts.length === 3) {
     return parts[0] * 3600 + parts[1] * 60 + parts[2];
@@ -470,10 +612,21 @@ export async function generateContentWithRetry(aiClient: any, params: any, maxRe
       const isTransient =
         err.status === 503 ||
         err.status === 429 ||
+        err.status === 408 ||
+        err.status === 502 ||
+        err.status === 504 ||
         err.message?.includes('503') ||
-        err.message?.includes('overloaded');
+        err.message?.includes('429') ||
+        err.message?.includes('overloaded') ||
+        err.message?.includes('fetch failed') ||
+        err.code === 'ECONNRESET' ||
+        err.code === 'ETIMEDOUT' ||
+        err.message?.includes('ECONNRESET') ||
+        err.message?.includes('ETIMEDOUT') ||
+        err.message?.includes('socket hang up') ||
+        err.message?.includes('network');
       if (isTransient && attempt < maxRetries) {
-        console.warn(`[GeminiService] Attempt ${attempt} failed with ${err.status || err.message}. Retrying in ${delay}ms...`);
+        console.warn(`[GeminiService] Attempt ${attempt} failed with ${err.status || err.code || err.message}. Retrying in ${delay}ms...`);
         await new Promise((resolve) => setTimeout(resolve, delay));
         delay *= 2;
       } else {
@@ -498,6 +651,297 @@ export interface PipelineExecutionParams {
     pass3Model?: string;
     pass3Thinking?: string;
   };
+}
+
+export function normalizePass0ArchiveMetadata(
+  parsedJson: Record<string, any>,
+  fallbackName?: string
+): void {
+  const transcript = typeof parsedJson.transcribedAudio === 'string' ? parsedJson.transcribedAudio : '';
+  const isExperimentWorkflow = parsedJson.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW';
+
+  // Normalize archiveName
+  const rawArchiveName =
+    parsedJson.archiveName ??
+    parsedJson.experimentName ??
+    parsedJson.notebookName ??
+    null;
+  let archiveName =
+    typeof rawArchiveName === 'string'
+      ? rawArchiveName
+          .trim()
+          .replace(/^["'“”‘’]+|["'“”‘’.,;]+$/g, '')
+          .trim()
+      : '';
+
+  if (!archiveName && isExperimentWorkflow && transcript) {
+    const nameMatch =
+      transcript.match(
+        /(?:archive|experiment(?:\s+archive|\s+notebook)?|notebook|protocol)\s+(?:named|called|titled|name\s+is)\s+["'“”]?([^"'“”,.;\n]+)["'“”]?/i
+      ) ||
+      transcript.match(
+        /(?:creating|starting|initializing|appending\s+to|adding\s+to|updating|continuing|recording(?:\s+for)?|working\s+on)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+|existing\s+)?(?:experiment\s+)?(?:archive|experiment|notebook|protocol)(?:\s+(?:named|called|titled))?\s+["'“”]?([^"'“”,.;\n]+)["'“”]?/i
+      );
+    if (nameMatch?.[1]) {
+      archiveName = nameMatch[1]
+        .replace(/\s+(?:by|created\s+by|on|dated)\s+.*$/i, '')
+        .replace(/^["'“”‘’]+|["'“”‘’.,;]+$/g, '')
+        .trim();
+    }
+  }
+
+  if (!archiveName) {
+    archiveName = fallbackName || 'default_archive';
+  }
+  parsedJson.archiveName = archiveName;
+
+  if (!isExperimentWorkflow) {
+    parsedJson.creatorName = parsedJson.creatorName ?? null;
+    parsedJson.creationDate = parsedJson.creationDate ?? null;
+    parsedJson.archiveIntent = parsedJson.archiveIntent ?? null;
+    parsedJson.isAppending =
+      typeof parsedJson.isAppending === 'boolean' ? parsedJson.isAppending : null;
+
+    if (
+      parsedJson.workflowType === 'INVENTORY_UPDATE_WORKFLOW' &&
+      (parsedJson.inventoryName || parsedJson.identificationEvent)
+    ) {
+      const rawIdEvt =
+        parsedJson.identificationEvent && typeof parsedJson.identificationEvent === 'object'
+          ? parsedJson.identificationEvent
+          : Array.isArray(parsedJson.events) && parsedJson.events.length > 0
+          ? parsedJson.events[0]
+          : null;
+      const startSec =
+        typeof rawIdEvt?.startTimestampSeconds === 'number'
+          ? rawIdEvt.startTimestampSeconds
+          : typeof rawIdEvt?.startTime === 'number'
+          ? rawIdEvt.startTime
+          : typeof rawIdEvt?.startTime === 'string'
+          ? parseTimeStringToSeconds(rawIdEvt.startTime)
+          : 0;
+      const endSec =
+        typeof rawIdEvt?.endTimestampSeconds === 'number'
+          ? rawIdEvt.endTimestampSeconds
+          : typeof rawIdEvt?.endTime === 'number'
+          ? rawIdEvt.endTime
+          : typeof rawIdEvt?.endTime === 'string'
+          ? parseTimeStringToSeconds(rawIdEvt.endTime)
+          : startSec > 0
+          ? startSec + 5
+          : 5;
+      const invIdEvt = {
+        eventId: rawIdEvt?.eventId || 'evt_id_001',
+        eventClass: 'INVENTORY_IDENTIFICATION' as const,
+        eventTrack: rawIdEvt?.eventTrack === 'video' ? ('video' as const) : ('audio' as const),
+        startTime: startSec,
+        endTime: endSec,
+        startTimestampSeconds: startSec,
+        endTimestampSeconds: endSec,
+        description:
+          rawIdEvt?.description ||
+          `Operator identifies target inventory: ${parsedJson.inventoryName || 'Cryo Inventory'}`,
+        ...(rawIdEvt?.spokenContext || transcript
+          ? { spokenContext: rawIdEvt?.spokenContext || transcript }
+          : {}),
+      };
+      parsedJson.identificationEvent = invIdEvt;
+      parsedJson.events = [invIdEvt];
+    } else {
+      parsedJson.identificationEvent = parsedJson.identificationEvent ?? null;
+    }
+    return;
+  }
+
+  // Normalize creatorName (optional)
+  const rawCreator =
+    parsedJson.creatorName ??
+    parsedJson.creator ??
+    parsedJson.operatorName ??
+    parsedJson.author ??
+    null;
+  let creatorName = typeof rawCreator === 'string' ? rawCreator.trim() : '';
+  if (!creatorName && transcript) {
+    const creatorMatch = transcript.match(
+      /(?:created\s+by|creator(?:\s+name)?(?:\s+is)?|recorded\s+by|researcher(?:\s+is)?|operator(?:\s+is)?|my\s+name\s+is)\s*:?\s*([A-Z][a-zA-Z.\- ]{1,40}?)(?=[,;\n]|\.(?:\s*$|\s+(?:on|dated|date|today|for|appending|creating|we|i|this|the)\b)|\s+(?:on|dated|date|today|for|appending|creating)\b|$)/i
+    );
+    if (creatorMatch?.[1]) {
+      creatorName = creatorMatch[1].replace(/\.+$/, '').trim();
+    }
+  }
+  parsedJson.creatorName = creatorName || null;
+
+  // Normalize creationDate (optional)
+  const rawDate =
+    parsedJson.creationDate ??
+    parsedJson.dateCreated ??
+    parsedJson.experimentDate ??
+    parsedJson.date ??
+    null;
+  let creationDate = typeof rawDate === 'string' ? rawDate.trim() : '';
+  if (!creationDate && transcript) {
+    const isoMatch = transcript.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+    const slashMatch = transcript.match(/\b(\d{1,2}\/\d{1,2}\/20\d{2})\b/);
+    const writtenMatch = transcript.match(
+      /\b((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+20\d{2})\b/i
+    );
+    if (isoMatch?.[1]) {
+      creationDate = isoMatch[1];
+    } else if (writtenMatch?.[1]) {
+      creationDate = writtenMatch[1];
+    } else if (slashMatch?.[1]) {
+      creationDate = slashMatch[1];
+    }
+  }
+  parsedJson.creationDate = creationDate || null;
+
+  // Normalize archiveIntent ('CREATE' | 'APPEND') & isAppending (boolean)
+  const rawIntent =
+    typeof parsedJson.archiveIntent === 'string'
+      ? parsedJson.archiveIntent.trim().toUpperCase()
+      : '';
+  let archiveIntent: 'CREATE' | 'APPEND' | null = null;
+
+  const appendPattern =
+    /\b(append(?:ing)?|continu(?:e|ing)|add(?:ing)?\s+to|existing\s+(?:archive|experiment|notebook)|updat(?:e|ing)\s+(?:the\s+)?(?:archive|experiment|notebook)|resum(?:e|ing))\b/i;
+  const createPattern =
+    /\b(creat(?:e|ing)|new\s+(?:archive|experiment|notebook)|initializ(?:e|ing)|start(?:ing)?\s+(?:a\s+)?new)\b/i;
+
+  if (rawIntent === 'APPEND' || rawIntent === 'APPENDING' || rawIntent === 'EXISTING' || rawIntent === 'UPDATE') {
+    archiveIntent = 'APPEND';
+  } else if (transcript && appendPattern.test(transcript) && !createPattern.test(transcript)) {
+    archiveIntent = 'APPEND';
+  } else if (rawIntent === 'CREATE' || rawIntent === 'NEW' || rawIntent === 'CREATE_NEW' || rawIntent === 'INITIALIZE') {
+    archiveIntent = 'CREATE';
+  } else if (typeof parsedJson.isAppending === 'boolean') {
+    archiveIntent = parsedJson.isAppending ? 'APPEND' : 'CREATE';
+  } else if (transcript) {
+    if (createPattern.test(transcript)) {
+      archiveIntent = 'CREATE';
+    } else if (appendPattern.test(transcript)) {
+      archiveIntent = 'APPEND';
+    }
+  }
+
+  if (!archiveIntent) {
+    archiveIntent = 'CREATE';
+  }
+
+  parsedJson.archiveIntent = archiveIntent;
+  parsedJson.isAppending = archiveIntent === 'APPEND';
+
+  const rawIdEvt =
+    parsedJson.identificationEvent && typeof parsedJson.identificationEvent === 'object'
+      ? parsedJson.identificationEvent
+      : Array.isArray(parsedJson.events) && parsedJson.events.length > 0
+      ? parsedJson.events[0]
+      : null;
+  const startSec =
+    typeof rawIdEvt?.startTimestampSeconds === 'number'
+      ? rawIdEvt.startTimestampSeconds
+      : typeof rawIdEvt?.startTime === 'number'
+      ? rawIdEvt.startTime
+      : typeof rawIdEvt?.startTime === 'string'
+      ? parseTimeStringToSeconds(rawIdEvt.startTime)
+      : 0;
+  const endSec =
+    typeof rawIdEvt?.endTimestampSeconds === 'number'
+      ? rawIdEvt.endTimestampSeconds
+      : typeof rawIdEvt?.endTime === 'number'
+      ? rawIdEvt.endTime
+      : typeof rawIdEvt?.endTime === 'string'
+      ? parseTimeStringToSeconds(rawIdEvt.endTime)
+      : startSec > 0
+      ? startSec + 10
+      : 10;
+  const archiveIdEvt = {
+    eventId: rawIdEvt?.eventId || 'evt_id_001',
+    eventClass: 'ARCHIVE_IDENTIFICATION' as const,
+    eventTrack: rawIdEvt?.eventTrack === 'video' ? ('video' as const) : ('audio' as const),
+    startTime: startSec,
+    endTime: endSec,
+    startTimestampSeconds: startSec,
+    endTimestampSeconds: endSec,
+    description:
+      rawIdEvt?.description ||
+      `Operator identifies experiment archive "${archiveName}"${
+        creatorName ? ` by ${creatorName}` : ''
+      }${creationDate ? ` (${creationDate})` : ''}`,
+    ...(rawIdEvt?.spokenContext || transcript
+      ? { spokenContext: rawIdEvt?.spokenContext || transcript }
+      : {}),
+  };
+  parsedJson.identificationEvent = archiveIdEvt;
+  parsedJson.events = [archiveIdEvt];
+}
+
+/**
+ * Determines whether a Pass 1 event is a duplicate or misclassified repetition of the
+ * Pass 0 `INVENTORY_IDENTIFICATION` or `ARCHIVE_IDENTIFICATION` event.
+ * Once detected in Pass 0, identification events must not be repeated in Pass 1.
+ */
+export function isPass0IdentificationEventDuplicate(
+  evt: any,
+  classification?: WorkflowClassification
+): boolean {
+  if (!evt || typeof evt !== 'object') return false;
+
+  const cls = String(evt.eventClass || '').trim().toUpperCase();
+  const hasPass0Identification = Boolean(
+    classification?.identificationEvent ||
+      (classification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' && classification?.archiveName) ||
+      (classification?.workflowType === 'INVENTORY_UPDATE_WORKFLOW' && classification?.inventoryName)
+  );
+
+  // 1. Explicit identification event classes belong to Pass 0 and should not repeat in Pass 1
+  if (
+    cls === 'ARCHIVE_IDENTIFICATION' ||
+    cls === 'ARCHIVE_IDENTIFICATION_EVENT' ||
+    cls === 'INVENTORY_IDENTIFICATION' ||
+    cls === 'INVENTORY_IDENTIFICATION_EVENT'
+  ) {
+    return hasPass0Identification;
+  }
+
+  if (!hasPass0Identification) return false;
+
+  const desc = String(evt.description || '').trim();
+  const spoken = String(evt.spokenContext || '').trim();
+  const combinedText = `${desc} ${spoken}`.trim();
+  if (!combinedText) return false;
+
+  // Preserve events that explicitly describe a physical reagent bottle/vial/box label presentation with reagent/vial details or mixing volumes
+  const hasReagentVolumeOrSeeding =
+    /\b\d+(?:\.\d+)?\s*(?:ml|µl|ul|l|cells\/well)\b/i.test(combinedText) ||
+    /\b(?:bottle\s+label|tube\s+label|vial\s+label|box\s+label|catalog|lot\s*#|ref\s*#)\b/i.test(desc);
+
+  // 2. Check if the event describes announcing experiment/archive/inventory identification metadata
+  const isArchiveIdAnnouncement =
+    /\b(?:announc(?:e|es|ing)|stat(?:e|es|ing)|introduc(?:e|es|ing)|identif(?:y|ies|ying))\b.*\b(?:experiment\s+title|archive\s+(?:name|title)|notebook\s+(?:name|title)|researcher\s+name|creator\s+name)\b/i.test(
+      combinedText
+    ) ||
+    /\b(?:experiment\s+title\s*,\s*researcher\s+name|researcher\s+name\s*,\s*date|(?:creating|initializing|appending\s+to)\s+(?:a\s+)?(?:new\s+|existing\s+)?(?:archive|experiment|notebook))\b/i.test(
+      combinedText
+    );
+
+  const isInventoryIdAnnouncement =
+    /\b(?:announc(?:e|es|ing)|identif(?:y|ies|ying))\b.*\b(?:inventory\s+name|storage\s+tank|cryo[- ]?tank)\b/i.test(
+      combinedText
+    );
+
+  if ((isArchiveIdAnnouncement || isInventoryIdAnnouncement) && !hasReagentVolumeOrSeeding) {
+    return true;
+  }
+
+  // 3. If Pass 0 recorded an explicit non-default identificationEvent window and this event matches the same window and identification description
+  const pass0Evt = classification?.identificationEvent;
+  if (pass0Evt && pass0Evt.description && desc) {
+    if (desc.toLowerCase() === pass0Evt.description.toLowerCase()) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 export interface Pass0Options {
@@ -621,21 +1065,20 @@ Return a valid JSON object matching WorkflowClassificationSchema.`;
     },
   };
 
-  // Sanitize archiveName if null or empty before schema validation
+  // Sanitize and normalize archive metadata before schema validation
   if (parsedJson && typeof parsedJson === 'object') {
     parsedJson.executionAudit = pass0Audit;
     parsedJson.modelUsed = targetModel;
-    if (!parsedJson.archiveName) {
-      if (!videoRecord && videoId) {
-        try {
-          videoRecord = (await getVideoMetadata(databaseId, videoId)) || undefined;
-        } catch {
-          // ignore lookup error
-        }
+    if (!parsedJson.archiveName && !videoRecord && videoId) {
+      try {
+        videoRecord = (await getVideoMetadata(databaseId, videoId)) || undefined;
+      } catch {
+        // ignore lookup error
       }
-      parsedJson.archiveName =
-        videoRecord?.originalName || videoRecord?.videoId || videoId || 'default_archive';
     }
+    const fallbackArchiveName =
+      videoRecord?.originalName || videoRecord?.videoId || videoId || 'default_archive';
+    normalizePass0ArchiveMetadata(parsedJson, fallbackArchiveName);
   }
 
   return WorkflowClassificationSchema.parse(parsedJson);
@@ -730,14 +1173,18 @@ export async function runPass1ActionDetection(
       notes: 'Default classification',
     };
 
-  const guidelineFile =
-    classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
-      ? 'archive-agent-guidelines.md'
-      : 'inventory-agent-guidelines.md';
+  const isArchiveWorkflow = classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW';
+  const guidelineFile = isArchiveWorkflow
+    ? 'archive-agent-guidelines.md'
+    : 'inventory-agent-guidelines.md';
 
   const baseSystemInstruction = loadGuideline(guidelineFile);
 
-  const temporalScanningInstructions = `CRITICAL TEMPORAL SCANNING INSTRUCTIONS:
+  const temporalScanningInstructions = isArchiveWorkflow
+    ? `CRITICAL TEMPORAL SCANNING INSTRUCTIONS:
+- Analyze the full video timeline from 00:00 through completion (${durationSeconds}s), across both the FIRST HALF and the SECOND HALF using both visual and audio tracks.
+- Segment physical experimental work steps in "actions" (REAGENT_MIXING_ACTION / MIX_REAGENTS for physical reagent mixing/transfers, and REAGENT_SEEDING_ACTION / SEED_REAGENTS for physical plate seeding) ONLY when they actually occur in the video. A video may have zero actions (actions: []) and only contain events that contribute to actions in subsequent videos.`
+    : `CRITICAL TEMPORAL SCANNING INSTRUCTIONS:
 - Analyze the full video timeline from 00:00 through completion (${durationSeconds}s), across both the FIRST HALF and the SECOND HALF.
 - IGNORE verbal count cues from the audio transcript; rely strictly on visual evidence.`;
 
@@ -750,7 +1197,30 @@ export async function runPass1ActionDetection(
     videoDoc?.rawGcsUri;
   const gcsUri = resolveNormalizedGcsUri(resolvedGcs, videoId);
 
-  const promptText = `TASK: Detect EVERY distinct vial insertion into or removal from a cryo-rack or box.
+  const promptText = isArchiveWorkflow
+    ? `TASK: Detect EVERY distinct experimental work step action (Mix Reagents: REAGENT_MIXING_ACTION / MIX_REAGENTS, and Seed Reagents: REAGENT_SEEDING_ACTION / SEED_REAGENTS) across the entire video timeline.
+Workflow Type: ${classification.workflowType}.
+Video URI: ${gcsUri}.
+Video Duration: ${durationSeconds} seconds (${durationSeconds}s).
+
+CRITICAL TEMPORAL SCANNING INSTRUCTIONS:
+- Analyze the full video timeline from 00:00 to ${durationSeconds}s (including both the FIRST HALF and the SECOND HALF).
+- IMPORTANT - MULTI-ACTION TEMPORAL EXTRACTION: Emit each distinct experimental action (mixing two reagents or seeding a plate) as a separate, chronological action (\`act_001\`, \`act_002\`, ...); NEVER aggregate multiple steps into one summary event.
+- \`totalActionsDetected\` MUST equal \`actions.length\`.
+
+CRITICAL WORK STEP DETECTION RULES:
+- Only emit a work step action in the "actions" array ('REAGENT_MIXING_ACTION' / 'MIX_REAGENTS' for physical reagent mixing, media preparation, or liquid transfers between vessels; 'REAGENT_SEEDING_ACTION' / 'SEED_REAGENTS' for physical plate seeding/dispensing) when that physical action actually occurs in the video.
+- NEVER hallucinate or fabricate a work step action if no physical mixing or seeding occurs in the video. It is completely valid for a video to have ZERO actions (\`actions: []\`, \`totalActionsDetected: 0\`) and ONLY contain events in "events" that contribute to actions in subsequent videos.
+- In the "events" array, detect 'REAGENT_LABEL_PRESENTATION_EVENT' (operator shows reagent bottle/tube label to the camera) and 'PROTOCOL_AUDIO_UTTERANCE_EVENT' across the timeline. Emit EXACTLY ONE 'REAGENT_LABEL_PRESENTATION_EVENT' per distinct reagent; if a reagent label is shown multiple times, select the presentation where the label is best visible (closest to the camera and not occluded by objects in the foreground). Associate each event with its parent work step in "actionIds" (and primary "actionId") ONLY if a corresponding action occurs in this video; otherwise leave "actionId" empty ("") and "actionIds" empty ([]).
+- CRITICAL PASS 0 IDENTIFICATION EVENT EXCLUSION: The opening announcement of the archive/experiment title, creator/researcher name, creation date, or target inventory name (ARCHIVE_IDENTIFICATION / INVENTORY_IDENTIFICATION) is detected in Pass 0. Do NOT repeat it in Pass 1 "events" and do NOT misclassify it as VIAL_LABEL_PRESENTATION, REAGENT_LABEL_PRESENTATION_EVENT, or PROTOCOL_AUDIO_UTTERANCE_EVENT.
+
+CRITICAL CONSTRAINTS:
+- \`description\`: Concise sentence under 15 words (max 20 words, e.g., "Operator mixes 5 mL FBS into 45 mL DMEM").
+- \`startTime\` / \`endTime\` on actions: Single "MM:SS" string only (e.g., "00:01", "00:45"), paired with numeric \`startTimestampSeconds\` / \`endTimestampSeconds\` and \`confidenceScore\` (0.0–1.0).
+- Explicitly forbidden: NEVER output comma-separated lists of alternate timestamp formats (e.g., "00:01.000,00:01,1.0s,..."), repeating timestamp strings, or repeating phrase chains.
+
+Return a JSON object conforming to ActionDetectionPassResultSchema.`
+    : `TASK: Detect EVERY distinct vial insertion into or removal from a cryo-rack or box.
 Workflow Type: ${classification.workflowType}.
 Video URI: ${gcsUri}.
 Video Duration: ${durationSeconds} seconds (${durationSeconds}s).
@@ -807,26 +1277,107 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       modelUsed: { type: 'STRING' },
       actions: {
         type: 'ARRAY',
-        description:
-          'Exhaustive chronological array of all vial insertion and removal actions observed in the video.',
+        description: isArchiveWorkflow
+          ? 'Exhaustive chronological array of all mix reagents and seed reagents actions observed in the video.'
+          : 'Exhaustive chronological array of all vial insertion and removal actions observed in the video.',
         items: {
           type: 'OBJECT',
           properties: {
             actionId: { type: 'STRING' },
             actionType: {
               type: 'STRING',
-              enum: ['VIAL_INSERTION', 'VIAL_REMOVAL'],
+              enum: isArchiveWorkflow
+                ? [
+                    'MIX_REAGENTS',
+                    'SEED_REAGENTS',
+                    'REAGENT_MIXING_ACTION',
+                    'REAGENT_SEEDING_ACTION',
+                    'REAGENT_MIXING',
+                    'REAGENT_SEEDING',
+                  ]
+                : ['VIAL_INSERTION', 'VIAL_REMOVAL'],
             },
-            description: { type: 'STRING' },
-            startTime: { type: 'STRING' },
-            endTime: { type: 'STRING' },
-            startTimestampSeconds: { type: 'NUMBER' },
-            endTimestampSeconds: { type: 'NUMBER' },
+            actionClass: {
+              type: 'STRING',
+              enum: isArchiveWorkflow
+                ? ['REAGENT_MIXING_ACTION', 'REAGENT_SEEDING_ACTION']
+                : ['VIAL_INSERTION_ACTION', 'VIAL_REMOVAL_ACTION'],
+            },
+            description: {
+              type: 'STRING',
+              description: 'Concise single sentence under 15 words (max 20 words) describing the action.',
+            },
+            startTime: {
+              type: 'STRING',
+              description:
+                "Single timestamp string in 'MM:SS' format (e.g. '00:05'). Do NOT output multiple or comma-separated formats.",
+            },
+            endTime: {
+              type: 'STRING',
+              description:
+                "Single timestamp string in 'MM:SS' format (e.g. '00:15'). Do NOT output multiple or comma-separated formats.",
+            },
+            startTimestampSeconds: {
+              type: 'NUMBER',
+              description: 'Numeric start timestamp in seconds (e.g. 5.0).',
+            },
+            endTimestampSeconds: {
+              type: 'NUMBER',
+              description: 'Numeric end timestamp in seconds (e.g. 15.0).',
+            },
             confidenceScore: { type: 'NUMBER' },
             targetCoordinate: {
               type: 'STRING',
               description: "Alphanumeric grid slot coordinate (e.g. 'A1', 'B2', 'C3') or 'UNKNOWN'",
             },
+            ...(isArchiveWorkflow
+              ? {
+                  mixReagentsData: {
+                    type: 'OBJECT',
+                    properties: {
+                      firstReagentName: {
+                        type: 'STRING',
+                        description: 'First reagent name extracted from audio/labels, or "N/A" if not found.',
+                      },
+                      firstReagentAmount: {
+                        type: 'STRING',
+                        description: 'Mixing amount of the first reagent extracted from audio, or "N/A" if not found.',
+                      },
+                      secondReagentName: {
+                        type: 'STRING',
+                        description: 'Second reagent name extracted from audio/labels, or "N/A" if not found.',
+                      },
+                      secondReagentAmount: {
+                        type: 'STRING',
+                        description: 'Mixing amount of the second reagent extracted from audio, or "N/A" if not found.',
+                      },
+                    },
+                  },
+                  seedReagentsData: {
+                    type: 'OBJECT',
+                    properties: {
+                      plateType: {
+                        type: 'STRING',
+                        description: 'Plate type extracted from audio/video (e.g. "96-well plate"), or "N/A" if not found.',
+                      },
+                      pipetteType: {
+                        type: 'STRING',
+                        description: 'Pipette type extracted from audio/video (e.g. "8-channel pipette"), or "N/A" if not found.',
+                      },
+                      cellsSeeded: {
+                        type: 'STRING',
+                        description:
+                          'Cells or reagent being seeded extracted from operator audio and/or reagent labels (e.g. "A549"), or "N/A" if not found. Never use placeholder values.',
+                      },
+                      cellsPerWell: {
+                        type: 'STRING',
+                        description:
+                          'Number of cells per well extracted from operator spoken audio (e.g. "3K cells/well"), or "N/A" if not found. Never use placeholder values.',
+                      },
+                    },
+                  },
+                }
+              : {}),
           },
           required: [
             'actionId',
@@ -843,7 +1394,7 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       events: {
         type: 'ARRAY',
         description:
-          'Chronological list of all BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events detected at 1 fps and associated with the detected actions.',
+          'Chronological list of all presentation and audio events detected at 1 fps and associated with the detected actions.',
         items: {
           type: 'OBJECT',
           properties: {
@@ -855,7 +1406,17 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
                 'VIAL_LABEL_PRESENTATION',
                 'BOX_LABEL_PRESENTATION_EVENT',
                 'VIAL_LABEL_PRESENTATION_EVENT',
+                'REAGENT_LABEL_PRESENTATION',
+                'REAGENT_LABEL_PRESENTATION_EVENT',
+                'PROTOCOL_AUDIO_UTTERANCE_EVENT',
+                'MIXING_AMOUNT_UTTERANCE_EVENT',
+                'WELL_SEEDING_EVENT',
               ],
+            },
+            eventTrack: {
+              type: 'STRING',
+              enum: ['video', 'audio'],
+              description: "Track where the event occurred: 'video' for visual events or 'audio' for spoken utterances.",
             },
             actionId: {
               type: 'STRING',
@@ -867,13 +1428,58 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
               description:
                 'All actionIds from actions associated with this presentation event (e.g. all actions in the box for a box label presentation, or N subsequent vial actions when operator states a count).',
             },
-            startTime: { type: 'STRING' },
-            endTime: { type: 'STRING' },
-            startTimestampSeconds: { type: 'NUMBER' },
-            endTimestampSeconds: { type: 'NUMBER' },
-            description: { type: 'STRING' },
-            spokenContext: { type: 'STRING' },
-            associationReason: { type: 'STRING' },
+            startTimestampSeconds: {
+              type: 'NUMBER',
+              description: 'Numeric start timestamp of the event in seconds (e.g. 1.0).',
+            },
+            endTimestampSeconds: {
+              type: 'NUMBER',
+              description: 'Numeric end timestamp of the event in seconds (e.g. 11.0).',
+            },
+            description: {
+              type: 'STRING',
+              description: 'Concise sentence under 20 words describing the event.',
+            },
+            spokenContext: {
+              type: 'STRING',
+              description: 'Concise transcript of the operator utterance associated with this event, if any.',
+            },
+            associationReason: {
+              type: 'STRING',
+              description: 'Concise explanation under 20 words of why this event is linked to actionIds.',
+            },
+            ...(isArchiveWorkflow
+              ? {
+                  reagentName: {
+                    type: 'STRING',
+                    description: 'Reagent name read from the label or spoken in audio, or "N/A" if not found.',
+                  },
+                  reagentAcronym: {
+                    type: 'STRING',
+                    description: 'Reagent acronym read from the label or formed from the reagent name, or "N/A" if not found.',
+                  },
+                  mixingAmount: {
+                    type: 'STRING',
+                    description: 'Mixing volume/amount stated in audio, or "N/A" if not applicable.',
+                  },
+                  cellsSeeded: {
+                    type: 'STRING',
+                    description: 'Cells or reagent being seeded stated in audio or read from label, or "N/A" if not applicable.',
+                  },
+                  cellsPerWell: {
+                    type: 'STRING',
+                    description: 'Cells per well stated by the operator in audio (e.g. "3K cells/well"), or "N/A" if not applicable.',
+                  },
+                  plateType: {
+                    type: 'STRING',
+                    description: 'Plate type stated in audio or observed, or "N/A" if not applicable.',
+                  },
+                  pipetteType: {
+                    type: 'STRING',
+                    description: 'Pipette type stated in audio or observed, or "N/A" if not applicable.',
+                  },
+                }
+              : {}),
           },
           required: ['eventId', 'eventClass', 'startTimestampSeconds', 'endTimestampSeconds'],
         },
@@ -973,31 +1579,11 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
   try {
     parsedJson = JSON.parse(cleaned);
   } catch (err: any) {
-    let repaired = false;
-    const lastBraceIndex = cleaned.lastIndexOf('}');
-    if (lastBraceIndex !== -1) {
-      const candidateSub = cleaned.substring(0, lastBraceIndex + 1);
-      const repairAttempts = [
-        candidateSub + ']}',
-        candidateSub + ']',
-        candidateSub,
-        candidateSub + '}',
-        cleaned + '"}]}',
-        cleaned + '"}]',
-      ];
-      for (const attempt of repairAttempts) {
-        try {
-          parsedJson = JSON.parse(attempt);
-          console.warn('[Pass 1] Successfully repaired truncated JSON response');
-          repaired = true;
-          break;
-        } catch {
-          // ignore and continue trying
-        }
-      }
-    }
-
-    if (!repaired) {
+    const repaired = tryRepairTruncatedJson(cleaned);
+    if (repaired !== undefined) {
+      parsedJson = repaired;
+      console.warn('[Pass 1] Successfully repaired truncated JSON response');
+    } else {
       const payloadPreview = cleaned.slice(0, 500);
       console.error(
         `[Pass 1] JSON parse error: ${err.message}. Payload preview (first 500 chars): ${payloadPreview}`
@@ -1040,15 +1626,69 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
           : 'VIAL_INSERTION';
     }
 
-    if (!actionClass) {
-      if (actionType.includes('REAGENT') || actionType.includes('SEEDING')) {
-        actionClass = actionType.includes('MIX') ? 'REAGENT_MIXING_ACTION' : 'REAGENT_SEEDING_ACTION';
-      } else if (actionType.includes('REMOVAL')) {
+    const VALID_ACTION_CLASSES = new Set([
+      'VIAL_INSERTION_ACTION',
+      'VIAL_REMOVAL_ACTION',
+      'REAGENT_MIXING_ACTION',
+      'REAGENT_SEEDING_ACTION',
+    ]);
+
+    if (!actionClass || !VALID_ACTION_CLASSES.has(actionClass)) {
+      const combined = `${actionClass || ''} ${actionType || ''}`.toUpperCase();
+      if (
+        combined.includes('REAGENT') ||
+        combined.includes('SEEDING') ||
+        combined.includes('MIX') ||
+        combined.includes('SEED') ||
+        classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+      ) {
+        actionClass = combined.includes('MIX') ? 'REAGENT_MIXING_ACTION' : 'REAGENT_SEEDING_ACTION';
+      } else if (combined.includes('REMOVAL')) {
         actionClass = 'VIAL_REMOVAL_ACTION';
       } else {
         actionClass = 'VIAL_INSERTION_ACTION';
       }
     }
+
+    // Normalize mixReagentsData and seedReagentsData if present
+    let mixReagentsData: MixReagentsActionData | undefined = raw.mixReagentsData
+      ? {
+          firstReagentName: raw.mixReagentsData.firstReagentName || 'N/A',
+          firstReagentAmount: raw.mixReagentsData.firstReagentAmount || 'N/A',
+          secondReagentName: raw.mixReagentsData.secondReagentName || 'N/A',
+          secondReagentAmount: raw.mixReagentsData.secondReagentAmount || 'N/A',
+        }
+      : undefined;
+
+    let seedReagentsData: SeedReagentsActionData | undefined = raw.seedReagentsData
+      ? (() => {
+          const plateType = raw.seedReagentsData.plateType || 'N/A';
+          const pipetteType = raw.seedReagentsData.pipetteType || 'N/A';
+          const seedingEventsCount =
+            typeof raw.seedReagentsData.seedingEventsCount === 'number'
+              ? raw.seedReagentsData.seedingEventsCount
+              : 0;
+          const expectedCount =
+            typeof raw.seedReagentsData.expectedSeedingEventsCount === 'number'
+              ? raw.seedReagentsData.expectedSeedingEventsCount
+              : computeExpectedSeedingEvents(plateType, pipetteType);
+          const isSeedingCountCorrect =
+            typeof raw.seedReagentsData.isSeedingCountCorrect === 'boolean'
+              ? raw.seedReagentsData.isSeedingCountCorrect
+              : expectedCount !== undefined
+              ? seedingEventsCount === expectedCount
+              : undefined;
+          return {
+            plateType,
+            pipetteType,
+            cellsSeeded: raw.seedReagentsData.cellsSeeded || 'N/A',
+            cellsPerWell: raw.seedReagentsData.cellsPerWell || 'N/A',
+            seedingEventsCount,
+            ...(expectedCount !== undefined ? { expectedSeedingEventsCount: expectedCount } : {}),
+            ...(isSeedingCountCorrect !== undefined ? { isSeedingCountCorrect } : {}),
+          };
+        })()
+      : undefined;
 
     // Precise Timestamps & Numeric intervals
     let startSec =
@@ -1064,8 +1704,18 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
         ? raw.endTime
         : undefined;
 
-    let startTime = typeof raw.startTime === 'string' ? raw.startTime : undefined;
-    let endTime = typeof raw.endTime === 'string' ? raw.endTime : undefined;
+    let startTime =
+      typeof raw.startTime === 'string'
+        ? raw.startTime.includes(',')
+          ? formatSecondsToTimeString(startSec ?? parseTimeStringToSeconds(raw.startTime))
+          : raw.startTime
+        : undefined;
+    let endTime =
+      typeof raw.endTime === 'string'
+        ? raw.endTime.includes(',')
+          ? formatSecondsToTimeString(endSec ?? parseTimeStringToSeconds(raw.endTime))
+          : raw.endTime
+        : undefined;
 
     if (startSec === undefined && startTime) {
       startSec = parseTimeStringToSeconds(startTime);
@@ -1088,33 +1738,42 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
     const confidenceScore =
       typeof raw.confidenceScore === 'number' ? Math.max(0, Math.min(1, raw.confidenceScore)) : 0.95;
 
-    // Coordinate & Location
-    let targetLocation = raw.targetLocation;
-    let targetCoordinate = raw.targetCoordinate || targetLocation?.coordinate;
-    let boxRowId = raw.boxRowId;
-    let boxColId = typeof raw.boxColId === 'number' ? raw.boxColId : undefined;
+    const isArchiveAct =
+      classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+      actionType === 'REAGENT_SEEDING_ACTION' ||
+      actionType === 'REAGENT_MIXING_ACTION';
 
-    if (targetCoordinate && (!boxRowId || !boxColId)) {
+    // Coordinate & Location (cryo-box slot coordinates only apply to inventory vial actions, never 96-well plate seeding or archive workflows)
+    let targetLocation = isArchiveAct ? undefined : raw.targetLocation;
+    let targetCoordinate = isArchiveAct ? undefined : (raw.targetCoordinate || targetLocation?.coordinate);
+    let boxRowId = isArchiveAct ? undefined : raw.boxRowId;
+    let boxColId = isArchiveAct ? undefined : (typeof raw.boxColId === 'number' ? raw.boxColId : undefined);
+
+    if (!isArchiveAct && targetCoordinate && (!boxRowId || !boxColId)) {
       const match = String(targetCoordinate).match(/^([A-Za-z]+)(\d+)$/);
       if (match) {
         boxRowId = boxRowId || match[1].toUpperCase();
         boxColId = boxColId || parseInt(match[2], 10);
       }
-    } else if (boxRowId && boxColId && !targetCoordinate) {
+    } else if (!isArchiveAct && boxRowId && boxColId && !targetCoordinate) {
       targetCoordinate = `${boxRowId}${boxColId}`;
     }
 
-    if (!targetLocation && targetCoordinate) {
+    if (!isArchiveAct && !targetLocation && targetCoordinate) {
       targetLocation = { coordinate: targetCoordinate };
-    } else if (targetLocation && targetCoordinate && !targetLocation.coordinate) {
+    } else if (!isArchiveAct && targetLocation && targetCoordinate && !targetLocation.coordinate) {
       targetLocation.coordinate = targetCoordinate;
     }
 
     const description =
       raw.description ||
-      `Operator performs ${actionType} at ${
-        targetCoordinate || (boxRowId ? `${boxRowId}${boxColId || ''}` : 'target slot')
-      }`;
+      (actionType === 'REAGENT_SEEDING_ACTION'
+        ? 'Operator seeds cells into 96-well plate'
+        : actionType === 'REAGENT_MIXING_ACTION'
+        ? 'Operator mixes reagents'
+        : `Operator performs ${actionType} at ${
+            targetCoordinate || (boxRowId ? `${boxRowId}${boxColId || ''}` : 'target slot')
+          }`);
 
     const cellLineName = raw.cellLineName || (raw.cellLineInfo?.name as string) || undefined;
     const inventoryId = raw.inventoryId || (classification.inventoryName || undefined);
@@ -1146,6 +1805,8 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       cellLineInfo: raw.cellLineInfo,
       boxRowId,
       boxColId,
+      ...(mixReagentsData ? { mixReagentsData } : {}),
+      ...(seedReagentsData ? { seedReagentsData } : {}),
     };
 
     const actionItem: Action = {
@@ -1175,6 +1836,8 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       towerId: raw.towerId || targetLocation?.tower,
       boxRowId,
       boxColId,
+      ...(mixReagentsData ? { mixReagentsData } : {}),
+      ...(seedReagentsData ? { seedReagentsData } : {}),
       eventList: Array.isArray(raw.eventList) && raw.eventList.length > 0 ? raw.eventList : [`evt_${actionId}`],
     };
 
@@ -1189,7 +1852,9 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
     ? parsedJson.eventList
     : [];
 
-  const normalizedPass1RawEvents = rawPass1Events.map((evt: any, idx: number) => {
+  const normalizedPass1RawEvents = rawPass1Events
+    .filter((evt: any) => !isPass0IdentificationEventDuplicate(evt, classification))
+    .map((evt: any, idx: number) => {
     const startSec =
       typeof evt.startTimestampSeconds === 'number'
         ? evt.startTimestampSeconds
@@ -1209,8 +1874,15 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
     return {
       ...evt,
       eventId: evt.eventId || `evt_${String(idx + 1).padStart(3, '0')}`,
-      eventClass: evt.eventClass || 'VIAL_LABEL_PRESENTATION',
-      eventTrack: evt.eventTrack === 'audio' ? 'audio' : 'video',
+      eventClass:
+        evt.eventClass ||
+        (isArchiveWorkflow ? 'PROTOCOL_AUDIO_UTTERANCE_EVENT' : 'VIAL_LABEL_PRESENTATION'),
+      eventTrack:
+        evt.eventTrack === 'audio' ||
+        String(evt.eventClass || '').includes('AUDIO') ||
+        String(evt.eventClass || '').includes('UTTERANCE')
+          ? 'audio'
+          : 'video',
       startTime: startSec,
       endTime: endSec,
     };
@@ -1222,15 +1894,33 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
     classification
   );
 
-  const pass1Events: Event[] = associatedPass1RawEvents.map((evt: any) =>
-    EventSchema.parse({
+  const hasActionsInVideo = normalizedActions.length > 0;
+  let pass1Events: Event[] = associatedPass1RawEvents.map((evt: any) => {
+    const resolvedActionIds = hasActionsInVideo
+      ? Array.isArray(evt.actionIds) && evt.actionIds.length > 0
+        ? evt.actionIds
+        : [evt.actionId || normalizedActions[0]?.actionId || 'act_001']
+      : isArchiveWorkflow
+      ? []
+      : Array.isArray(evt.actionIds) && evt.actionIds.length > 0
+      ? evt.actionIds
+      : evt.actionId
+      ? [evt.actionId]
+      : [];
+    const resolvedActionId = hasActionsInVideo
+      ? evt.actionId || normalizedActions[0]?.actionId || 'act_001'
+      : isArchiveWorkflow
+      ? ''
+      : evt.actionId || '';
+
+    return EventSchema.parse({
+      ...evt,
       eventId: evt.eventId,
-      actionId: evt.actionId || normalizedActions[0]?.actionId || 'act_001',
-      actionIds:
-        Array.isArray(evt.actionIds) && evt.actionIds.length > 0
-          ? evt.actionIds
-          : [evt.actionId || normalizedActions[0]?.actionId || 'act_001'],
-      eventClass: evt.eventClass || 'VIAL_LABEL_PRESENTATION',
+      actionId: resolvedActionId,
+      actionIds: resolvedActionIds,
+      eventClass:
+        evt.eventClass ||
+        (isArchiveWorkflow ? 'REAGENT_LABEL_PRESENTATION_EVENT' : 'VIAL_LABEL_PRESENTATION'),
       eventTrack: evt.eventTrack === 'audio' ? 'audio' : 'video',
       startTime: evt.startTime ?? 0,
       endTime: evt.endTime ?? 0,
@@ -1240,8 +1930,15 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       bestShotUrls: Array.isArray(evt.bestShotUrls) ? evt.bestShotUrls : [],
       bestShotTimes: Array.isArray(evt.bestShotTimes) ? evt.bestShotTimes : [],
       refinementList: Array.isArray(evt.refinementList) ? evt.refinementList : [],
-    })
-  );
+    });
+  });
+
+  // Deduplicate reagent label presentation events in Pass 1 so there is only one event per distinct reagent,
+  // selecting the event where the label is best visible (closest to camera, not occluded by objects in the foreground).
+  if (isArchiveWorkflow || pass1Events.some((e) => isReagentLabelPresentationEvent(e))) {
+    const { deduplicatedEvents } = deduplicateReagentLabelPresentationEvents(pass1Events, normalizedActions);
+    pass1Events = deduplicatedEvents;
+  }
 
   // Cross-link Pass 1 associated presentation events back onto Pass 1 actions & intervals
   if (pass1Events.length > 0) {
@@ -1258,6 +1955,79 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       if (linkedEventIds.length > 0) {
         act.eventList = Array.from(new Set(linkedEventIds));
         interval.eventList = act.eventList;
+      }
+    }
+  }
+
+  // Enrich archive seeding actions in Pass 1 from associated events & spoken audio (never using placeholders)
+  if (isArchiveWorkflow) {
+    const pass1ReagentCandidates = pass1Events
+      .filter(
+        (e) =>
+          (e.reagentName && e.reagentName !== 'N/A') ||
+          (e.reagentAcronym && e.reagentAcronym !== 'N/A') ||
+          (e.reagentData &&
+            (e.reagentData.reagentName !== 'N/A' || e.reagentData.reagentAcronym !== 'N/A'))
+      )
+      .map((e) => ({
+        reagentName: e.reagentData?.reagentName || e.reagentName || 'N/A',
+        reagentAcronym: e.reagentData?.reagentAcronym || e.reagentAcronym || 'N/A',
+        rawLabelText: e.reagentData?.rawLabelText || e.conflatedLabelText || e.description,
+      }));
+    const globalAudioEvents = pass1Events.filter(
+      (e) => e.eventClass === 'PROTOCOL_AUDIO_UTTERANCE_EVENT'
+    );
+
+    for (let i = 0; i < normalizedActions.length; i++) {
+      const act = normalizedActions[i];
+      const interval = normalizedIntervals[i];
+      const isSeedAction =
+        act.actionClass === 'REAGENT_SEEDING_ACTION' ||
+        act.actionType === 'REAGENT_SEEDING_ACTION' ||
+        act.actionType === 'SEED_REAGENTS' ||
+        String(act.actionClass || act.actionType || '').toUpperCase().includes('SEED');
+
+      if (isSeedAction) {
+        const linkedEvts = pass1Events.filter(
+          (e) =>
+            e.actionId === act.actionId ||
+            (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId)) ||
+            (Array.isArray(act.eventList) && act.eventList.includes(e.eventId))
+        );
+        const identEvtText =
+          typeof classification?.identificationEvent === 'string'
+            ? classification.identificationEvent
+            : classification?.identificationEvent
+            ? `${(classification.identificationEvent as any).description || ''} ${(classification.identificationEvent as any).spokenContext || ''}`
+            : undefined;
+        const audioAndEventTexts = [
+          ...linkedEvts.map(
+            (e) => `${e.description || ''} ${e.conflatedLabelText || ''} ${e.reagentName || ''} ${e.reagentAcronym || ''}`
+          ),
+          ...globalAudioEvents.map((e) => e.description || ''),
+          classification?.transcribedAudio,
+          identEvtText,
+        ];
+        const resolvedSeed = resolveSeedReagentsDataFromContext({
+          explicitCandidates: [act.seedReagentsData, ...linkedEvts],
+          actionDescription: act.description,
+          cellLineName: act.cellLineName,
+          cellLineInfo: act.cellLineInfo,
+          audioAndEventTexts,
+          reagents: [
+            ...(Array.isArray(act.reagents) ? act.reagents : []),
+            ...pass1ReagentCandidates,
+          ],
+        });
+        act.seedReagentsData = {
+          ...(act.seedReagentsData || {}),
+          plateType: resolvedSeed.plateType,
+          pipetteType: resolvedSeed.pipetteType,
+          cellsSeeded: resolvedSeed.cellsSeeded,
+          cellsPerWell: resolvedSeed.cellsPerWell,
+          seedingEventsCount: act.seedReagentsData?.seedingEventsCount ?? 0,
+        };
+        interval.seedReagentsData = act.seedReagentsData;
       }
     }
   }
@@ -1354,126 +2124,213 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
  * Pass 1 actions (actionIds), identifies the 2 best frames (highest contrast & minimal blur),
  * and refines Pass 1 action interval boundaries at 4 fps within [start - 1s, end + 1s].
  */
-export const eventDetectionSchema = {
-  type: 'OBJECT',
-  properties: {
-    events: {
-      type: 'ARRAY',
-      description:
-        'Chronological list of detected BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events (and optional state/audio sub-events).',
-      items: {
-        type: 'OBJECT',
-        properties: {
-          eventId: { type: 'STRING' },
-          actionId: {
-            type: 'STRING',
-            description: 'Primary Pass 1 actionId associated with this event (e.g. act_001)',
+export function getEventDetectionSchema(isArchiveWorkflow: boolean = false) {
+  return {
+    type: 'OBJECT',
+    properties: {
+      events: {
+        type: 'ARRAY',
+        description: isArchiveWorkflow
+          ? 'Chronological list of Pass 1 REAGENT_LABEL_PRESENTATION_EVENT events refined at 4 fps with their 2 best frames. Do NOT detect or emit PROTOCOL_AUDIO_UTTERANCE_EVENT, BOX_LABEL_PRESENTATION, or VIAL_LABEL_PRESENTATION events.'
+          : 'Chronological list of detected BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events (and optional state/audio sub-events).',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            eventId: { type: 'STRING' },
+            actionId: {
+              type: 'STRING',
+              description: 'Primary Pass 1 actionId associated with this event (e.g. act_001)',
+            },
+            actionIds: {
+              type: 'ARRAY',
+              items: { type: 'STRING' },
+              description:
+                'All Pass 1 actionIds associated with this event (e.g. all actions in the box for a box label presentation, or N subsequent vial actions when operator states a count like "four vials").',
+            },
+            eventClass: {
+              type: 'STRING',
+              enum: isArchiveWorkflow
+                ? [
+                    'REAGENT_LABEL_PRESENTATION',
+                    'REAGENT_LABEL_PRESENTATION_EVENT',
+                    'WELL_SEEDING_EVENT',
+                    'SEEDING_EVENT',
+                  ]
+                : [
+                    'BOX_LABEL_PRESENTATION',
+                    'VIAL_LABEL_PRESENTATION',
+                    'REAGENT_LABEL_PRESENTATION',
+                    'BOX_LABEL_PRESENTATION_EVENT',
+                    'VIAL_LABEL_PRESENTATION_EVENT',
+                    'REAGENT_LABEL_PRESENTATION_EVENT',
+                    'VIAL_INSERTION',
+                    'VIAL_REMOVAL',
+                    'CAP_REMOVAL',
+                    'LABEL_PRESENTATION',
+                    'PRE_ACTION_BOX_STATE_EVENT',
+                    'POST_ACTION_BOX_STATE_EVENT',
+                    'PRE_TRANSFER_STATE_EVENT',
+                    'POST_TRANSFER_STATE_EVENT',
+                    'OPERATOR_AUDIO_UTTERANCE_EVENT',
+                    'PROTOCOL_AUDIO_UTTERANCE_EVENT',
+                    'MIXING_AMOUNT_UTTERANCE_EVENT',
+                    'WELL_SEEDING_EVENT',
+                    'SEEDING_EVENT',
+                    'OTHER',
+                  ],
+              description: isArchiveWorkflow
+                ? 'Explicit event class for experiment archive workflows in Pass 2. Must be REAGENT_LABEL_PRESENTATION_EVENT or WELL_SEEDING_EVENT. Never PROTOCOL_AUDIO_UTTERANCE_EVENT, VIAL_LABEL_PRESENTATION, or BOX_LABEL_PRESENTATION.'
+                : 'Explicit event class',
+            },
+            eventTrack: {
+              type: 'STRING',
+              enum: ['video', 'audio'],
+              description: 'Track modality for the event',
+            },
+            startTime: {
+              type: 'NUMBER',
+              description: 'Start time in elapsed seconds as float (e.g. 2.5)',
+            },
+            endTime: {
+              type: 'NUMBER',
+              description: 'End time in elapsed seconds as float (e.g. 6.0)',
+            },
+            description: {
+              type: 'STRING',
+              description: 'Concise description of the event',
+            },
+            spokenContext: {
+              type: 'STRING',
+              description: 'Relevant spoken phrase during or near the event (e.g. "I am adding 5 ml of this")',
+            },
+            associationReason: {
+              type: 'STRING',
+              description: 'Reason explaining why this event is associated with actionIds',
+            },
+            reagentName: {
+              type: 'STRING',
+              description: 'Detected reagent name printed on the vessel label or "N/A" if not printed',
+            },
+            reagentAcronym: {
+              type: 'STRING',
+              description: 'Acronym formed from the first letters of the reagent name (e.g. FBS) or printed on the vessel, or "N/A"',
+            },
+            manufacturer: {
+              type: 'STRING',
+              description: 'Manufacturer printed on the reagent vessel label, or "N/A" if not printed on the label',
+            },
+            catalogNumber: {
+              type: 'STRING',
+              description: 'Catalog / Ref # printed on the reagent vessel label, or "N/A" if not printed on the label',
+            },
+            lotNumber: {
+              type: 'STRING',
+              description: 'Lot # printed on the reagent vessel label, or "N/A" if not printed on the label',
+            },
+            mixingAmount: {
+              type: 'STRING',
+              description: 'Detected mixing volume/amount from audio or video (e.g. "5 ml")',
+            },
+            plateType: {
+              type: 'STRING',
+              description: 'Detected plate type for seeding action from video or spoken audio, or "N/A" if not found (never use placeholder values)',
+            },
+            pipetteType: {
+              type: 'STRING',
+              description: 'Detected pipette type for seeding action from video or spoken audio, or "N/A" if not found (never use placeholder values)',
+            },
+            cellsSeeded: {
+              type: 'STRING',
+              description: 'Cell line / reagent seeded as extracted from spoken audio or reagent label events, or "N/A" if not found (never use placeholder values)',
+            },
+            cellsPerWell: {
+              type: 'STRING',
+              description: 'Number of cells per well seeded as extracted from operator spoken audio (or computed from spoken concentration in cells/mL and volume per well in µL), or "N/A" if not found (never use placeholder values)',
+            },
+            seedingEventsCount: {
+              type: 'NUMBER',
+              description: 'Count of individual seeding dispense events detected for this plate',
+            },
+            expectedSeedingEventsCount: {
+              type: 'NUMBER',
+              description: 'Expected count of seeding events based on plate wells divided by pipette channels (e.g. 96 / 8 = 12)',
+            },
+            isSeedingCountCorrect: {
+              type: 'BOOLEAN',
+              description: 'True if seedingEventsCount matches expectedSeedingEventsCount',
+            },
+            seededColumn: {
+              type: 'INTEGER',
+              minimum: 1,
+              maximum: 12,
+              description:
+                'Detected 96-well plate column number (1 to 12, where column 1 is on the left side and column 12 is all the way to the right) into which cells were deposited during this individual seeding event.',
+            },
+            seededColumns: {
+              type: 'ARRAY',
+              items: { type: 'INTEGER', minimum: 1, maximum: 12 },
+              description:
+                'Aggregated list of detected 96-well plate column numbers (1 to 12, left to right) into which cells were seeded across the seeding action.',
+            },
+            highestContrastTimestamp: {
+              type: 'NUMBER',
+              description:
+                'Timestamp in elapsed seconds (within [startTime, endTime]) of a frame that first and foremost shows the label clearly to the camera (unoccluded and oriented toward the camera), and secondarily has the highest contrast among such frames. It is OK if this equals minimalBlurTimestamp.',
+            },
+            minimalBlurTimestamp: {
+              type: 'NUMBER',
+              description:
+                'Timestamp in elapsed seconds (within [startTime, endTime]) of a frame that first and foremost shows the label clearly to the camera (unoccluded and oriented toward the camera), and secondarily has the minimal amount of blur among such frames. It is OK if this equals highestContrastTimestamp.',
+            },
+            bestShotTimes: {
+              type: 'ARRAY',
+              items: { type: 'NUMBER' },
+              description:
+                'Two best frame timestamps [highestContrastTimestamp, minimalBlurTimestamp] in elapsed seconds that clearly show the label to the camera (it is OK if both timestamps are the same)',
+            },
+            refinementList: {
+              type: 'ARRAY',
+              items: { type: 'STRING' },
+              description: 'Associated refinement identifiers',
+            },
           },
-          actionIds: {
-            type: 'ARRAY',
-            items: { type: 'STRING' },
-            description:
-              'All Pass 1 actionIds associated with this event (e.g. all actions in the box for a box label presentation, or N subsequent vial actions when operator states a count like "four vials").',
-          },
-          eventClass: {
-            type: 'STRING',
-            enum: [
-              'BOX_LABEL_PRESENTATION',
-              'VIAL_LABEL_PRESENTATION',
-              'BOX_LABEL_PRESENTATION_EVENT',
-              'VIAL_LABEL_PRESENTATION_EVENT',
-              'VIAL_INSERTION',
-              'VIAL_REMOVAL',
-              'CAP_REMOVAL',
-              'LABEL_PRESENTATION',
-              'PRE_ACTION_BOX_STATE_EVENT',
-              'POST_ACTION_BOX_STATE_EVENT',
-              'OPERATOR_AUDIO_UTTERANCE_EVENT',
-              'OTHER',
-            ],
-            description: 'Explicit event class (BOX_LABEL_PRESENTATION or VIAL_LABEL_PRESENTATION)',
-          },
-          eventTrack: {
-            type: 'STRING',
-            enum: ['video', 'audio'],
-            description: 'Track modality for the event',
-          },
-          startTime: {
-            type: 'NUMBER',
-            description: 'Start time in elapsed seconds as float (e.g. 2.5)',
-          },
-          endTime: {
-            type: 'NUMBER',
-            description: 'End time in elapsed seconds as float (e.g. 6.0)',
-          },
-          description: {
-            type: 'STRING',
-            description: 'Concise description of the label presentation event',
-          },
-          spokenContext: {
-            type: 'STRING',
-            description: 'Relevant spoken phrase during or near the presentation (e.g. "four vials")',
-          },
-          associationReason: {
-            type: 'STRING',
-            description: 'Reason explaining why this event is associated with actionIds',
-          },
-          highestContrastTimestamp: {
-            type: 'NUMBER',
-            description:
-              'Timestamp in elapsed seconds (within [startTime, endTime]) of a frame that first and foremost shows the label clearly to the camera (unoccluded and oriented toward the camera), and secondarily has the highest contrast among such frames. It is OK if this equals minimalBlurTimestamp.',
-          },
-          minimalBlurTimestamp: {
-            type: 'NUMBER',
-            description:
-              'Timestamp in elapsed seconds (within [startTime, endTime]) of a frame that first and foremost shows the label clearly to the camera (unoccluded and oriented toward the camera), and secondarily has the minimal amount of blur among such frames. It is OK if this equals highestContrastTimestamp.',
-          },
-          bestShotTimes: {
-            type: 'ARRAY',
-            items: { type: 'NUMBER' },
-            description:
-              'Two best frame timestamps [highestContrastTimestamp, minimalBlurTimestamp] in elapsed seconds that clearly show the label to the camera (it is OK if both timestamps are the same)',
-          },
-          refinementList: {
-            type: 'ARRAY',
-            items: { type: 'STRING' },
-            description: 'Associated refinement identifiers',
-          },
+          required: ['eventId', 'eventClass', 'startTime', 'endTime'],
         },
-        required: ['eventId', 'eventClass', 'startTime', 'endTime'],
+      },
+      refinedActions: {
+        type: 'ARRAY',
+        description:
+          'For each Pass 1 vial insertion or removal action, refine the start and end interval boundaries (refinedStartTimestampSeconds and refinedEndTimestampSeconds) at 4 fps precision within [max(0, pass1Start - 1), min(duration, pass1End + 1)].',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            actionId: { type: 'STRING' },
+            actionType: { type: 'STRING' },
+            refinedStartTimestampSeconds: {
+              type: 'NUMBER',
+              description:
+                'Refined start timestamp in seconds at 4 fps precision within [pass1Start - 1s, pass1End + 1s] marking when the vial insertion or removal action begins.',
+            },
+            refinedEndTimestampSeconds: {
+              type: 'NUMBER',
+              description:
+                'Refined end timestamp in seconds at 4 fps precision within [pass1Start - 1s, pass1End + 1s] marking when the vial insertion or removal action completes.',
+            },
+            confidenceScore: { type: 'NUMBER' },
+          },
+          required: [
+            'actionId',
+            'refinedStartTimestampSeconds',
+            'refinedEndTimestampSeconds',
+          ],
+        },
       },
     },
-    refinedActions: {
-      type: 'ARRAY',
-      description:
-        'For each Pass 1 vial insertion or removal action, refine the start and end interval boundaries (refinedStartTimestampSeconds and refinedEndTimestampSeconds) at 4 fps precision within [max(0, pass1Start - 1), min(duration, pass1End + 1)].',
-      items: {
-        type: 'OBJECT',
-        properties: {
-          actionId: { type: 'STRING' },
-          actionType: { type: 'STRING' },
-          refinedStartTimestampSeconds: {
-            type: 'NUMBER',
-            description:
-              'Refined start timestamp in seconds at 4 fps precision within [pass1Start - 1s, pass1End + 1s] marking when the vial insertion or removal action begins.',
-          },
-          refinedEndTimestampSeconds: {
-            type: 'NUMBER',
-            description:
-              'Refined end timestamp in seconds at 4 fps precision within [pass1Start - 1s, pass1End + 1s] marking when the vial insertion or removal action completes.',
-          },
-          confidenceScore: { type: 'NUMBER' },
-        },
-        required: [
-          'actionId',
-          'refinedStartTimestampSeconds',
-          'refinedEndTimestampSeconds',
-        ],
-      },
-    },
-  },
-  required: ['events'],
-};
+    required: ['events'],
+  };
+}
+
+export const eventDetectionSchema = getEventDetectionSchema(false);
 
 /**
  * Parses spoken vial count phrases such as "four vials", "four vial", "4 vials", "three vials", etc.
@@ -1635,6 +2492,22 @@ export function associatePresentationEventsWithActions(
           associationReason = `Box label presentation at ${evtStart.toFixed(1)}s applies to ${resolvedIds.length} subsequent vial action(s) in this box.`;
         }
       }
+    } else if (cls.includes('REAGENT_LABEL')) {
+      if (resolvedIds.length === 0 && actionsWithTimes.length > 0) {
+        if (evt.actionId && (validActionIds.size === 0 || validActionIds.has(evt.actionId))) {
+          resolvedIds = [evt.actionId];
+        } else {
+          const nextAction =
+            actionsWithTimes.find((item) => item.hasTime && item.endSec >= evtStart - 1.0) ||
+            actionsWithTimes[0];
+          if (nextAction) {
+            resolvedIds = [nextAction.action.actionId];
+          }
+        }
+        if (!associationReason && resolvedIds.length > 0) {
+          associationReason = `Associated reagent label presentation with action ${resolvedIds.join(', ')}.`;
+        }
+      }
     } else if (cls.includes('VIAL_LABEL') || cls === 'LABEL_PRESENTATION') {
       const spokenCount =
         parseSpokenVialCount(spokenContext) ??
@@ -1667,6 +2540,19 @@ export function associatePresentationEventsWithActions(
           associationReason = `Associated with subsequent vial action ${resolvedIds.join(', ')}.`;
         }
       }
+    }
+
+    const isArchiveNoActions =
+      classification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' && actions.length === 0;
+
+    if (isArchiveNoActions) {
+      return {
+        ...evt,
+        actionId: '',
+        actionIds: [],
+        ...(spokenContext ? { spokenContext } : {}),
+        ...(associationReason ? { associationReason } : {}),
+      };
     }
 
     if (resolvedIds.length === 0) {
@@ -1928,7 +2814,28 @@ export async function runPass2EventDetection(
     (mergedOptions.actions as any)?.events ||
     videoDoc?.passes?.pass1?.data?.events ||
     [];
-  const pass1Events: Event[] = Array.isArray(rawPass1Events) ? rawPass1Events : [];
+  const rawPass1EventsList: Event[] = Array.isArray(rawPass1Events) ? rawPass1Events : [];
+  const hasPass1EventsInput = rawPass1EventsList.length > 0;
+  const isArchivePass2 = classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW';
+  const hasSeedingAction = actions.some((act) => {
+    const actType = String(act.actionType || act.actionClass || '').toUpperCase();
+    return actType.includes('SEED');
+  });
+  // Pass 2 selects 4 fps best frames for label presentation events and detects individual seeding events
+  const pass1Events: Event[] = isArchivePass2
+    ? rawPass1EventsList.filter((evt) => {
+        const cls = String(evt?.eventClass || (evt as any)?.actionType || '').toUpperCase();
+        return isReagentLabelPresentationEvent(evt) || cls.includes('SEEDING');
+      })
+    : rawPass1EventsList.filter((evt) => {
+        const cls = String(evt?.eventClass || (evt as any)?.actionType || '').toUpperCase();
+        return (
+          !cls.includes('AUDIO_UTTERANCE') &&
+          !cls.includes('STATEMENT_EVENT') &&
+          !cls.includes('NOTEBOOK_TRANSCRIPTION') &&
+          evt?.eventTrack !== 'audio'
+        );
+      });
   const durationSeconds: number | undefined =
     videoDoc?.durationSeconds || (videoDoc as any)?.durationSec || undefined;
 
@@ -2031,31 +2938,68 @@ export async function runPass2EventDetection(
       return `  ${idx + 1}. eventId="${ew.event.eventId}" (${ew.event.eventClass}, associated actionIds=[${actionIdsStr}]): Pass 1 interval [${ew.startSeconds.toFixed(2)}s - ${ew.endSeconds.toFixed(2)}s]`;
     });
 
-    const promptText = [
-      `Pass 2 Targeted 4 fps Best-Frame Selection & Action Boundary Refinement for videoId="${videoId || 'unknown'}".`,
-      classification.transcribedAudio
-        ? `Pass 0 Audio Transcript Context: "${classification.transcribedAudio}"`
-        : '',
-      `Pass 1 Detected Inventory Update Actions (${actions.length}):`,
-      actionSummaryLines.length > 0 ? actionSummaryLines.join('\n') : '  (No Pass 1 actions provided)',
-      `Pass 1 Detected & Associated Label Presentation Events (${pass1Events.length}):`,
-      eventSummaryLines.length > 0 ? eventSummaryLines.join('\n') : '  (None pre-populated in Pass 1)',
-      ``,
-      `Instructions (4 fps targeted window analysis only):`,
-      `1. For each presentation event (BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION), inspect its window at 4 fps and identify the 2 best frames within [startTime, endTime]:`,
-      `   - Primary Criterion: The most important aspect of frame selection is that the frame shows the label clearly to the camera (oriented directly toward the camera, in frame, legible, and not occluded by the operator's fingers or hand).`,
-      `   - Secondary Properties: The amount of blur and high contrast are secondary properties evaluated among frames that show the label clearly to the camera.`,
-      `   - "highestContrastTimestamp": timestamp (seconds) of the frame that shows the label clearly to the camera and secondarily has the highest contrast.`,
-      `   - "minimalBlurTimestamp": timestamp (seconds) of the frame that shows the label clearly to the camera and secondarily has the minimal amount of blur.`,
-      `   - It is OK if both frames are the same ("highestContrastTimestamp" === "minimalBlurTimestamp"). Set "bestShotTimes" to [highestContrastTimestamp, minimalBlurTimestamp] and preserve the Pass 1 "actionIds" associations.`,
-      `2. For each Pass 1 vial insertion or removal action, inspect its 4 fps refinement window in "refinedActions" and refine the action interval boundaries ("refinedStartTimestampSeconds" and "refinedEndTimestampSeconds") at 4 fps within [pass1Start - 1s, pass1End + 1s]:`,
-      `   - "refinedStartTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the vial insertion or removal action begins.`,
-      `   - "refinedEndTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the vial insertion or removal action completes.`,
-      `   - Neighboring action intervals must NEVER overlap in time: for any consecutive actions i and i+1, "refinedEndTimestampSeconds" of action i MUST be <= "refinedStartTimestampSeconds" of action i+1.`,
-      `Return a JSON object containing "events" and "refinedActions" conforming to the response schema.`,
-    ]
-      .filter(Boolean)
-      .join('\n');
+    const targetSchema = getEventDetectionSchema(isArchivePass2);
+    const promptText = isArchivePass2
+      ? [
+          `Pass 2 Targeted 4 fps Analysis for Experiment Archive Workflow (videoId="${videoId || 'unknown'}").`,
+          `CRITICAL WORKFLOW DIRECTIVE: This video is an EXPERIMENT_NOTEBOOK_WORKFLOW (laboratory experiment archive).`,
+          `DO NOT emit any VIAL_LABEL_PRESENTATION, BOX_LABEL_PRESENTATION, VIAL_INSERTION, VIAL_REMOVAL, or PROTOCOL_AUDIO_UTTERANCE_EVENT events in Pass 2.`,
+          pass1Events.length > 0
+            ? `Inspect and select the 2 best frames at 4 fps for the ${pass1Events.length} Pass 1 detected events listed below.`
+            : '',
+          hasSeedingAction
+            ? `SEEDING EVENT DETECTION DIRECTIVE: Pass 1 detected a cell seeding action into a 96-well plate. In Pass 2, detect each individual seeding event when the pipette deposits cells into the 96-well plate. Count these events to ensure all wells were seeded. For each individual seeding event, detect which column (1 to 12, where column 1 is on the left side and column 12 is all the way to the right) the cells were seeded into, and emit a WELL_SEEDING_EVENT with eventClass='WELL_SEEDING_EVENT', actionId of the seeding action, startTime, endTime, and seededColumn (1 to 12). Also populate seedingEventsCount, expectedSeedingEventsCount (e.g. 12 for an 8-channel pipette seeding 12 columns of a 96-well plate), isSeedingCountCorrect, and seededColumns.`
+            : '',
+          classification.transcribedAudio
+            ? `Pass 0 Audio Transcript Context: "${classification.transcribedAudio}"`
+            : '',
+          `Pass 1 Detected Experiment Work Step Actions (${actions.length}):`,
+          actionSummaryLines.length > 0 ? actionSummaryLines.join('\n') : '  (No Pass 1 actions provided)',
+          `Pass 1 Detected Reagent Label Presentation Events (${pass1Events.length}):`,
+          eventSummaryLines.length > 0 ? eventSummaryLines.join('\n') : '  (None pre-populated in Pass 1)',
+          ``,
+          `Instructions (4 fps targeted window analysis only):`,
+          `1. For each REAGENT_LABEL_PRESENTATION_EVENT:`,
+          `   - Inspect its window at 4 fps and identify the 2 best frames within [startTime, endTime].`,
+          `   - Primary Criterion: The frame MUST show the reagent label clearly to the camera (oriented directly toward the camera, in frame, legible, and not occluded by the operator's fingers or objects in the foreground).`,
+          `   - Secondary Properties: The amount of blur and high contrast are secondary properties evaluated among frames that show the label clearly to the camera.`,
+          `   - "highestContrastTimestamp": timestamp (seconds) of the frame showing the label clearly with highest contrast.`,
+          `   - "minimalBlurTimestamp": timestamp (seconds) of the frame showing the label clearly with minimal blur.`,
+          `   - It is OK if both frames are the same ("highestContrastTimestamp" === "minimalBlurTimestamp"). Set "bestShotTimes" to [highestContrastTimestamp, minimalBlurTimestamp].`,
+          `   - Populate "reagentName", "reagentAcronym" (formed from the first letters of the reagent name), "manufacturer", "catalogNumber" (Catalog / Ref #), and "lotNumber" (Lot #), leaving any field not printed on the label as "N/A".`,
+          hasSeedingAction
+            ? `2. For REAGENT_SEEDING_ACTION: Detect each individual seeding event where the pipette deposits cells into a column of the 96-well plate. Emit a WELL_SEEDING_EVENT for each dispense, setting "seededColumn" to the column number (1 to 12, with column 1 on the left side and column 12 all the way to the right). Count the total seeding events in "seedingEventsCount" and verify against "expectedSeedingEventsCount" (12).`
+            : '',
+          `Return a JSON object containing "events" and "refinedActions" conforming to the response schema.`,
+        ]
+          .filter(Boolean)
+          .join('\n')
+      : [
+          `Pass 2 Targeted 4 fps Best-Frame Selection & Action Boundary Refinement for videoId="${videoId || 'unknown'}".`,
+          classification.transcribedAudio
+            ? `Pass 0 Audio Transcript Context: "${classification.transcribedAudio}"`
+            : '',
+          `Pass 1 Detected Inventory Update Actions (${actions.length}):`,
+          actionSummaryLines.length > 0 ? actionSummaryLines.join('\n') : '  (No Pass 1 actions provided)',
+          `Pass 1 Detected & Associated Label Presentation Events (${pass1Events.length}):`,
+          eventSummaryLines.length > 0 ? eventSummaryLines.join('\n') : '  (None pre-populated in Pass 1)',
+          ``,
+          `Instructions (4 fps targeted window analysis only):`,
+          `1. For each presentation event (BOX_LABEL_PRESENTATION, VIAL_LABEL_PRESENTATION, and REAGENT_LABEL_PRESENTATION / REAGENT_LABEL_PRESENTATION_EVENT), inspect its window at 4 fps and identify the 2 best frames within [startTime, endTime]:`,
+          `   - Primary Criterion: The most important aspect of frame selection is that the frame shows the label clearly to the camera (oriented directly toward the camera, in frame, legible, and not occluded by the operator's fingers or hand).`,
+          `   - Secondary Properties: The amount of blur and high contrast are secondary properties evaluated among frames that show the label clearly to the camera.`,
+          `   - "highestContrastTimestamp": timestamp (seconds) of the frame that shows the label clearly to the camera and secondarily has the highest contrast.`,
+          `   - "minimalBlurTimestamp": timestamp (seconds) of the frame that shows the label clearly to the camera and secondarily has the minimal amount of blur.`,
+          `   - It is OK if both frames are the same ("highestContrastTimestamp" === "minimalBlurTimestamp"). Set "bestShotTimes" to [highestContrastTimestamp, minimalBlurTimestamp] and preserve the Pass 1 "actionIds" associations.`,
+          `   - For REAGENT_LABEL_PRESENTATION / REAGENT_LABEL_PRESENTATION_EVENT (reagent container/bottle labels distinct from small cryo-box vials): Emit EXACTLY ONE event per distinct reagent across the workflow. If a reagent bottle or container label is shown multiple times, select the single event where the label is best visible (i.e., closest to the camera and not occluded by objects in the foreground). Also populate "reagentName", "reagentAcronym" (formed from the first letters of the reagent name), "manufacturer", "catalogNumber" (Catalog / Ref #), and "lotNumber" (Lot #), leaving any field not printed on the label as "N/A". Either the acronym or the full name might be printed on the vessel containing the reagent; identify that it is the same reagent regardless of whether referred to by full name or acronym.`,
+          `2. For each Pass 1 action, inspect its 4 fps refinement window in "refinedActions" and refine the action interval boundaries ("refinedStartTimestampSeconds" and "refinedEndTimestampSeconds") at 4 fps within [pass1Start - 1s, pass1End + 1s]:`,
+          `   - "refinedStartTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the action begins.`,
+          `   - "refinedEndTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the action completes.`,
+          `   - Neighboring action intervals must NEVER overlap in time: for any consecutive actions i and i+1, "refinedEndTimestampSeconds" of action i MUST be <= "refinedStartTimestampSeconds" of action i+1.`,
+          `Return a JSON object containing "events" and "refinedActions" conforming to the response schema.`,
+        ]
+          .filter(Boolean)
+          .join('\n');
 
     const parts: any[] = [];
     if (gcsUri) {
@@ -2132,7 +3076,7 @@ export async function runPass2EventDetection(
       systemInstruction,
       temperature: 0.1,
       responseMimeType: 'application/json',
-      responseSchema: eventDetectionSchema,
+      responseSchema: targetSchema,
     };
     if (targetThinking && targetThinking !== 'OFF') {
       pass2Config.thinkingConfig = {
@@ -2144,173 +3088,255 @@ export async function runPass2EventDetection(
     let usedModel = targetModel;
     let response: any;
 
-    if (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' && actions.length > 0) {
-      const collectedArchiveEvents: any[] = [];
-      for (const action of actions) {
-        const archiveActionPrompt = [
-          `Pass 2 Archive Event Detection for videoId="${videoId || 'unknown'}".`,
-          `Action ID: ${action.actionId}`,
-          `Action Class: ${action.actionClass || action.actionType || 'REAGENT_ACTION'}`,
-          promptText,
-        ].join('\n');
-        const archiveParts: any[] = [];
-        if (gcsUri) {
-          archiveParts.push({
-            fileData: {
-              fileUri: gcsUri,
-              mimeType: 'video/mp4',
-            },
+    if (actions.length > 0 || mergedOptions.videoGcsUri || gcsUri) {
+      for (let mIdx = 0; mIdx < pass2Candidates.length; mIdx++) {
+        const candidateModel = pass2Candidates[mIdx];
+        try {
+          usedModel = candidateModel;
+          response = await generateContentWithRetry(client, {
+            model: candidateModel,
+            contents: [
+              {
+                role: 'user',
+                parts,
+              },
+            ],
+            config: pass2Config,
           });
-        }
-        archiveParts.push({ text: archiveActionPrompt });
-
-        let actionResp: any;
-        for (let mIdx = 0; mIdx < pass2Candidates.length; mIdx++) {
-          const candidateModel = pass2Candidates[mIdx];
-          try {
-            usedModel = candidateModel;
-            actionResp = await generateContentWithRetry(client, {
-              model: candidateModel,
-              contents: [{ role: 'user', parts: archiveParts }],
-              config: pass2Config,
-            });
-            response = actionResp;
-            break;
-          } catch (err: any) {
-            const isNotFound =
-              err?.status === 404 ||
-              err?.statusCode === 404 ||
-              err?.code === 404 ||
-              err?.code === 'NOT_FOUND' ||
-              err?.message?.includes('404') ||
-              err?.message?.includes('NOT_FOUND') ||
-              err?.message?.includes('not found');
-            if (isNotFound && mIdx < pass2Candidates.length - 1) {
-              continue;
-            }
-            throw err;
+          break;
+        } catch (err: any) {
+          const isNotFound =
+            err?.status === 404 ||
+            err?.statusCode === 404 ||
+            err?.code === 404 ||
+            err?.code === 'NOT_FOUND' ||
+            err?.message?.includes('404') ||
+            err?.message?.includes('NOT_FOUND') ||
+            err?.message?.includes('not found');
+          if (isNotFound && mIdx < pass2Candidates.length - 1) {
+            console.warn(`[Pass 2] Model ${candidateModel} not found, falling back to next candidate...`);
+            continue;
           }
-        }
-        const actionRawText = actionResp ? extractTextFromResponse(actionResp) : '[]';
-        const actionParsed = extractJsonFromText(actionRawText);
-        const actionEvents = Array.isArray(actionParsed)
-          ? actionParsed
-          : actionParsed?.events || actionParsed?.eventList || [];
-        for (const ev of actionEvents) {
-          collectedArchiveEvents.push({
-            ...ev,
-            actionId: ev.actionId || action.actionId,
-          });
-        }
-      }
-      rawResult = { events: collectedArchiveEvents, refinedActions: [] };
-    } else {
-      if (actions.length > 0 || mergedOptions.videoGcsUri || gcsUri) {
-        for (let mIdx = 0; mIdx < pass2Candidates.length; mIdx++) {
-          const candidateModel = pass2Candidates[mIdx];
-          try {
-            usedModel = candidateModel;
+          // Fallback if Vertex AI rejects multiple fileData clips in a single content message
+          if (parts.length > 2 && gcsUri) {
+            const singlePartFallback = [
+              {
+                fileData: {
+                  fileUri: gcsUri,
+                  mimeType: 'video/mp4',
+                },
+              },
+              { text: promptText },
+            ];
             response = await generateContentWithRetry(client, {
               model: candidateModel,
-              contents: [
-                {
-                  role: 'user',
-                  parts,
-                },
-              ],
+              contents: [{ role: 'user', parts: singlePartFallback }],
               config: pass2Config,
             });
             break;
-          } catch (err: any) {
-            const isNotFound =
-              err?.status === 404 ||
-              err?.statusCode === 404 ||
-              err?.code === 404 ||
-              err?.code === 'NOT_FOUND' ||
-              err?.message?.includes('404') ||
-              err?.message?.includes('NOT_FOUND') ||
-              err?.message?.includes('not found');
-            if (isNotFound && mIdx < pass2Candidates.length - 1) {
-              console.warn(`[Pass 2] Model ${candidateModel} not found, falling back to next candidate...`);
-              continue;
-            }
-            // Fallback if Vertex AI rejects multiple fileData clips in a single content message
-            if (parts.length > 2 && gcsUri) {
-              const singlePartFallback = [
-                {
-                  fileData: {
-                    fileUri: gcsUri,
-                    mimeType: 'video/mp4',
-                  },
-                },
-                { text: promptText },
-              ];
-              response = await generateContentWithRetry(client, {
-                model: candidateModel,
-                contents: [{ role: 'user', parts: singlePartFallback }],
-                config: pass2Config,
-              });
-              break;
-            }
-            throw err;
           }
+          throw err;
         }
-      }
-
-      const rawText = response ? extractTextFromResponse(response) : '{"events":[],"refinedActions":[]}';
-      const parsedJson = extractJsonFromText(rawText);
-      rawResult = Array.isArray(parsedJson)
-        ? { events: parsedJson, refinedActions: [] }
-        : parsedJson && typeof parsedJson === 'object'
-        ? parsedJson
-        : { events: [], refinedActions: [] };
-
-      if (!Array.isArray(rawResult.events) && Array.isArray((rawResult as any).eventList)) {
-        rawResult.events = (rawResult as any).eventList;
       }
     }
 
+    const rawText = response ? extractTextFromResponse(response) : '{"events":[],"refinedActions":[]}';
+    const parsedJson = extractJsonFromText(rawText);
+    rawResult = Array.isArray(parsedJson)
+      ? { events: parsedJson, refinedActions: [] }
+      : parsedJson && typeof parsedJson === 'object'
+      ? parsedJson
+      : { events: [], refinedActions: [] };
+
+    if (!Array.isArray(rawResult.events) && Array.isArray((rawResult as any).eventList)) {
+      rawResult.events = (rawResult as any).eventList;
+    }
+
     const rawModelEvents: any[] = Array.isArray(rawResult.events) ? rawResult.events : [];
+    const candidateModelEvents = isArchivePass2
+      ? rawModelEvents.filter((me) => {
+          const meCls = String(me?.eventClass || me?.actionType || '').toUpperCase();
+          return (
+            !meCls.includes('VIAL_LABEL') &&
+            !meCls.includes('BOX_LABEL') &&
+            !meCls.includes('VIAL_INSERTION') &&
+            !meCls.includes('VIAL_REMOVAL') &&
+            !meCls.includes('CAP_REMOVAL') &&
+            !meCls.includes('AUDIO_UTTERANCE') &&
+            !meCls.includes('STATEMENT_EVENT') &&
+            !meCls.includes('NOTEBOOK_TRANSCRIPTION') &&
+            me?.eventTrack !== 'audio'
+          );
+        })
+      : rawModelEvents;
     let combinedRawEvents: any[] = [];
+
+    const pickValidStr = (preferred: any, fallback: any) => {
+      const p = typeof preferred === 'string' ? preferred.trim() : '';
+      const f = typeof fallback === 'string' ? fallback.trim() : '';
+      if (p && p.toUpperCase() !== 'N/A' && p.toUpperCase() !== 'UNKNOWN') return p;
+      if (f && f.toUpperCase() !== 'N/A' && f.toUpperCase() !== 'UNKNOWN') return f;
+      return p || f || undefined;
+    };
 
     if (pass1Events.length > 0) {
       const modelById = new Map<string, any>();
-      for (const me of rawModelEvents) {
+      for (const me of candidateModelEvents) {
         if (me && typeof me.eventId === 'string') {
           modelById.set(me.eventId, me);
         }
       }
+      const allPass1IdsMatched =
+        pass1Events.every((p) => p.eventId && modelById.has(p.eventId));
+      const usedModelIndices = new Set<number>();
       const matchedModelIds = new Set<string>();
+
       combinedRawEvents = pass1Events.map((p1Evt, idx) => {
-        const matched =
-          modelById.get(p1Evt.eventId) ||
-          (rawModelEvents.length === pass1Events.length ? rawModelEvents[idx] : undefined);
+        let matched: any = undefined;
+        const p1Start =
+          typeof p1Evt.startTime === 'number'
+            ? p1Evt.startTime
+            : parseTimeStringToSeconds(String(p1Evt.startTime || 0));
+        const p1End =
+          typeof p1Evt.endTime === 'number'
+            ? p1Evt.endTime
+            : parseTimeStringToSeconds(String(p1Evt.endTime || p1Start));
+
+        if (allPass1IdsMatched) {
+          matched = modelById.get(p1Evt.eventId);
+        } else {
+          // Try temporal overlap match among unused candidateModelEvents first
+          let bestIdx = -1;
+          let bestDist = Infinity;
+          for (let mIdx = 0; mIdx < candidateModelEvents.length; mIdx++) {
+            if (usedModelIndices.has(mIdx)) continue;
+            const me = candidateModelEvents[mIdx];
+            const meStart =
+              typeof me?.startTime === 'number'
+                ? me.startTime
+                : typeof me?.highestContrastTimestamp === 'number'
+                ? me.highestContrastTimestamp
+                : Array.isArray(me?.bestShotTimes) && typeof me.bestShotTimes[0] === 'number'
+                ? me.bestShotTimes[0]
+                : NaN;
+            const meEnd =
+              typeof me?.endTime === 'number' ? me.endTime : meStart;
+            if (!isNaN(meStart) && (p1Start > 0 || p1End > 0)) {
+              const overlaps = meStart <= p1End + 1.5 && meEnd >= p1Start - 1.5;
+              if (overlaps) {
+                const p1Mid = (p1Start + p1End) / 2;
+                const meMid = (meStart + meEnd) / 2;
+                const dist = Math.abs(p1Mid - meMid);
+                if (dist < bestDist) {
+                  bestDist = dist;
+                  bestIdx = mIdx;
+                }
+              }
+            }
+          }
+          if (bestIdx >= 0) {
+            usedModelIndices.add(bestIdx);
+            matched = candidateModelEvents[bestIdx];
+          } else if (
+            candidateModelEvents.length === pass1Events.length &&
+            !usedModelIndices.has(idx)
+          ) {
+            usedModelIndices.add(idx);
+            matched = candidateModelEvents[idx];
+          } else if (modelById.has(p1Evt.eventId)) {
+            matched = modelById.get(p1Evt.eventId);
+          }
+        }
+
         if (matched?.eventId) {
           matchedModelIds.add(matched.eventId);
         }
+        const matchedClsUpper = String(matched?.eventClass || '').toUpperCase();
+        const p1ClsUpper = String(p1Evt.eventClass || '').toUpperCase();
+        const defaultPass2EventClass =
+          classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+            ? 'REAGENT_LABEL_PRESENTATION_EVENT'
+            : 'VIAL_LABEL_PRESENTATION';
+        const resolvedEventClass =
+          matchedClsUpper.includes('REAGENT_LABEL') ||
+          (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
+            p1ClsUpper.includes('VIAL_LABEL'))
+            ? matched?.eventClass || 'REAGENT_LABEL_PRESENTATION_EVENT'
+            : p1Evt.eventClass || matched?.eventClass || defaultPass2EventClass;
         return {
           ...p1Evt,
           ...(matched || {}),
           eventId: p1Evt.eventId,
-          eventClass: p1Evt.eventClass || matched?.eventClass || 'VIAL_LABEL_PRESENTATION',
+          eventClass: resolvedEventClass,
           actionId: p1Evt.actionId || matched?.actionId,
           actionIds:
             Array.isArray(p1Evt.actionIds) && p1Evt.actionIds.length > 0
               ? p1Evt.actionIds
               : matched?.actionIds,
+          description: p1Evt.description || matched?.description,
+          reagentName: pickValidStr(matched?.reagentName, (p1Evt as any).reagentName),
+          reagentAcronym: pickValidStr(matched?.reagentAcronym, (p1Evt as any).reagentAcronym),
+          manufacturer: pickValidStr(matched?.manufacturer, (p1Evt as any).manufacturer),
+          catalogNumber: pickValidStr(matched?.catalogNumber, (p1Evt as any).catalogNumber),
+          lotNumber: pickValidStr(matched?.lotNumber, (p1Evt as any).lotNumber),
           spokenContext: p1Evt.spokenContext || matched?.spokenContext,
           associationReason: p1Evt.associationReason || matched?.associationReason,
           startTime: p1Evt.startTime !== undefined ? p1Evt.startTime : matched?.startTime,
           endTime: p1Evt.endTime !== undefined ? p1Evt.endTime : matched?.endTime,
         };
       });
-      for (const me of rawModelEvents) {
-        if (me && me.eventId && !matchedModelIds.has(me.eventId) && !pass1Events.some((p) => p.eventId === me.eventId)) {
-          combinedRawEvents.push(me);
+      if (!isArchivePass2) {
+        for (const me of rawModelEvents) {
+          if (me && me.eventId && !matchedModelIds.has(me.eventId) && !pass1Events.some((p) => p.eventId === me.eventId)) {
+            combinedRawEvents.push(me);
+          }
+        }
+      } else {
+        // In archive Pass 2, include newly detected WELL_SEEDING_EVENTs / SEEDING_EVENTs from model
+        for (const me of candidateModelEvents) {
+          const meCls = String(me?.eventClass || me?.actionType || '').toUpperCase();
+          if (me && (meCls.includes('SEEDING') || meCls.includes('WELL_SEEDING')) && !matchedModelIds.has(me.eventId)) {
+            combinedRawEvents.push(me);
+          }
         }
       }
+    } else if (isArchivePass2 && hasPass1EventsInput) {
+      combinedRawEvents = candidateModelEvents.filter((me) => {
+        const meCls = String(me?.eventClass || me?.actionType || '').toUpperCase();
+        return meCls.includes('SEEDING');
+      });
     } else {
       combinedRawEvents = rawModelEvents;
+    }
+
+    if (isArchivePass2) {
+      combinedRawEvents = combinedRawEvents.filter((evt: any) => {
+        const cls = String(evt.eventClass || evt.actionType || '').toUpperCase();
+        if (
+          cls.includes('VIAL_LABEL') ||
+          cls.includes('BOX_LABEL') ||
+          cls.includes('VIAL_INSERTION') ||
+          cls.includes('VIAL_REMOVAL') ||
+          cls.includes('CAP_REMOVAL')
+        ) {
+          return false;
+        }
+        if (cls.includes('SEEDING')) {
+          return true;
+        }
+        const hasPreexistingBestShots =
+          Array.isArray(evt.bestShotUrls) && evt.bestShotUrls.length > 0;
+        if (
+          !hasPreexistingBestShots &&
+          (cls.includes('AUDIO_UTTERANCE') ||
+            cls.includes('STATEMENT_EVENT') ||
+            cls.includes('NOTEBOOK_TRANSCRIPTION') ||
+            evt.eventTrack === 'audio')
+        ) {
+          return false;
+        }
+        return true;
+      });
     }
 
     const normalizedRawEvents = combinedRawEvents.map(
@@ -2331,10 +3357,24 @@ export async function runPass2EventDetection(
             : evt.endTimestampSeconds !== undefined
             ? evt.endTimestampSeconds
             : 0;
+        const rawEvtCls = String(evt.eventClass || evt.actionType || '').toUpperCase();
+        const defaultCls =
+          classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+            ? 'REAGENT_LABEL_PRESENTATION_EVENT'
+            : 'VIAL_LABEL_PRESENTATION';
+        const finalEvtClass =
+          classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
+          (rawEvtCls === 'VIAL_LABEL_PRESENTATION' ||
+            rawEvtCls === 'VIAL_LABEL_PRESENTATION_EVENT' ||
+            rawEvtCls === 'LABEL_PRESENTATION')
+            ? 'REAGENT_LABEL_PRESENTATION_EVENT'
+            : rawEvtCls.includes('SEEDING')
+            ? 'WELL_SEEDING_EVENT'
+            : evt.eventClass || evt.actionType || defaultCls;
         return {
           ...evt,
           eventId: evt.eventId || `evt_${String(idx + 1).padStart(3, '0')}`,
-          eventClass: evt.eventClass || evt.actionType || 'VIAL_LABEL_PRESENTATION',
+          eventClass: finalEvtClass,
           startTime,
           endTime,
         };
@@ -2360,6 +3400,29 @@ export async function runPass2EventDetection(
         typeof rawEvent.endTime === 'number'
           ? rawEvent.endTime
           : parseTimeStringToSeconds(String(rawEvent.endTime || numStart));
+
+      const isSeedingEvent = String(rawEvent.eventClass || '').toUpperCase().includes('SEEDING');
+      if (isSeedingEvent) {
+        const validatedEvent = EventSchema.parse({
+          ...rawEvent,
+          eventId,
+          actionId: rawEvent.actionId || actions[0]?.actionId || 'act_001',
+          actionIds:
+            Array.isArray(rawEvent.actionIds) && rawEvent.actionIds.length > 0
+              ? rawEvent.actionIds
+              : [rawEvent.actionId || actions[0]?.actionId || 'act_001'],
+          eventClass: 'WELL_SEEDING_EVENT',
+          eventTrack: 'video',
+          startTime: numStart,
+          endTime: numEnd,
+          bestShotUrls: rawEvent.bestShotUrls || [],
+          bestShotTimes: rawEvent.bestShotTimes || [numStart, numEnd],
+          bestFrames: rawEvent.bestFrames || [],
+          refinementList: Array.isArray(rawEvent.refinementList) ? rawEvent.refinementList : [],
+        });
+        allEvents.push(validatedEvent);
+        continue;
+      }
 
       const rawBestShotTimes: number[] = Array.isArray(rawEvent.bestShotTimes)
         ? rawEvent.bestShotTimes.map((t: any) => Number(t)).filter((n: number) => !isNaN(n))
@@ -2480,15 +3543,23 @@ export async function runPass2EventDetection(
         bestShotUrls = [highestContrastFrame.gcsUri, minimalBlurFrame.gcsUri];
       }
 
+      const isArchiveWithoutActions =
+        classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' && actions.length === 0;
       const validatedEvent = EventSchema.parse({
         ...rawEvent,
         eventId,
-        actionId: rawEvent.actionId || actions[0]?.actionId || 'act_001',
-        actionIds:
-          Array.isArray(rawEvent.actionIds) && rawEvent.actionIds.length > 0
-            ? rawEvent.actionIds
-            : [rawEvent.actionId || actions[0]?.actionId || 'act_001'],
-        eventClass: rawEvent.eventClass || rawEvent.actionType || 'VIAL_LABEL_PRESENTATION',
+        actionId: isArchiveWithoutActions
+          ? ''
+          : rawEvent.actionId || actions[0]?.actionId || 'act_001',
+        actionIds: isArchiveWithoutActions
+          ? []
+          : Array.isArray(rawEvent.actionIds) && rawEvent.actionIds.length > 0
+          ? rawEvent.actionIds
+          : [rawEvent.actionId || actions[0]?.actionId || 'act_001'],
+        eventClass:
+          rawEvent.eventClass ||
+          rawEvent.actionType ||
+          (isArchivePass2 ? 'REAGENT_LABEL_PRESENTATION_EVENT' : 'VIAL_LABEL_PRESENTATION'),
         eventTrack: rawEvent.eventTrack === 'audio' ? 'audio' : 'video',
         startTime: rawEvent.startTime !== undefined ? rawEvent.startTime : 0,
         endTime: rawEvent.endTime !== undefined ? rawEvent.endTime : 0,
@@ -2501,6 +3572,25 @@ export async function runPass2EventDetection(
       });
 
       allEvents.push(validatedEvent);
+    }
+
+    // When Pass 1 events were NOT pre-supplied, deduplicate reagent label presentation events so there is only one event per distinct reagent.
+    // (When Pass 1 events ARE supplied via hasPass1EventsInput, Pass 1 has already deduplicated the reagent presentation events.)
+    const hasReagentPresentationEvents = allEvents.some((e) => isReagentLabelPresentationEvent(e));
+    if (
+      !hasPass1EventsInput &&
+      (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' || hasReagentPresentationEvents)
+    ) {
+      let candidateEvents = allEvents;
+      if (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW') {
+        candidateEvents = allEvents.filter((e) => {
+          const cls = String(e.eventClass || '').toUpperCase();
+          return !cls.includes('VIAL_LABEL') && !cls.includes('BOX_LABEL');
+        });
+      }
+      const { deduplicatedEvents } = deduplicateReagentLabelPresentationEvents(candidateEvents, actions);
+      allEvents.length = 0;
+      allEvents.push(...deduplicatedEvents);
     }
 
     // 3. Refine Pass 1 action interval boundaries at 4 fps within [max(0, start - 1), min(duration, end + 1)]
@@ -2616,6 +3706,105 @@ export async function runPass2EventDetection(
       };
       act.eventList = mergedEventList;
 
+      if (act.actionType === 'REAGENT_SEEDING_ACTION' || act.actionType === 'SEED_REAGENTS') {
+        const seedingEvents = allEvents.filter(
+          (e) =>
+            (e.actionId === act.actionId || (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId))) &&
+            String(e.eventClass || '').toUpperCase().includes('SEEDING')
+        );
+        const pass1LinkedEvts = rawPass1EventsList.filter(
+          (e: any) =>
+            e?.actionId === act.actionId ||
+            (Array.isArray(e?.actionIds) && e.actionIds.includes(act.actionId)) ||
+            (Array.isArray(act.eventList) && act.eventList.includes(e?.eventId)) ||
+            e?.eventClass === 'PROTOCOL_AUDIO_UTTERANCE_EVENT'
+        );
+        const pass2ReagentEvts = [
+          ...allEvents,
+          ...rawPass1EventsList,
+        ].filter(
+          (e: any) =>
+            (e?.reagentName && e.reagentName !== 'N/A') ||
+            (e?.reagentAcronym && e.reagentAcronym !== 'N/A') ||
+            (e?.reagentData &&
+              (e.reagentData.reagentName !== 'N/A' || e.reagentData.reagentAcronym !== 'N/A'))
+        );
+
+        const resolvedSeed = resolveSeedReagentsDataFromContext({
+          explicitCandidates: [
+            (modelRefined as any)?.seedReagentsData,
+            ...seedingEvents,
+            ...pass1LinkedEvts,
+            act.seedReagentsData,
+          ],
+          actionDescription: act.description,
+          cellLineName: act.cellLineName,
+          cellLineInfo: act.cellLineInfo,
+          audioAndEventTexts: [
+            ...pass1LinkedEvts.map(
+              (e: any) =>
+                `${e?.description || ''} ${e?.conflatedLabelText || ''} ${e?.reagentName || ''} ${e?.reagentAcronym || ''}`
+            ),
+            ...seedingEvents.map((e: any) => e?.description || ''),
+            ...pass2ReagentEvts.map(
+              (e: any) =>
+                `${e?.reagentData?.reagentName || e?.reagentName || ''} ${e?.reagentData?.reagentAcronym || e?.reagentAcronym || ''} ${e?.description || ''}`
+            ),
+            classification?.transcribedAudio,
+            typeof classification?.identificationEvent === 'string'
+              ? classification.identificationEvent
+              : classification?.identificationEvent
+              ? `${(classification.identificationEvent as any).description || ''} ${(classification.identificationEvent as any).spokenContext || ''}`
+              : undefined,
+          ],
+          reagents: [
+            ...(Array.isArray(act.reagents) ? act.reagents : []),
+            ...pass2ReagentEvts.map((e: any) => ({
+              reagentName: e?.reagentData?.reagentName || e?.reagentName || 'N/A',
+              reagentAcronym: e?.reagentData?.reagentAcronym || e?.reagentAcronym || 'N/A',
+              rawLabelText: e?.reagentData?.rawLabelText || e?.conflatedLabelText || e?.description,
+            })),
+          ],
+        });
+
+        const seedingEventsCount = seedingEvents.length;
+        const detectedCols = Array.from(
+          new Set(
+            seedingEvents
+              .map((e) => (e as any).seededColumn)
+              .filter((col): col is number => typeof col === 'number' && col >= 1 && col <= 12)
+          )
+        ).sort((a, b) => a - b);
+
+        const plateType = resolvedSeed.plateType;
+        const pipetteType = resolvedSeed.pipetteType;
+        const expectedSeedingEventsCount =
+          act.seedReagentsData?.expectedSeedingEventsCount ||
+          computeExpectedSeedingEvents(plateType, pipetteType) ||
+          12;
+        const isSeedingCountCorrect = seedingEventsCount === expectedSeedingEventsCount;
+
+        act.seedReagentsData = {
+          ...act.seedReagentsData,
+          plateType,
+          pipetteType,
+          cellsSeeded: resolvedSeed.cellsSeeded,
+          cellsPerWell: resolvedSeed.cellsPerWell,
+          seedingEventsCount:
+            seedingEventsCount > 0 ? seedingEventsCount : act.seedReagentsData?.seedingEventsCount ?? 0,
+          ...(seedingEventsCount > 0
+            ? {
+                expectedSeedingEventsCount,
+                isSeedingCountCorrect,
+              }
+            : {}),
+          ...(detectedCols.length > 0 ? { seededColumns: detectedCols } : {}),
+        };
+        if (detectedCols.length > 0) {
+          act.seededColumns = detectedCols;
+        }
+      }
+
       refinedActionsList.push(
         RefinedActionBoundarySchema.parse({
           actionId: act.actionId,
@@ -2662,7 +3851,7 @@ export async function runPass2EventDetection(
           fps: 4,
         })),
       },
-      schema: eventDetectionSchema,
+      schema: targetSchema,
       videoMetadata: {
         durationSeconds,
         uri: gcsUri,
@@ -3051,14 +4240,6 @@ export async function runPass3AnalysisRefinement(
     }
   }
 
-  const classification: WorkflowClassification =
-    mergedOptions.classification ||
-    videoDoc?.passes?.pass0?.data || {
-      workflowType: 'INVENTORY_UPDATE_WORKFLOW',
-      confidence: 1.0,
-      notes: 'Default classification',
-    };
-
   const rawActions =
     mergedOptions.actions ||
     videoDoc?.passes?.pass1?.data ||
@@ -3078,6 +4259,50 @@ export async function runPass3AnalysisRefinement(
     : Array.isArray((rawEvents as any)?.events)
     ? (rawEvents as any).events
     : [];
+
+  // Also gather Pass 1 events (especially PROTOCOL_AUDIO_UTTERANCE_EVENTs that Pass 2 does not re-emit as visual best-shot events)
+  const rawPass1EventsForPass3: Event[] = Array.isArray((mergedOptions.actions as any)?.events)
+    ? (mergedOptions.actions as any).events
+    : Array.isArray((rawActions as any)?.events)
+    ? (rawActions as any).events
+    : Array.isArray(videoDoc?.passes?.pass1?.data?.events)
+    ? videoDoc.passes.pass1.data.events
+    : [];
+  const allContextEvents: Event[] = [...events];
+  const seenContextEventIds = new Set(events.map((e) => e.eventId).filter(Boolean));
+  for (const p1Evt of rawPass1EventsForPass3) {
+    if (p1Evt && (!p1Evt.eventId || !seenContextEventIds.has(p1Evt.eventId))) {
+      allContextEvents.push(p1Evt);
+      if (p1Evt.eventId) seenContextEventIds.add(p1Evt.eventId);
+    }
+  }
+
+  const inferredArchiveFromInputs =
+    !mergedOptions.classification &&
+    !videoDoc?.passes?.pass0?.data &&
+    ((videoDoc as any)?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+      events.some(
+        (e: any) =>
+          String(e?.eventClass || e?.eventType || '')
+            .toUpperCase()
+            .includes('REAGENT') ||
+          Boolean(e?.reagentData || e?.reagentName)
+      ) ||
+      actions.some((a: any) =>
+        /REAGENT|MIX_REAGENTS|SEED_REAGENTS|SEEDING/i.test(
+          String(a?.actionClass || a?.actionType || '')
+        )
+      ));
+
+  const classification: WorkflowClassification =
+    mergedOptions.classification ||
+    videoDoc?.passes?.pass0?.data || {
+      workflowType: inferredArchiveFromInputs
+        ? 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+        : 'INVENTORY_UPDATE_WORKFLOW',
+      confidence: 1.0,
+      notes: 'Default classification',
+    };
 
   const pass2RefinedActions: RefinedActionBoundary[] = Array.isArray((rawEvents as any)?.refinedActions)
     ? (rawEvents as any).refinedActions
@@ -3205,18 +4430,63 @@ export async function runPass3AnalysisRefinement(
     };
   });
 
-  const promptText = `Workflow: ${classification.workflowType}
+  const isArchiveWorkflow = classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW';
+
+  const promptText = isArchiveWorkflow
+    ? `Workflow: ${classification.workflowType}
+Video URI: ${gcsUri}
+
+1. REAGENT LABEL PRESENTATION EVENTS (Dual-Shot Transcription & Conflation at Full Frame Resolution):
+For each reagent label presentation event below (typically a reagent bottle or container, distinct from a small cryovial), transcribe the exact label text shown in the TWO full-resolution best shots (Shot 1: HIGHEST_CONTRAST and Shot 2: MINIMAL_BLUR) and conflate the results.
+CRITICAL: NEVER invent or copy placeholder text. Only transcribe text physically visible on the label.
+CRITICAL: Do NOT extract cell line vial fields (do NOT output "vialLabelData", "cellLineName", "userInitials", or "dateFrozen").
+Format the conflated text into "reagentData" with the following 5 fields (leave any field not printed on the label as "N/A"):
+- "reagentName": reagent name printed on the label (or "N/A" if only an acronym is printed)
+- "reagentAcronym": reagent acronym, typically formed from the first letters of the name of the reagent (e.g. "Fetal Bovine Serum" -> "FBS", "Dulbecco's Modified Eagle Medium" -> "DMEM"). Either the acronym or the full name might be printed on the vessel containing the reagent; identify that it is the same reagent being used regardless of whether it is referred to by the full name or the acronym.
+- "manufacturer": manufacturer printed on the label (e.g. "Gibco", or "N/A" if not printed on the label)
+- "catalogNumber": catalog / ref # printed on the label (e.g. after REF or Cat#, or "N/A" if not printed on the label)
+- "lotNumber": Lot # printed on the label (e.g. after LOT, or "N/A" if not printed on the label)
+- "rawLabelText": full verbatim text extracted from the label across the two shots
+- "frame1Text": verbatim OCR text from Shot 1 (HIGHEST_CONTRAST)
+- "frame2Text": verbatim OCR text from Shot 2 (MINIMAL_BLUR)
+Events to refine:
+${JSON.stringify(eventsForTranscriptionSummary, null, 2)}
+
+2. EXPERIMENT WORK STEP ACTIONS (Reagent Identification, Mixing, and Seeding Conflation):
+For each experiment action below, conflate visual and spoken evidence for reagents, source/destination vessels, volumes, pipette types, and seeding events (identifying reagents across steps whether referred to by full name or acronym).
+Actions to analyze:
+${JSON.stringify(actionsSummary, null, 2)}
+
+3. Output a JSON array of Refinement objects (or an object with "refinements" and "labelTranscriptions") where EVERY refinement item for a reagent label presentation includes:
+- "refinementId": string (e.g. "ref_001")
+- "eventId": string (matching the eventId from Pass 2)
+- "actionId": string (matching the associated actionId)
+- "refinementClass": "OCR_CONFLATION"
+- "transcriptionText": string (full conflated label text)
+- "frame1Text": string (Shot 1 HIGHEST_CONTRAST OCR text)
+- "frame2Text": string (Shot 2 MINIMAL_BLUR OCR text)
+- "reagentData": { "reagentName": string, "reagentAcronym": string, "manufacturer": string, "catalogNumber": string, "lotNumber": string, "rawLabelText": string } (use "N/A" for any field not printed on the label)
+- "conflationMetadata": { "confidence": number, "framesEvaluated": number, "ocrEngine": string }`
+    : `Workflow: ${classification.workflowType}
 Video URI: ${gcsUri}
 
 1. LABEL PRESENTATION EVENTS (Dual-Shot Transcription & Conflation at Full Frame Resolution):
 For each label presentation event below, transcribe the exact label text shown in the TWO full-resolution best shots (Shot 1: HIGHEST_CONTRAST and Shot 2: MINIMAL_BLUR) and conflate the results.
 NOTE: Vial label transcription is skipped for vial removal actions (VIAL_REMOVAL_ACTION / VIAL_REMOVAL), leaving all label fields empty except for the well coordinate.
 CRITICAL: NEVER invent or copy placeholder text. Only transcribe text physically visible on the label.
-If the event is a vial label presentation (VIAL_LABEL_PRESENTATION) for a vial insertion action, format the conflated text into:
+Distinguish strictly between VIAL LABEL PRESENTATION (small cryovial that goes into a cryo-box) and REAGENT LABEL PRESENTATION (larger reagent container such as a bottle or vessel distinct from a small cryo-box vial):
+A) If the event is a VIAL LABEL PRESENTATION (VIAL_LABEL_PRESENTATION / VIAL_LABEL_PRESENTATION_EVENT) for a vial insertion action, format the conflated text into "vialLabelData":
 - "cellLineName" (required): cell line name
 - "userInitials" (optional): user's initials
 - "dateFrozen" (optional): date frozen
 - "fullText" (required): full text extracted from the label across the two shots
+B) If the event is a REAGENT LABEL PRESENTATION (REAGENT_LABEL_PRESENTATION / REAGENT_LABEL_PRESENTATION_EVENT), format the conflated text into "reagentData":
+- "reagentName": reagent name printed on the label (or "N/A" if not printed on the label)
+- "reagentAcronym": reagent acronym, typically formed from the first letters of the name of the reagent (or "N/A" if not printed and cannot be formed). Either the acronym or the full name might be printed on the vessel containing the reagent; identify that it is the same reagent being used regardless of whether it is referred to by the full name or the acronym.
+- "manufacturer": manufacturer printed on the label (or "N/A" if not printed on the label)
+- "catalogNumber": catalog / ref # printed on the label (or "N/A" if not printed on the label)
+- "lotNumber": Lot # printed on the label (or "N/A" if not printed on the label)
+- "rawLabelText": full verbatim text extracted from the label across the two shots
 Events to refine:
 ${JSON.stringify(eventsForTranscriptionSummary, null, 2)}
 
@@ -3236,7 +4506,8 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
 - "actionId": string (matching the associated actionId)
 - "refinementClass": "OCR_CONFLATION" | "SPATIAL_REFINEMENT"
 - "transcriptionText": string (full conflated label text)
-- "vialLabelData": { "cellLineName": string, "userInitials"?: string, "dateFrozen"?: string, "fullText": string, "frame1Text"?: string, "frame2Text"?: string }
+- "vialLabelData": { "cellLineName": string, "userInitials"?: string, "dateFrozen"?: string, "fullText": string, "frame1Text"?: string, "frame2Text"?: string } (for VIAL_LABEL_PRESENTATION)
+- "reagentData": { "reagentName": string, "reagentAcronym": string, "manufacturer": string, "catalogNumber": string, "lotNumber": string, "rawLabelText"?: string } (for REAGENT_LABEL_PRESENTATION; use "N/A" for any field not printed on the label)
 - "boxWellLocation": { "actionId": string, "row": string, "col": number, "coordinate": string, "boxId"?: string, "originCorner": "TOP_LEFT_BLACK" }
 - "spatialResult": { "row": string, "col": number }
 - "conflationMetadata": { "confidence": number, "framesEvaluated": number, "ocrEngine": string }`;
@@ -3435,8 +4706,20 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
     }
   };
 
+  const hasRealFullResVideo = (() => {
+    try {
+      return Boolean(
+        localFullResVideoPath &&
+          fs.existsSync(localFullResVideoPath) &&
+          fs.statSync(localFullResVideoPath).size > 256
+      );
+    } catch {
+      return false;
+    }
+  })();
+
   if (
-    classification.workflowType !== 'INVENTORY_UPDATE_WORKFLOW' ||
+    (classification.workflowType !== 'INVENTORY_UPDATE_WORKFLOW' && !hasRealFullResVideo) ||
     (eventsSummary.length === 0 && actionsSummary.length === 0)
   ) {
     const singleVideoParts: any[] = [];
@@ -3456,22 +4739,19 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
     mergePass3Response(extractJsonFromText(extractTextFromResponse(singleResp)));
   } else {
     // Submit ONE video clip at a time sampled at 4 fps + the TWO full-resolution best-shot JPEG frames for each label presentation event
-    const hasRealFullResVideo = (() => {
-      try {
-        return Boolean(
-          localFullResVideoPath &&
-            fs.existsSync(localFullResVideoPath) &&
-            fs.statSync(localFullResVideoPath).size > 256
-        );
-      } catch {
-        return false;
-      }
-    })();
-
     for (let eIdx = 0; eIdx < eventsSummary.length; eIdx++) {
       const evtSum = eventsSummary[eIdx];
       const evtObj = events[eIdx];
+      const evtClsUpper = String(evtObj?.eventClass || (evtObj as any)?.eventType || '').toUpperCase();
       if (isVialLabelEventForRemovalOnly(evtObj)) {
+        continue;
+      }
+      if (
+        classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
+        !evtClsUpper.includes('LABEL') &&
+        !evtObj?.reagentData &&
+        !evtObj?.reagentName
+      ) {
         continue;
       }
 
@@ -3563,7 +4843,40 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
         }
       }
 
-      const eventPromptText = `Workflow: ${classification.workflowType}
+      const evtIsReagentLabel =
+        classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+        evtClsUpper.includes('REAGENT_LABEL') ||
+        Boolean(evtObj?.reagentData || evtObj?.reagentName);
+
+      const eventPromptText = evtIsReagentLabel
+        ? `Workflow: ${classification.workflowType}
+Video URI: ${gcsUri}
+
+REAGENT LABEL PRESENTATION EVENT (Dual-Shot Full-Resolution Frame Transcription & Conflation):
+Transcribe the exact label text shown in the TWO full-resolution best shots (Shot 1: HIGHEST_CONTRAST at ${t1}s and Shot 2: MINIMAL_BLUR at ${t2}s) for this single reagent vessel presentation event and conflate the results.
+CRITICAL: Read the actual text printed or handwritten on the physical reagent container/bottle label in the full-resolution frames and video clip. NEVER output placeholder or example values.
+CRITICAL: This is a REAGENT LABEL PRESENTATION (larger container such as a bottle), NOT a cell line cryovial. Do NOT output "vialLabelData", "cellLineName", "userInitials", or "dateFrozen".
+Format the conflated text into "reagentData" with the following 5 fields (leave any field not printed on the label as "N/A"):
+- "reagentName": reagent name printed on the label (e.g. "Fetal Bovine Serum", or "N/A" if not printed on the label)
+- "reagentAcronym": reagent acronym, typically formed from the first letters of the name of the reagent (e.g. "FBS", "DMEM", "PBS", or "N/A" if not printed and cannot be formed). Either the acronym or the full name might be printed on the vessel containing the reagent; identify that it is the same reagent regardless of whether referred to by full name or acronym.
+- "manufacturer": manufacturer printed on the label (e.g. "Gibco", or "N/A" if not printed on the label)
+- "catalogNumber": catalog / ref # printed on the label (e.g. after REF or Cat#, or "N/A" if not printed on the label)
+- "lotNumber": Lot # printed on the label (e.g. after LOT, or "N/A" if not printed on the label)
+- "rawLabelText": full verbatim text extracted from the label across the two shots
+Event to refine:
+${JSON.stringify(evtSum, null, 2)}
+
+Output a JSON Refinement object (or array of 1 Refinement object) with:
+- "refinementId": "ref_${evtSum.eventId}"
+- "eventId": "${evtSum.eventId}"
+- "actionId": "${evtSum.actionId || ''}"
+- "refinementClass": "OCR_CONFLATION"
+- "transcriptionText": string (full conflated label text)
+- "frame1Text": string (verbatim OCR text from Shot 1: HIGHEST_CONTRAST)
+- "frame2Text": string (verbatim OCR text from Shot 2: MINIMAL_BLUR)
+- "reagentData": { "reagentName": string, "reagentAcronym": string, "manufacturer": string, "catalogNumber": string, "lotNumber": string, "rawLabelText": string }
+- "conflationMetadata": { "confidence": number, "framesEvaluated": 2, "ocrEngine": "Gemini-DualShot-Conflation" }`
+        : `Workflow: ${classification.workflowType}
 Video URI: ${gcsUri}
 
 LABEL PRESENTATION EVENT (Dual-Shot Full-Resolution Frame Transcription & Conflation):
@@ -3594,53 +4907,54 @@ Output a JSON Refinement object (or array of 1 Refinement object) with:
       });
     }
 
-    // Submit ONE video clip at a time sampled at 4 fps for each vial insertion/removal action interval
-    for (const actSum of actionsSummary) {
-      const hasExplicitInterval =
-        Number(actSum.intervalEndSeconds || 0) > 0 || Number(actSum.intervalStartSeconds || 0) > 0;
-      const alreadyHasActionWell =
-        modelActionWellLocations.some((w) => w && w.actionId === actSum.actionId) ||
-        rawRefinementsArray.some(
-          (r) =>
-            r &&
-            r.actionId === actSum.actionId &&
-            (r.boxWellLocation ||
-              r.spatialResult ||
-              r.spatialCoordinates ||
-              r.row !== undefined ||
-              r.coordinate !== undefined ||
-              r.well !== undefined ||
-              r.wellCoordinate !== undefined)
-        ) ||
-        ((actionsSummary.length === 1 || !hasExplicitInterval) &&
+    // Submit ONE video clip at a time sampled at 4 fps for each vial insertion/removal action interval (INVENTORY_UPDATE_WORKFLOW only)
+    if (classification.workflowType === 'INVENTORY_UPDATE_WORKFLOW') {
+      for (const actSum of actionsSummary) {
+        const hasExplicitInterval =
+          Number(actSum.intervalEndSeconds || 0) > 0 || Number(actSum.intervalStartSeconds || 0) > 0;
+        const alreadyHasActionWell =
+          modelActionWellLocations.some((w) => w && w.actionId === actSum.actionId) ||
           rawRefinementsArray.some(
             (r) =>
               r &&
-              Array.isArray(actSum.eventList) &&
-              actSum.eventList.includes(r.eventId) &&
-              (r.boxWellLocation || r.spatialResult || r.row !== undefined || r.coordinate !== undefined)
-          ));
-      if (alreadyHasActionWell) continue;
+              r.actionId === actSum.actionId &&
+              (r.boxWellLocation ||
+                r.spatialResult ||
+                r.spatialCoordinates ||
+                r.row !== undefined ||
+                r.coordinate !== undefined ||
+                r.well !== undefined ||
+                r.wellCoordinate !== undefined)
+          ) ||
+          ((actionsSummary.length === 1 || !hasExplicitInterval) &&
+            rawRefinementsArray.some(
+              (r) =>
+                r &&
+                Array.isArray(actSum.eventList) &&
+                actSum.eventList.includes(r.eventId) &&
+                (r.boxWellLocation || r.spatialResult || r.row !== undefined || r.coordinate !== undefined)
+            ));
+        if (alreadyHasActionWell) continue;
 
-      const startSec = Math.max(0, Number(actSum.intervalStartSeconds || 0));
-      const endSec = Math.max(startSec + 0.5, Number(actSum.intervalEndSeconds || startSec + 1));
+        const startSec = Math.max(0, Number(actSum.intervalStartSeconds || 0));
+        const endSec = Math.max(startSec + 0.5, Number(actSum.intervalEndSeconds || startSec + 1));
 
-      const actionParts: any[] = [];
-      if (gcsUri) {
-        actionParts.push({
-          fileData: {
-            fileUri: gcsUri,
-            mimeType: 'video/mp4',
-          },
-          videoMetadata: {
-            fps: 4,
-            startOffset: `${Number(startSec.toFixed(2))}s`,
-            endOffset: `${Number(endSec.toFixed(2))}s`,
-          },
-        });
-      }
+        const actionParts: any[] = [];
+        if (gcsUri) {
+          actionParts.push({
+            fileData: {
+              fileUri: gcsUri,
+              mimeType: 'video/mp4',
+            },
+            videoMetadata: {
+              fps: 4,
+              startOffset: `${Number(startSec.toFixed(2))}s`,
+              endOffset: `${Number(endSec.toFixed(2))}s`,
+            },
+          });
+        }
 
-      const actionPromptText = `Workflow: ${classification.workflowType}
+        const actionPromptText = `Workflow: ${classification.workflowType}
 Video URI: ${gcsUri}
 
 VIAL INSERTION / REMOVAL ACTION (Video Interval Well Location Analysis at 4 fps - Top-Left Black Corner Origin):
@@ -3659,13 +4973,72 @@ Output a JSON object (or array of 1 Refinement object) with:
 - "boxWellLocation": { "actionId": "${actSum.actionId}", "row": string, "col": number, "coordinate": string, "boxId"?: string, "originCorner": "TOP_LEFT_BLACK", "confidence": number }
 - "spatialResult": { "row": string, "col": number }`;
 
-      actionParts.push({ text: actionPromptText });
-      const actResp = await callPass3ModelWithSingleVideo(actionParts);
-      mergePass3Response(extractJsonFromText(extractTextFromResponse(actResp)), {
-        defaultActionId: actSum.actionId,
-      });
+        actionParts.push({ text: actionPromptText });
+        const actResp = await callPass3ModelWithSingleVideo(actionParts);
+        mergePass3Response(extractJsonFromText(extractTextFromResponse(actResp)), {
+          defaultActionId: actSum.actionId,
+        });
+      }
     }
   }
+
+  const isReagentLabelPresentation = (
+    evt: any,
+    matchingRef?: any,
+    matchingModelLabel?: any
+  ): boolean => {
+    const evtCls = String(evt?.eventClass || evt?.eventType || '').toUpperCase();
+    const modelCls = String(
+      matchingModelLabel?.eventClass || matchingModelLabel?.eventType || ''
+    ).toUpperCase();
+    const refCls = String(matchingRef?.refinementClass || '').toUpperCase();
+
+    if (evtCls.includes('BOX_LABEL') || modelCls.includes('BOX_LABEL')) {
+      return false;
+    }
+    if (evtCls.includes('REAGENT_LABEL') || modelCls.includes('REAGENT_LABEL')) {
+      return true;
+    }
+    if (
+      classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
+      (evtCls.includes('LABEL') || modelCls.includes('LABEL'))
+    ) {
+      return true;
+    }
+    if (
+      refCls.includes('REAGENT_OCR') ||
+      evt?.reagentData ||
+      matchingRef?.reagentData ||
+      matchingModelLabel?.reagentData ||
+      evt?.reagentName ||
+      matchingRef?.reagentName ||
+      matchingModelLabel?.reagentName ||
+      evt?.manufacturer ||
+      matchingRef?.manufacturer ||
+      matchingModelLabel?.manufacturer ||
+      evt?.catalogNumber ||
+      matchingRef?.catalogNumber ||
+      matchingModelLabel?.catalogNumber
+    ) {
+      return true;
+    }
+
+    const candidateText =
+      matchingRef?.transcriptionText ||
+      matchingRef?.fullText ||
+      matchingRef?.vialLabelData?.frame1Text ||
+      matchingRef?.vialLabelData?.fullText ||
+      matchingModelLabel?.fullText ||
+      matchingModelLabel?.conflatedText ||
+      evt?.conflatedLabelText ||
+      evt?.highestContrastText ||
+      '';
+    if (isLikelyReagentBottleLabelText(candidateText)) {
+      return true;
+    }
+
+    return false;
+  };
 
   // 1. Process label presentation events -> conflate two best shots & format into required/optional fields
   const labelTranscriptions: LabelTranscriptionRecord[] = [];
@@ -3675,20 +5048,13 @@ Output a JSON object (or array of 1 Refinement object) with:
     const evt = events[idx];
     const evtSum = eventsSummary[idx];
 
-    if (isVialLabelEventForRemovalOnly(evt)) {
-      delete evt.labelTranscription;
-      delete evt.vialLabelData;
-      delete evt.conflatedLabelText;
-      delete evt.highestContrastText;
-      delete evt.minimalBlurText;
-      continue;
-    }
-
     const matchingRef =
       rawRefinementsArray.find(
         (r) =>
           r.eventId === evt.eventId &&
-          (r.vialLabelData ||
+          (r.reagentData ||
+            r.reagentName ||
+            r.vialLabelData ||
             r.labelTranscription ||
             r.transcriptionText ||
             r.fullText ||
@@ -3702,6 +5068,183 @@ Output a JSON object (or array of 1 Refinement object) with:
         ? rawRefinementsArray[idx]
         : undefined);
     const matchingModelLabel = modelLabelTranscriptions.find((l) => l.eventId === evt.eventId);
+
+    const clsUpper = String(evt.eventClass || '').toUpperCase();
+    const isReagentLabel = isReagentLabelPresentation(evt, matchingRef, matchingModelLabel);
+
+    if (!isReagentLabel && isVialLabelEventForRemovalOnly(evt)) {
+      delete evt.labelTranscription;
+      delete evt.vialLabelData;
+      delete evt.conflatedLabelText;
+      delete evt.highestContrastText;
+      delete evt.minimalBlurText;
+      continue;
+    }
+
+    // In EXPERIMENT_NOTEBOOK_WORKFLOW, skip non-label state/audio/seeding events unless they explicitly carry label data
+    if (
+      classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
+      !isReagentLabel &&
+      !clsUpper.includes('LABEL') &&
+      !matchingModelLabel &&
+      !evt.vialLabelData &&
+      !matchingRef?.vialLabelData
+    ) {
+      continue;
+    }
+
+    const isBoxLabel = clsUpper.includes('BOX_LABEL');
+
+    // Determine associated actionIds for this event (excluding vial removal actions for vial labels)
+    const rawAssociatedActionIds = Array.from(
+      new Set([
+        ...(Array.isArray(evt.actionIds) ? evt.actionIds : []),
+        ...(evt.actionId ? [evt.actionId] : []),
+        ...actions
+          .filter((a) => Array.isArray(a.eventList) && a.eventList.includes(evt.eventId))
+          .map((a) => a.actionId),
+      ])
+    ).filter(Boolean);
+
+    if (isReagentLabel) {
+      const rawReagentExplicit: Record<string, any> = {
+        ...(evt.reagentData || {}),
+        ...(evt.reagentName ? { reagentName: evt.reagentName } : {}),
+        ...(evt.reagentAcronym ? { reagentAcronym: evt.reagentAcronym } : {}),
+        ...(evt.manufacturer ? { manufacturer: evt.manufacturer } : {}),
+        ...(evt.catalogNumber ? { catalogNumber: evt.catalogNumber } : {}),
+        ...(evt.lotNumber ? { lotNumber: evt.lotNumber } : {}),
+        ...(matchingRef || {}),
+        ...(matchingRef?.reagentData || {}),
+        ...(matchingModelLabel || {}),
+        ...(matchingModelLabel?.reagentData || {}),
+      };
+
+      const shot1Raw =
+        rawReagentExplicit.frame1Text ||
+        rawReagentExplicit.highestContrastShotText ||
+        rawReagentExplicit.highestContrastText ||
+        matchingRef?.vialLabelData?.frame1Text ||
+        matchingRef?.labelTranscription?.frame1Text ||
+        evt.highestContrastText ||
+        '';
+      const shot2Raw =
+        rawReagentExplicit.frame2Text ||
+        rawReagentExplicit.minimalBlurShotText ||
+        rawReagentExplicit.minimalBlurText ||
+        matchingRef?.vialLabelData?.frame2Text ||
+        matchingRef?.labelTranscription?.frame2Text ||
+        evt.minimalBlurText ||
+        '';
+      const conflatedShots =
+        shot1Raw || shot2Raw ? conflateTwoShotLabelText(shot1Raw, shot2Raw) : '';
+
+      const rawReagentTextSource =
+        rawReagentExplicit.rawLabelText ||
+        rawReagentExplicit.fullText ||
+        rawReagentExplicit.conflatedText ||
+        rawReagentExplicit.conflatedLabelText ||
+        rawReagentExplicit.transcriptionText ||
+        rawReagentExplicit.ocrExtractedText ||
+        conflatedShots ||
+        matchingRef?.vialLabelData?.fullText ||
+        evt.conflatedLabelText ||
+        '';
+
+      const parsedReagent = ArchiveReagentSchema.parse(
+        parseReagentLabelFields(rawReagentTextSource, {
+          ...rawReagentExplicit,
+          eventId: evt.eventId,
+          actionIds: rawAssociatedActionIds,
+        })
+      );
+
+      const resolvedFullText =
+        rawReagentTextSource ||
+        parsedReagent.rawLabelText ||
+        [
+          parsedReagent.reagentName !== 'N/A' ? parsedReagent.reagentName : '',
+          parsedReagent.reagentAcronym !== 'N/A' &&
+          parsedReagent.reagentAcronym !== parsedReagent.reagentName
+            ? parsedReagent.reagentAcronym
+            : '',
+          parsedReagent.manufacturer !== 'N/A' ? parsedReagent.manufacturer : '',
+          parsedReagent.catalogNumber !== 'N/A' ? `Cat# ${parsedReagent.catalogNumber}` : '',
+          parsedReagent.lotNumber !== 'N/A' ? `Lot# ${parsedReagent.lotNumber}` : '',
+        ]
+          .filter(Boolean)
+          .join(' ') ||
+        'N/A';
+
+      parsedReagent.rawLabelText = resolvedFullText;
+
+      const shot1Text = shot1Raw || resolvedFullText;
+      const shot2Text = shot2Raw || resolvedFullText;
+
+      const frameTranscriptions = [
+        {
+          frameType: 'HIGHEST_CONTRAST',
+          timestampSeconds: evtSum?.twoBestShots?.[0]?.timestampSeconds ?? 0,
+          gcsUri: evtSum?.twoBestShots?.[0]?.uri || '',
+          url: evt.highestContrastFrame?.url || evt.bestFrames?.[0]?.url || evt.bestShotUrls?.[0] || '',
+          text: shot1Text,
+        },
+        {
+          frameType: 'MINIMAL_BLUR',
+          timestampSeconds: evtSum?.twoBestShots?.[1]?.timestampSeconds ?? 0,
+          gcsUri: evtSum?.twoBestShots?.[1]?.uri || '',
+          url:
+            evt.minimalBlurFrame?.url ||
+            evt.bestFrames?.[1]?.url ||
+            evt.bestShotUrls?.[1] ||
+            evt.bestShotUrls?.[0] ||
+            '',
+          text: shot2Text,
+        },
+      ];
+
+      const record = LabelTranscriptionRecordSchema.parse({
+        eventId: evt.eventId,
+        eventClass: clsUpper.includes('REAGENT_LABEL')
+          ? evt.eventClass
+          : 'REAGENT_LABEL_PRESENTATION_EVENT',
+        actionIds: rawAssociatedActionIds,
+        isVialLabel: false,
+        isReagentLabel: true,
+        cellLineName: '',
+        fullText: resolvedFullText,
+        frame1Text: shot1Text,
+        frame2Text: shot2Text,
+        highestContrastShotText: shot1Text,
+        minimalBlurShotText: shot2Text,
+        conflatedText: resolvedFullText,
+        reagentData: parsedReagent,
+        reagentName: parsedReagent.reagentName,
+        reagentAcronym: parsedReagent.reagentAcronym,
+        manufacturer: parsedReagent.manufacturer,
+        catalogNumber: parsedReagent.catalogNumber,
+        lotNumber: parsedReagent.lotNumber,
+        frameTranscriptions,
+        conflatedAt: new Date().toISOString(),
+      });
+
+      delete evt.vialLabelData;
+      delete evt.labelTranscription;
+      evt.eventClass = record.eventClass;
+      evt.reagentData = parsedReagent;
+      evt.reagentName = parsedReagent.reagentName;
+      evt.reagentAcronym = parsedReagent.reagentAcronym;
+      evt.manufacturer = parsedReagent.manufacturer;
+      evt.catalogNumber = parsedReagent.catalogNumber;
+      evt.lotNumber = parsedReagent.lotNumber;
+      evt.conflatedLabelText = record.fullText;
+      evt.highestContrastText = shot1Text;
+      evt.minimalBlurText = shot2Text;
+
+      labelTranscriptions.push(record);
+      eventIdToLabelRecord.set(evt.eventId, record);
+      continue;
+    }
 
     const flatRefLabel =
       matchingRef &&
@@ -3751,19 +5294,6 @@ Output a JSON object (or array of 1 Refinement object) with:
       evt.labelTranscription?.fullText ||
       '';
 
-    const clsUpper = String(evt.eventClass || '').toUpperCase();
-    const isBoxLabel = clsUpper.includes('BOX_LABEL');
-
-    // Determine associated actionIds for this event (excluding vial removal actions for vial labels)
-    const rawAssociatedActionIds = Array.from(
-      new Set([
-        ...(Array.isArray(evt.actionIds) ? evt.actionIds : []),
-        ...(evt.actionId ? [evt.actionId] : []),
-        ...actions
-          .filter((a) => Array.isArray(a.eventList) && a.eventList.includes(evt.eventId))
-          .map((a) => a.actionId),
-      ])
-    ).filter(Boolean);
     const associatedActionIds = isBoxLabel
       ? rawAssociatedActionIds
       : rawAssociatedActionIds.filter(
@@ -3833,6 +5363,7 @@ Output a JSON object (or array of 1 Refinement object) with:
       eventClass: evt.eventClass || 'VIAL_LABEL_PRESENTATION',
       actionIds: associatedActionIds,
       isVialLabel: !isBoxLabel,
+      isReagentLabel: false,
       cellLineName: vialLabelData.cellLineName,
       ...(vialLabelData.userInitials ? { userInitials: vialLabelData.userInitials } : {}),
       ...(vialLabelData.dateFrozen ? { dateFrozen: vialLabelData.dateFrozen } : {}),
@@ -3867,6 +5398,23 @@ Output a JSON object (or array of 1 Refinement object) with:
   for (let aIdx = 0; aIdx < actions.length; aIdx++) {
     const act = actions[aIdx];
     const actSum = actionsSummary[aIdx];
+
+    const actTypeUpper = String(act.actionType || act.actionClass || '').toUpperCase();
+    const isVialAct =
+      actTypeUpper.includes('VIAL') ||
+      actTypeUpper.includes('INSERTION') ||
+      actTypeUpper.includes('REMOVAL');
+    const isArchiveAct =
+      classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+      actTypeUpper.includes('SEED') ||
+      actTypeUpper.includes('MIX') ||
+      actTypeUpper.includes('PREPAR');
+
+    // Cryo-box well locations (A1-I9, origin top-left black corner) only apply to cryo-box vial inventory actions,
+    // never to 96-well plate seeding or experiment archive notebook actions.
+    if (isArchiveAct || !isVialAct) {
+      continue;
+    }
 
     // Check explicit modelActionWellLocations or matching refinement
     const explicitWell = modelActionWellLocations.find((w) => w.actionId === act.actionId);
@@ -4018,7 +5566,7 @@ Output a JSON object (or array of 1 Refinement object) with:
       const clsUpper = String(rec.eventClass || '').toUpperCase();
       if (clsUpper.includes('BOX_LABEL')) {
         associatedBoxLabel = rec;
-      } else if (!isRemovalAct) {
+      } else if (!rec.isReagentLabel && !clsUpper.includes('REAGENT_LABEL') && !isRemovalAct) {
         associatedVialLabel = rec;
       }
     }
@@ -4026,7 +5574,12 @@ Output a JSON object (or array of 1 Refinement object) with:
     // If there's no linked vial label event yet and there is a vial label event in the video, associate if single event (unless removal)
     if (!isRemovalAct && !associatedVialLabel && labelTranscriptions.length === 1) {
       const onlyRec = labelTranscriptions[0];
-      if (!String(onlyRec.eventClass || '').toUpperCase().includes('BOX_LABEL')) {
+      const onlyClsUpper = String(onlyRec.eventClass || '').toUpperCase();
+      if (
+        !onlyRec.isReagentLabel &&
+        !onlyClsUpper.includes('BOX_LABEL') &&
+        !onlyClsUpper.includes('REAGENT_LABEL')
+      ) {
         associatedVialLabel = onlyRec;
       }
     }
@@ -4054,6 +5607,21 @@ Output a JSON object (or array of 1 Refinement object) with:
         coordinate: act.targetCoordinate,
       };
       act.boxWellLocation = wellLocation;
+    }
+
+    const actTypeUpper = String(act.actionType || act.actionClass || '').toUpperCase();
+    const isArchiveAct =
+      classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+      actTypeUpper.includes('SEED') ||
+      actTypeUpper.includes('MIX') ||
+      actTypeUpper.includes('PREPAR');
+
+    if (isArchiveAct) {
+      delete act.boxWellLocation;
+      delete act.targetCoordinate;
+      delete act.targetLocation;
+      delete act.boxRowId;
+      delete act.boxColId;
     }
 
     if (isRemovalAct) {
@@ -4161,7 +5729,26 @@ Output a JSON object (or array of 1 Refinement object) with:
         r.conflatedText ||
         r.conflatedLabelText ||
         r.ocrExtractedText ||
-        r.vialLabelData?.fullText;
+        r.vialLabelData?.fullText ||
+        r.reagentData?.rawLabelText;
+
+    const isReagentRef = Boolean(
+      labelRec?.isReagentLabel ||
+        r.reagentData ||
+        (r.reagentName && !r.vialLabelData && !r.cellLineName) ||
+        isLikelyReagentBottleLabelText(rawText)
+    );
+
+    const parsedReagentData = isReagentRef
+      ? labelRec?.reagentData ||
+        ArchiveReagentSchema.parse(
+          parseReagentLabelFields(rawText, {
+            ...r,
+            ...(r.reagentData || {}),
+            eventId: String(resolvedEventId),
+          })
+        )
+      : undefined;
 
     const parsedLabel = isRemovalRef
       ? {
@@ -4171,9 +5758,11 @@ Output a JSON object (or array of 1 Refinement object) with:
           fullText: '',
           ...(wellLoc?.boxId ? { boxId: wellLoc.boxId } : {}),
         }
+      : isReagentRef
+      ? undefined
       : r.vialLabelData
       ? parseVialLabelFields(rawText, r.vialLabelData)
-      : labelRec
+      : labelRec && !labelRec.isReagentLabel
       ? {
           cellLineName: labelRec.cellLineName,
           ...(labelRec.userInitials ? { userInitials: labelRec.userInitials } : {}),
@@ -4210,8 +5799,16 @@ Output a JSON object (or array of 1 Refinement object) with:
               }
             : undefined);
 
+    const sanitizedRef = { ...r };
+    if (isReagentRef) {
+      delete sanitizedRef.vialLabelData;
+      delete sanitizedRef.cellLineName;
+      delete sanitizedRef.userInitials;
+      delete sanitizedRef.dateFrozen;
+    }
+
     return {
-      ...r,
+      ...sanitizedRef,
       refinementId: String(resolvedRefinementId),
       eventId: String(resolvedEventId),
       refinementClass: String(
@@ -4220,10 +5817,11 @@ Output a JSON object (or array of 1 Refinement object) with:
       ...(primaryActionId ? { actionId: primaryActionId } : {}),
       ...(labelRec?.actionIds && labelRec.actionIds.length > 0 ? { actionIds: labelRec.actionIds } : {}),
       ...(parsedLabel ? { vialLabelData: parsedLabel } : {}),
+      ...(parsedReagentData ? { reagentData: parsedReagentData } : {}),
       ...(isRemovalRef
         ? { transcriptionText: '' }
-        : parsedLabel && !r.transcriptionText
-        ? { transcriptionText: parsedLabel.fullText }
+        : !r.transcriptionText && (labelRec?.fullText || parsedLabel?.fullText || parsedReagentData?.rawLabelText)
+        ? { transcriptionText: labelRec?.fullText || parsedLabel?.fullText || parsedReagentData?.rawLabelText }
         : {}),
       ...(resolvedWellLoc ? { boxWellLocation: resolvedWellLoc } : {}),
       ...(spatial && spatial.row ? { spatialResult: { row: String(spatial.row), col: Number(spatial.col || 1) } } : {}),
@@ -4234,47 +5832,54 @@ Output a JSON object (or array of 1 Refinement object) with:
   });
 
   // Ensure every label presentation event in `labelTranscriptions` has an OCR_CONFLATION refinement entry in `enrichedRefinementsInput`
-  if (classification.workflowType === 'INVENTORY_UPDATE_WORKFLOW') {
-    for (const labelRec of labelTranscriptions) {
-      const alreadyPresent = enrichedRefinementsInput.some(
-        (item) => item.eventId === labelRec.eventId
-      );
-      if (!alreadyPresent) {
-        const primaryActId = labelRec.actionIds[0];
-        const wellLoc = primaryActId ? actionIdToWellLocation.get(primaryActId) : undefined;
-        enrichedRefinementsInput.unshift({
-          refinementId: `ref_${labelRec.eventId}`,
-          eventId: labelRec.eventId,
-          ...(primaryActId ? { actionId: primaryActId } : {}),
-          actionIds: labelRec.actionIds,
-          refinementClass: 'OCR_CONFLATION',
-          transcriptionText: labelRec.fullText,
-          vialLabelData: {
-            cellLineName: labelRec.cellLineName,
-            ...(labelRec.userInitials ? { userInitials: labelRec.userInitials } : {}),
-            ...(labelRec.dateFrozen ? { dateFrozen: labelRec.dateFrozen } : {}),
-            fullText: labelRec.fullText,
-            ...(labelRec.lotNumber ? { lotNumber: labelRec.lotNumber } : {}),
-            ...(labelRec.passage !== undefined ? { passage: labelRec.passage } : {}),
-            ...(labelRec.boxId ? { boxId: labelRec.boxId } : {}),
-            ...(labelRec.frame1Text ? { frame1Text: labelRec.frame1Text } : {}),
-            ...(labelRec.frame2Text ? { frame2Text: labelRec.frame2Text } : {}),
-          },
-          ...(wellLoc
-            ? {
-                boxWellLocation: wellLoc,
-                spatialResult: { row: wellLoc.row, col: wellLoc.col },
-              }
-            : {}),
-          ...(labelRec.frameTranscriptions ? { frameTranscriptions: labelRec.frameTranscriptions } : {}),
-          conflationMetadata: {
-            confidence: 0.99,
-            framesEvaluated: 2,
-            ocrEngine: 'Gemini-DualShot-Conflation',
-          },
-        });
-      }
+  for (const labelRec of labelTranscriptions) {
+    const alreadyPresent = enrichedRefinementsInput.some(
+      (item) => item.eventId === labelRec.eventId
+    );
+    if (!alreadyPresent) {
+      const primaryActId = labelRec.actionIds[0];
+      const wellLoc = primaryActId ? actionIdToWellLocation.get(primaryActId) : undefined;
+      enrichedRefinementsInput.unshift({
+        refinementId: `ref_${labelRec.eventId}`,
+        eventId: labelRec.eventId,
+        ...(primaryActId ? { actionId: primaryActId } : {}),
+        actionIds: labelRec.actionIds,
+        refinementClass: 'OCR_CONFLATION',
+        transcriptionText: labelRec.fullText,
+        ...(labelRec.isReagentLabel && labelRec.reagentData
+          ? {
+              reagentData: labelRec.reagentData,
+            }
+          : {
+              vialLabelData: {
+                cellLineName: labelRec.cellLineName,
+                ...(labelRec.userInitials ? { userInitials: labelRec.userInitials } : {}),
+                ...(labelRec.dateFrozen ? { dateFrozen: labelRec.dateFrozen } : {}),
+                fullText: labelRec.fullText,
+                ...(labelRec.lotNumber ? { lotNumber: labelRec.lotNumber } : {}),
+                ...(labelRec.passage !== undefined ? { passage: labelRec.passage } : {}),
+                ...(labelRec.boxId ? { boxId: labelRec.boxId } : {}),
+                ...(labelRec.frame1Text ? { frame1Text: labelRec.frame1Text } : {}),
+                ...(labelRec.frame2Text ? { frame2Text: labelRec.frame2Text } : {}),
+              },
+            }),
+        ...(wellLoc
+          ? {
+              boxWellLocation: wellLoc,
+              spatialResult: { row: wellLoc.row, col: wellLoc.col },
+            }
+          : {}),
+        ...(labelRec.frameTranscriptions ? { frameTranscriptions: labelRec.frameTranscriptions } : {}),
+        conflationMetadata: {
+          confidence: 0.99,
+          framesEvaluated: 2,
+          ocrEngine: 'Gemini-DualShot-Conflation',
+        },
+      });
     }
+  }
+
+  if (classification.workflowType === 'INVENTORY_UPDATE_WORKFLOW') {
 
     // Ensure every action with a well location (especially VIAL_REMOVAL actions whose label transcription was skipped) has a refinement entry
     for (const actWell of actionWellLocations) {
@@ -4314,6 +5919,501 @@ Output a JSON object (or array of 1 Refinement object) with:
         });
       }
     }
+  }
+
+  // Synthesize Experiment Archive reagents and workSteps when workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+  // or when reagent label presentations are present
+  const archiveReagents: ArchiveReagent[] = [];
+  const archiveWorkSteps: ArchiveWorkStep[] = [];
+  const hasReagentPresentations =
+    labelTranscriptions.some((lt) => lt.isReagentLabel || Boolean(lt.reagentData)) ||
+    events.some((e) => Boolean(e.reagentData || e.reagentName));
+
+  if (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' || hasReagentPresentations) {
+    const canonicalReagents: ArchiveReagent[] = [];
+
+    const addOrMergeReagent = (
+      candidate: Partial<ArchiveReagent> & { rawLabelText?: string }
+    ): ArchiveReagent | undefined => {
+      if (!candidate) return undefined;
+      const rawName = String(candidate.reagentName || '').trim();
+      const rawAcronym = String(candidate.reagentAcronym || '').trim();
+      if (
+        (!rawName || rawName === 'Unknown Cell Line' || rawName.toUpperCase() === 'N/A') &&
+        (!rawAcronym || rawAcronym.toUpperCase() === 'N/A')
+      ) {
+        return undefined;
+      }
+
+      const normalizedCandidate = parseReagentLabelFields(candidate.rawLabelText, candidate);
+      const existingIdx = canonicalReagents.findIndex((existing) =>
+        areSameReagent(existing, normalizedCandidate)
+      );
+
+      if (existingIdx !== -1) {
+        const merged = ArchiveReagentSchema.parse(
+          mergeReagentRecords(canonicalReagents[existingIdx], normalizedCandidate)
+        );
+        canonicalReagents[existingIdx] = merged;
+        return merged;
+      } else {
+        const created = ArchiveReagentSchema.parse({
+          ...normalizedCandidate,
+          id: normalizedCandidate.id || `reagent_${canonicalReagents.length + 1}`,
+        });
+        canonicalReagents.push(created);
+        return created;
+      }
+    };
+
+    // 1. Collect reagents from refinements, events, labelTranscriptions, and actions
+    for (const refItem of enrichedRefinementsInput) {
+      if (refItem.reagentData) {
+        addOrMergeReagent(refItem.reagentData);
+      }
+      // Also parse "ACRONYM: Full Name" pairs from ACRONYM_MAPPING refinements if present
+      if (
+        typeof refItem.transcriptionText === 'string' &&
+        String(refItem.refinementClass || '').toUpperCase().includes('ACRONYM')
+      ) {
+        const segments = refItem.transcriptionText.split(/[;\n]+/);
+        for (const seg of segments) {
+          const m = seg.trim().match(/^([A-Z0-9/-]{2,8})\s*:\s*([^(,;]+)/i);
+          if (m) {
+            addOrMergeReagent({
+              reagentName: m[2].trim(),
+              reagentAcronym: m[1].trim().toUpperCase(),
+            });
+          }
+        }
+      }
+    }
+    for (const evt of events) {
+      if (evt.reagentData) {
+        addOrMergeReagent(evt.reagentData);
+      } else if (evt.reagentName || evt.reagentAcronym) {
+        addOrMergeReagent({
+          reagentName: evt.reagentName || 'N/A',
+          reagentAcronym: evt.reagentAcronym || generateReagentAcronym(evt.reagentName),
+          manufacturer: evt.manufacturer || 'N/A',
+          catalogNumber: evt.catalogNumber || 'N/A',
+          lotNumber: evt.lotNumber || evt.vialLabelData?.lotNumber || 'N/A',
+          rawLabelText: evt.conflatedLabelText || evt.vialLabelData?.fullText,
+          eventId: evt.eventId,
+          actionIds: evt.actionIds,
+        });
+      }
+    }
+    for (const lt of labelTranscriptions) {
+      if (lt.reagentData) {
+        addOrMergeReagent(lt.reagentData);
+      } else if (lt.isReagentLabel) {
+        addOrMergeReagent({
+          reagentName: lt.reagentName || 'N/A',
+          reagentAcronym: lt.reagentAcronym || 'N/A',
+          manufacturer: lt.manufacturer || 'N/A',
+          catalogNumber: lt.catalogNumber || 'N/A',
+          lotNumber: lt.lotNumber || 'N/A',
+          rawLabelText: lt.fullText,
+          eventId: lt.eventId,
+          actionIds: lt.actionIds,
+        });
+      } else if (
+        classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
+        lt.cellLineName &&
+        lt.cellLineName !== 'Unknown Cell Line'
+      ) {
+        addOrMergeReagent({
+          reagentName: lt.cellLineName,
+          reagentAcronym: generateReagentAcronym(lt.cellLineName),
+          lotNumber: lt.lotNumber || 'N/A',
+          rawLabelText: lt.fullText,
+        });
+      }
+    }
+    for (const act of actions) {
+      if (Array.isArray(act.reagents)) {
+        for (const r of act.reagents) {
+          addOrMergeReagent(r);
+        }
+      }
+      if (act.cellLineInfo && typeof act.cellLineInfo === 'object') {
+        if (act.cellLineInfo.reagentFullName || act.cellLineInfo.reagentAcronym) {
+          addOrMergeReagent({
+            reagentName: act.cellLineInfo.reagentFullName || 'N/A',
+            reagentAcronym: act.cellLineInfo.reagentAcronym || 'N/A',
+            actionIds: [act.actionId],
+          });
+        }
+        if (act.cellLineInfo.basalMedium) {
+          addOrMergeReagent({
+            reagentName: isLikelyReagentAcronym(act.cellLineInfo.basalMedium)
+              ? 'N/A'
+              : String(act.cellLineInfo.basalMedium),
+            reagentAcronym: isLikelyReagentAcronym(act.cellLineInfo.basalMedium)
+              ? String(act.cellLineInfo.basalMedium).toUpperCase()
+              : generateReagentAcronym(String(act.cellLineInfo.basalMedium)),
+            actionIds: [act.actionId],
+          });
+        }
+      }
+    }
+
+    // Helper to resolve acronym or full name against canonical merged reagents
+    const findCanonicalReagent = (
+      query?: Partial<ArchiveReagent> | string | null
+    ): ArchiveReagent | undefined => {
+      if (!query) return undefined;
+      return canonicalReagents.find((r) => areSameReagent(r, query));
+    };
+
+    const resolveReagentDisplayName = (nameOrAcronym?: string): string => {
+      if (!nameOrAcronym) return 'N/A';
+      const trimmed = nameOrAcronym.trim();
+      const matched = findCanonicalReagent(trimmed);
+      if (matched) {
+        if (
+          matched.reagentName !== 'N/A' &&
+          matched.reagentAcronym !== 'N/A' &&
+          matched.reagentName.toUpperCase() !== matched.reagentAcronym.toUpperCase()
+        ) {
+          return `${matched.reagentName} (${matched.reagentAcronym})`;
+        }
+        return matched.reagentName !== 'N/A' ? matched.reagentName : matched.reagentAcronym;
+      }
+      return trimmed;
+    };
+
+    // 2. Build workSteps and enrich each action with mixReagentsData or seedReagentsData
+    if (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW') {
+      const globalAudioEvents = allContextEvents.filter(
+        (e) => e.eventClass === 'PROTOCOL_AUDIO_UTTERANCE_EVENT'
+      );
+
+      for (let idx = 0; idx < actions.length; idx++) {
+        const act = actions[idx];
+        const actEvents = allContextEvents.filter(
+          (e) =>
+            e.actionId === act.actionId ||
+            (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId)) ||
+            (Array.isArray(act.eventList) && act.eventList.includes(e.eventId))
+        );
+        const actRef = enrichedRefinementsInput.find((r) => r.actionId === act.actionId);
+
+        const isMix =
+          act.actionClass === 'REAGENT_MIXING_ACTION' ||
+          String(act.actionType || '').toUpperCase().includes('MIX') ||
+          Boolean(act.mixReagentsData || actRef?.mixReagentsData);
+
+        if (isMix) {
+          act.actionClass = 'REAGENT_MIXING_ACTION';
+          const reagentEvts = actEvents.filter(
+            (e) =>
+              (e.reagentName && e.reagentName !== 'N/A') ||
+              (e.reagentAcronym && e.reagentAcronym !== 'N/A') ||
+              (e.reagentData &&
+                (e.reagentData.reagentName !== 'N/A' || e.reagentData.reagentAcronym !== 'N/A'))
+          );
+          const amountEvts = actEvents.filter((e) => e.mixingAmount && e.mixingAmount !== 'N/A');
+
+          const getEvtReagentRef = (ev?: Event) => {
+            if (!ev) return undefined;
+            if (ev.reagentData?.reagentName && ev.reagentData.reagentName !== 'N/A') {
+              return ev.reagentData.reagentName;
+            }
+            if (ev.reagentName && ev.reagentName !== 'N/A') {
+              return ev.reagentName;
+            }
+            if (ev.reagentData?.reagentAcronym && ev.reagentData.reagentAcronym !== 'N/A') {
+              return ev.reagentData.reagentAcronym;
+            }
+            if (ev.reagentAcronym && ev.reagentAcronym !== 'N/A') {
+              return ev.reagentAcronym;
+            }
+            return undefined;
+          };
+
+          const cellLineInfoObj =
+            act.cellLineInfo && typeof act.cellLineInfo === 'object' ? (act.cellLineInfo as any) : undefined;
+          const cellLineBasalMedium = cellLineInfoObj?.basalMedium
+            ? String(cellLineInfoObj.basalMedium)
+            : undefined;
+          const cellLineSupplement =
+            cellLineInfoObj?.reagentFullName || cellLineInfoObj?.reagentAcronym
+              ? String(cellLineInfoObj.reagentFullName || cellLineInfoObj.reagentAcronym)
+              : undefined;
+          const cellLineBasalVol =
+            cellLineInfoObj?.basalVolumeMl != null ? `${cellLineInfoObj.basalVolumeMl} mL` : undefined;
+          const cellLineSuppVol =
+            cellLineInfoObj?.supplementVolumeMl != null ? `${cellLineInfoObj.supplementVolumeMl} mL` : undefined;
+
+          // Extract volumes from action description or audio events if not explicitly set on events
+          const mixTextPool = [
+            act.description,
+            ...actEvents.map((e) => e.description),
+            ...globalAudioEvents.map((e) => e.description),
+            classification?.transcribedAudio,
+          ]
+            .filter(Boolean)
+            .join(' ');
+          const extractedVolumes = Array.from(
+            mixTextPool.matchAll(/\b(\d+(?:\.\d+)?\s*(?:mL|ml|uL|µL|ul|L|microliters?|milliliters?))\b/gi)
+          ).map((m) => m[1].replace(/\bml\b/i, 'mL').replace(/\b(?:ul|microliters?)\b/i, 'µL'));
+
+          const rawFirstReagent =
+            actRef?.mixReagentsData?.firstReagentName ||
+            act.mixReagentsData?.firstReagentName ||
+            getEvtReagentRef(reagentEvts[0]) ||
+            cellLineBasalMedium ||
+            canonicalReagents[0]?.reagentName ||
+            canonicalReagents[0]?.reagentAcronym ||
+            'N/A';
+          const rawFirstAmount =
+            actRef?.mixReagentsData?.firstReagentAmount ||
+            act.mixReagentsData?.firstReagentAmount ||
+            amountEvts[0]?.mixingAmount ||
+            cellLineBasalVol ||
+            extractedVolumes[0] ||
+            'N/A';
+          const rawSecondReagent =
+            actRef?.mixReagentsData?.secondReagentName ||
+            act.mixReagentsData?.secondReagentName ||
+            getEvtReagentRef(reagentEvts[1]) ||
+            cellLineSupplement ||
+            canonicalReagents[1]?.reagentName ||
+            canonicalReagents[1]?.reagentAcronym ||
+            'N/A';
+          const rawSecondAmount =
+            actRef?.mixReagentsData?.secondReagentAmount ||
+            act.mixReagentsData?.secondReagentAmount ||
+            amountEvts[1]?.mixingAmount ||
+            cellLineSuppVol ||
+            extractedVolumes[1] ||
+            'N/A';
+
+          // Also register these reagents if not yet in canonicalReagents (and not 'N/A')
+          const cleanReagentTitle = (s: string) => s.replace(/\s*\([A-Z0-9/-]+\)\s*$/, '').trim();
+          const firstTitle = rawFirstReagent !== 'N/A' ? cleanReagentTitle(rawFirstReagent) : 'N/A';
+          const secondTitle = rawSecondReagent !== 'N/A' ? cleanReagentTitle(rawSecondReagent) : 'N/A';
+          const firstMerged =
+            firstTitle !== 'N/A'
+              ? addOrMergeReagent(
+                  isLikelyReagentAcronym(firstTitle)
+                    ? { reagentName: 'N/A', reagentAcronym: firstTitle.toUpperCase(), actionIds: [act.actionId] }
+                    : { reagentName: firstTitle, actionIds: [act.actionId] }
+                )
+              : undefined;
+          const secondMerged =
+            secondTitle !== 'N/A'
+              ? addOrMergeReagent(
+                  isLikelyReagentAcronym(secondTitle)
+                    ? { reagentName: 'N/A', reagentAcronym: secondTitle.toUpperCase(), actionIds: [act.actionId] }
+                    : { reagentName: secondTitle, actionIds: [act.actionId] }
+                )
+              : undefined;
+
+          const mixData: MixReagentsActionData = {
+            firstReagentName: firstTitle !== 'N/A' ? resolveReagentDisplayName(firstTitle) : 'N/A',
+            ...(firstMerged?.reagentAcronym && firstMerged.reagentAcronym !== 'N/A'
+              ? { firstReagentAcronym: firstMerged.reagentAcronym }
+              : {}),
+            firstReagentAmount: rawFirstAmount,
+            secondReagentName: secondTitle !== 'N/A' ? resolveReagentDisplayName(secondTitle) : 'N/A',
+            ...(secondMerged?.reagentAcronym && secondMerged.reagentAcronym !== 'N/A'
+              ? { secondReagentAcronym: secondMerged.reagentAcronym }
+              : {}),
+            secondReagentAmount: rawSecondAmount,
+          };
+          act.mixReagentsData = mixData;
+          if (actRef) {
+            actRef.mixReagentsData = mixData;
+          }
+
+          archiveWorkSteps.push(
+            ArchiveWorkStepSchema.parse({
+              id: `step_${act.actionId}`,
+              stepNumber: idx + 1,
+              actionType: 'MIX_REAGENTS',
+              actionId: act.actionId,
+              description:
+                act.description ||
+                `Mixed ${mixData.firstReagentAmount} of ${mixData.firstReagentName} with ${mixData.secondReagentAmount} of ${mixData.secondReagentName}.`,
+              startTime: typeof act.startTime === 'number' ? formatSecondsToTimeString(act.startTime) : act.startTime,
+              endTime: typeof act.endTime === 'number' ? formatSecondsToTimeString(act.endTime) : act.endTime,
+              mixReagentsData: mixData,
+            })
+          );
+        } else {
+          act.actionClass = 'REAGENT_SEEDING_ACTION';
+          const seedEvts = actEvents.filter(
+            (e) =>
+              e.plateType ||
+              e.pipetteType ||
+              e.cellsSeeded ||
+              e.cellsPerWell ||
+              typeof e.seedingEventsCount === 'number'
+          );
+          const seedEvt = seedEvts[0];
+          const individualSeedEventsCount = actEvents.filter(
+            (e) => e.eventClass === 'WELL_SEEDING_EVENT' || e.eventClass === 'SEEDING_EVENT'
+          ).length;
+
+          const audioAndEventTexts = [
+            ...actEvents.map(
+              (e) =>
+                `${e.description || ''} ${e.conflatedLabelText || ''} ${e.reagentData?.rawLabelText || ''} ${e.reagentData?.reagentName || e.reagentName || ''} ${e.reagentData?.reagentAcronym || e.reagentAcronym || ''}`
+            ),
+            ...globalAudioEvents.map((e) => e.description || ''),
+            ...enrichedRefinementsInput
+              .filter((r) => !r.actionId || r.actionId === act.actionId)
+              .map((r) => `${r.transcriptionText || ''} ${r.description || ''}`),
+            classification?.transcribedAudio,
+            typeof classification?.identificationEvent === 'string'
+              ? classification.identificationEvent
+              : classification?.identificationEvent
+              ? `${(classification.identificationEvent as any).description || ''} ${(classification.identificationEvent as any).spokenContext || ''}`
+              : undefined,
+          ];
+
+          const resolvedSeed = resolveSeedReagentsDataFromContext({
+            explicitCandidates: [
+              actRef?.seedReagentsData,
+              ...seedEvts,
+              act.seedReagentsData,
+            ],
+            actionDescription: actRef?.description || act.description,
+            cellLineName: act.cellLineName,
+            cellLineInfo: act.cellLineInfo,
+            audioAndEventTexts,
+            reagents: canonicalReagents,
+          });
+
+          const plateType = resolvedSeed.plateType;
+          const pipetteType = resolvedSeed.pipetteType;
+          const cellsSeeded = resolvedSeed.cellsSeeded;
+          const cellsPerWell = resolvedSeed.cellsPerWell;
+
+          const expectedCount =
+            actRef?.seedReagentsData?.expectedSeedingEventsCount ??
+            act.seedReagentsData?.expectedSeedingEventsCount ??
+            seedEvt?.expectedSeedingEventsCount ??
+            computeExpectedSeedingEvents(plateType, pipetteType) ??
+            12;
+          const detectedCount =
+            actRef?.seedReagentsData?.seedingEventsCount ??
+            act.seedReagentsData?.seedingEventsCount ??
+            seedEvt?.seedingEventsCount ??
+            (individualSeedEventsCount > 0 ? individualSeedEventsCount : expectedCount);
+          const isCorrect =
+            actRef?.seedReagentsData?.isSeedingCountCorrect ??
+            act.seedReagentsData?.isSeedingCountCorrect ??
+            seedEvt?.isSeedingCountCorrect ??
+            detectedCount === expectedCount;
+
+          const detectedColsSet = new Set<number>();
+          if (Array.isArray(act.seededColumns)) {
+            act.seededColumns.forEach((c: number) => {
+              if (c >= 1 && c <= 12) detectedColsSet.add(c);
+            });
+          }
+          if (Array.isArray(actRef?.seedReagentsData?.seededColumns)) {
+            actRef.seedReagentsData.seededColumns.forEach((c: number) => {
+              if (c >= 1 && c <= 12) detectedColsSet.add(c);
+            });
+          }
+          if (Array.isArray(act.seedReagentsData?.seededColumns)) {
+            act.seedReagentsData.seededColumns.forEach((c: number) => {
+              if (c >= 1 && c <= 12) detectedColsSet.add(c);
+            });
+          }
+          for (const ev of actEvents) {
+            if (typeof ev.seededColumn === 'number' && ev.seededColumn >= 1 && ev.seededColumn <= 12) {
+              detectedColsSet.add(ev.seededColumn);
+            }
+            if (Array.isArray(ev.seededColumns)) {
+              ev.seededColumns.forEach((c: number) => {
+                if (c >= 1 && c <= 12) detectedColsSet.add(c);
+              });
+            }
+          }
+          if (detectedColsSet.size === 0 && (act.description || actRef?.description)) {
+            const parsed = parseColumnNumbersFromText(`${act.description || ''} ${actRef?.description || ''}`);
+            parsed.forEach((c) => detectedColsSet.add(c));
+          }
+          if (detectedColsSet.size === 0 && detectedCount > 0) {
+            const upTo = Math.min(detectedCount, 12);
+            for (let c = 1; c <= upTo; c++) detectedColsSet.add(c);
+          }
+
+          const rawCols = Array.from(detectedColsSet).sort((a, b) => a - b);
+          const { seededColumns, seededWells } = resolveSeededColumnsAndWells({
+            seededColumns: rawCols,
+            seedingEventsCount: detectedCount,
+          });
+
+          const seedData: SeedReagentsActionData = {
+            plateType,
+            pipetteType,
+            cellsSeeded,
+            cellsPerWell,
+            seedingEventsCount: detectedCount,
+            expectedSeedingEventsCount: expectedCount,
+            isSeedingCountCorrect: isCorrect,
+            seededColumns,
+            seededWells,
+          };
+          act.seedReagentsData = seedData;
+          act.seededColumns = seededColumns;
+          act.seededWells = seededWells;
+          if (actRef) {
+            actRef.seedReagentsData = seedData;
+          }
+
+          archiveWorkSteps.push(
+            ArchiveWorkStepSchema.parse({
+              id: `step_${act.actionId}`,
+              stepNumber: idx + 1,
+              actionType: 'SEED_REAGENTS',
+              actionId: act.actionId,
+              description:
+                act.description ||
+                `Seeded ${seedData.cellsSeeded} (${seedData.cellsPerWell}) into ${seedData.plateType} using ${seedData.pipetteType} (${seedData.seedingEventsCount}/${seedData.expectedSeedingEventsCount} seeding events detected).`,
+              startTime: typeof act.startTime === 'number' ? formatSecondsToTimeString(act.startTime) : act.startTime,
+              endTime: typeof act.endTime === 'number' ? formatSecondsToTimeString(act.endTime) : act.endTime,
+              seedReagentsData: seedData,
+            })
+          );
+        }
+      }
+    }
+
+    // 3. Link every reagent LabelTranscriptionRecord, Event, and Refinement to its canonical reagent ID
+    for (const lt of labelTranscriptions) {
+      if (lt.isReagentLabel && lt.reagentData) {
+        const matched = findCanonicalReagent(lt.reagentData);
+        if (matched?.id) {
+          lt.reagentData.id = matched.id;
+        }
+      }
+    }
+    for (const evt of events) {
+      if (evt.reagentData) {
+        const matched = findCanonicalReagent(evt.reagentData);
+        if (matched?.id) {
+          evt.reagentData.id = matched.id;
+        }
+      }
+    }
+    for (const refItem of enrichedRefinementsInput) {
+      if (refItem.reagentData) {
+        const matched = findCanonicalReagent(refItem.reagentData);
+        if (matched?.id) {
+          refItem.reagentData.id = matched.id;
+        }
+      }
+    }
+
+    archiveReagents.push(...canonicalReagents);
   }
 
   const validated = RefinementSchema.array().parse(enrichedRefinementsInput);
@@ -4359,6 +6459,8 @@ Output a JSON object (or array of 1 Refinement object) with:
   (validated as any).labelTranscriptions = labelTranscriptions;
   (validated as any).actionWellLocations = actionWellLocations;
   (validated as any).enrichedActions = actions;
+  (validated as any).reagents = archiveReagents;
+  (validated as any).workSteps = archiveWorkSteps;
   (validated as any).artifactPaths = artifactPaths;
   return validated;
 }

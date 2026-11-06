@@ -170,23 +170,16 @@ describe('Phase 5: End-to-End Pipeline Simulation, Fixture Validation & Atomic S
       let passCall = 0;
       setGenAIClient({
         models: {
-          generateContent: async (req) => {
+          generateContent: async () => {
             passCall++;
-            const promptStr = JSON.stringify(req?.contents || []);
             if (passCall === 1) {
               return { text: JSON.stringify(archiveFixture.workflowClassification) };
             }
             if (passCall === 2) {
               return { text: JSON.stringify(archiveFixture.actions) };
             }
-            for (const act of archiveFixture.actions) {
-              if (promptStr.includes(`Action ID: ${act.actionId}`)) {
-                return {
-                  text: JSON.stringify(
-                    archiveFixture.events.filter((e) => e.actionId === act.actionId)
-                  ),
-                };
-              }
+            if (passCall === 3) {
+              return { text: JSON.stringify({ events: archiveFixture.events, refinedActions: [] }) };
             }
             return { text: JSON.stringify(archiveFixture.refinements) };
           },
@@ -200,7 +193,7 @@ describe('Phase 5: End-to-End Pipeline Simulation, Fixture Validation & Atomic S
         videoGcsUri: `gs://${archiveFixture.customerId}-video-manager-storage/normalized/norm_${archiveFixture.videoId}.mp4`,
       });
 
-      assert.strictEqual(passCall, 5, 'Must execute all pipeline passes (Pass 0, Pass 1, 2x Pass 2 per action, Pass 3)');
+      assert.strictEqual(passCall, 4, 'Must execute all 4 pipeline passes (Pass 0, Pass 1, Pass 2, Pass 3)');
       assert.strictEqual(result.workloadClassification.workflowType, 'EXPERIMENT_NOTEBOOK_WORKFLOW');
       assert.strictEqual(result.actions.length, 2);
       assert.strictEqual(result.events.length, 14);
@@ -409,6 +402,82 @@ describe('Phase 5: End-to-End Pipeline Simulation, Fixture Validation & Atomic S
         assert.ok(archBody.markdownDoc.includes('## Description'));
         assert.ok(archBody.markdownDoc.includes('## Reagents Used'));
         assert.ok(archBody.markdownDoc.includes('## Experiment Steps'));
+        assert.ok(Array.isArray(archBody.details.reagents));
+        assert.ok(archBody.details.reagents.length >= 1);
+        assert.ok(Array.isArray(archBody.details.workSteps));
+        assert.ok(archBody.details.workSteps.length >= 1);
+
+        // Verify GET /api/archives returns the signed-off archive notebook with appended report content
+        const listArchRes = await fetch(`http://127.0.0.1:${port}/api/archives`, {
+          method: 'GET',
+          headers: {
+            'x-customer-id': archiveFixture.customerId,
+            'x-database-id': archiveFixture.databaseId,
+          },
+        });
+        assert.strictEqual(listArchRes.status, 200);
+        const listArchBody = await listArchRes.json();
+        const committedArchive = listArchBody.archives.find(
+          (a) => a.id === archiveFixture.archiveId
+        );
+        assert.ok(committedArchive, 'Signed-off archive must be returned by GET /api/archives');
+        assert.ok(committedArchive.reagents.length >= 1);
+        assert.ok(committedArchive.workSteps.length >= 1);
+        assert.ok(committedArchive.markdownDoc.includes('## Reagents Used'));
+        assert.ok(committedArchive.videoIds.includes(archiveFixture.videoId));
+
+        // 4. Append a second video report via POST /api/signoff/archive using archiveName resolution
+        const appendRes = await fetch(`http://127.0.0.1:${port}/api/signoff/archive`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-customer-id': archiveFixture.customerId,
+            'x-database-id': archiveFixture.databaseId,
+          },
+          body: JSON.stringify({
+            databaseId: archiveFixture.databaseId,
+            videoId: 'vid_archive_followup_02',
+            archiveId: committedArchive.name,
+            archiveName: committedArchive.name,
+            reagents: [
+              {
+                reagentName: 'Trypsin-EDTA',
+                reagentAcronym: 'TE',
+                manufacturer: 'Gibco',
+                catalogNumber: '25200-056',
+                lotNumber: 'LOT-TE-09',
+              },
+            ],
+            labelTranscriptions: ['Trypsin-EDTA (TE) | Gibco | Cat: 25200-056 | Lot: LOT-TE-09'],
+            workSteps: [
+              {
+                stepNumber: 1,
+                actionType: 'MIX_REAGENTS',
+                startTimeSeconds: 5,
+                endTimeSeconds: 15,
+                description: 'Mixed 5 mL of Trypsin-EDTA with 10 mL of DMEM.',
+                mixReagentsData: {
+                  firstReagentName: 'Trypsin-EDTA',
+                  firstReagentAmount: '5 mL',
+                  secondReagentName: 'DMEM',
+                  secondReagentAmount: '10 mL',
+                },
+              },
+            ],
+            operatorInitials: 'RS',
+          }),
+        });
+        assert.strictEqual(appendRes.status, 200);
+        const appendBody = await appendRes.json();
+        assert.strictEqual(appendBody.details.archiveId, archiveFixture.archiveId);
+        assert.ok(
+          appendBody.details.reagents.some((r) => r.reagentName === 'Trypsin-EDTA'),
+          'Appended reagent must be present in merged archive reagents'
+        );
+        assert.ok(
+          appendBody.details.workSteps.length >= committedArchive.workSteps.length + 1,
+          'Appended work step must be added to existing archive workSteps'
+        );
 
         const updatedArchAnalysis = await getVideoAnalysis(
           archiveFixture.databaseId,

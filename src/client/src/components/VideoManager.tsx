@@ -29,6 +29,7 @@ import {
   Cpu,
   Terminal,
   Trash2,
+  RotateCcw,
 } from 'lucide-react';
 import {
   type VideoAnalysisDoc,
@@ -36,14 +37,25 @@ import {
   type VideoPasses,
   type PassStatus,
   type ExecutionAudit,
+  type ArchiveReagent,
+  type ArchiveWorkStep,
   DEFAULT_VIDEO_PASSES,
+  generateReagentAcronym,
+  parseReagentLabelFields,
+  isLikelyReagentBottleLabelText,
+  computeExpectedSeedingEvents,
+  render96WellPlateMarkdown,
+  resolveSeededColumnsAndWells,
+  parseColumnNumbersFromText,
 } from '@sail/shared';
 import {
   TenantConfig,
   DEFAULT_GCS_BUCKET,
   apiService,
   UploadVideoResponse,
+  compileArchiveMarkdownFromAnalysis,
   type InventoryRecord,
+  type ArchiveRecord,
 } from '../services/api.service';
 
 export interface VideoManagerViewProps {
@@ -56,6 +68,7 @@ export interface VideoManagerViewProps {
     analysis?: VideoAnalysisDoc
   ) => void;
   onNavigateToInventory?: (inventoryId?: string, videoId?: string) => void;
+  onNavigateToArchive?: (archiveId?: string, videoId?: string) => void;
   onSeekVideo?: (seconds: number) => void;
   currentTime?: number;
 }
@@ -145,6 +158,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   onSelectActiveStream,
   onSelectVideoForReview,
   onNavigateToInventory,
+  onNavigateToArchive,
   onSeekVideo,
   currentTime,
 }) => {
@@ -161,6 +175,22 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   const [inventories, setInventories] = useState<InventoryRecord[]>([]);
   const [assigningInventoryMap, setAssigningInventoryMap] = useState<Record<string, string>>({});
   const [isAssigningMap, setIsAssigningMap] = useState<Record<string, boolean>>({});
+
+  // Experiment Archives for Pass 0 automatic matching, manual association & new archive confirmation
+  const [archives, setArchives] = useState<ArchiveRecord[]>([]);
+  const [assigningArchiveMap, setAssigningArchiveMap] = useState<Record<string, string>>({});
+  const [isAssigningArchiveMap, setIsAssigningArchiveMap] = useState<Record<string, boolean>>({});
+  const [archiveDraftMap, setArchiveDraftMap] = useState<
+    Record<
+      string,
+      {
+        name: string;
+        creatorName: string;
+        creationDate: string;
+        showCreateForm?: boolean;
+      }
+    >
+  >({});
 
   // Selected video for the Pass Stepper & Execution UI
   const [activeStream, setActiveStreamState] = useState<string | null>(
@@ -211,9 +241,87 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       }
     >
   >({});
+  const [hitlArchiveEdits, setHitlArchiveEdits] = useState<
+    Record<
+      string,
+      {
+        archiveName?: string;
+        creatorName?: string;
+        creationDate?: string;
+        reagents?: ArchiveReagent[];
+        labelTranscriptions?: string[];
+        workSteps?: ArchiveWorkStep[];
+      }
+    >
+  >({});
   const [isCommittingHitl, setIsCommittingHitl] = useState<boolean>(false);
+  const [isUndoingHitl, setIsUndoingHitl] = useState<boolean>(false);
   const [hitlCommitError, setHitlCommitError] = useState<string | null>(null);
   const [hitlCommitSuccess, setHitlCommitSuccess] = useState<string | null>(null);
+
+  const handleUndoHitlCommit = async (videoId: string) => {
+    setIsUndoingHitl(true);
+    setHitlCommitError(null);
+    setHitlCommitSuccess(null);
+    try {
+      await apiService.undoVideoCommit(videoId, {
+        customerId: tenant.customerId,
+        databaseId: tenant.databaseId,
+      });
+
+      // Update passesByVideo locally
+      setPassesByVideo((prev) => {
+        const cur = prev[videoId] || { ...DEFAULT_VIDEO_PASSES };
+        return {
+          ...prev,
+          [videoId]: {
+            ...cur,
+            hitl: {
+              status: 'PENDING',
+              error: null,
+            },
+          },
+        };
+      });
+
+      // Update videos list
+      setVideos((prev) =>
+        prev.map((v) =>
+          v.videoId === videoId
+            ? ({
+                ...v,
+                isSignedOff: false,
+                signedOffAt: null,
+                passes: {
+                  ...(v.passes || {}),
+                  hitl: { status: 'PENDING' },
+                },
+              } as any)
+            : v
+        )
+      );
+
+      // Update analysisCache if present
+      setAnalysisCache((prev) => {
+        const cached = prev[videoId];
+        if (!cached) return prev;
+        return {
+          ...prev,
+          [videoId]: {
+            ...cached,
+            isSignedOff: false,
+          },
+        };
+      });
+
+      setStatusBanner(`Reset commit state for ${videoId}. You can now edit and re-commit.`);
+    } catch (err: any) {
+      console.error(`[VideoManager] Failed to undo commit for ${videoId}:`, err);
+      setHitlCommitError(err?.message || 'Failed to undo commit.');
+    } finally {
+      setIsUndoingHitl(false);
+    }
+  };
 
   // Model & Thinking Level Selectors (Default: Pass 0 -> gemini-3.8-flash, Passes 1-3 -> gemini-1.5-pro, Passes 1-3 Thinking -> MEDIUM)
   const [pass0Model, setPass0Model] = useState<string>('gemini-3.8-flash');
@@ -343,6 +451,277 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   useEffect(() => {
     loadInventories();
   }, [loadInventories]);
+
+  const loadArchives = useCallback(async () => {
+    try {
+      const data = await apiService.fetchArchives({
+        customerId: tenant.customerId,
+        databaseId: tenant.databaseId,
+      });
+      setArchives(data);
+    } catch (err) {
+      console.error('[VideoManager] Failed to load archives:', err);
+    }
+  }, [tenant.customerId, tenant.databaseId]);
+
+  useEffect(() => {
+    loadArchives();
+  }, [loadArchives]);
+
+  const getArchiveDraftForVideo = (video: VideoRecord) => {
+    const existing = archiveDraftMap[video.videoId];
+    if (existing) return existing;
+    const vPasses = ensurePasses(passesByVideo[video.videoId] || video.passes);
+    const pass0Data = vPasses.pass0.data || {};
+    return {
+      name:
+        video.unmatchedArchiveName ||
+        video.archiveName ||
+        pass0Data.archiveName ||
+        video.originalName?.replace(/\.[^.]+$/, '') ||
+        '',
+      creatorName: video.archiveCreatorName || pass0Data.creatorName || '',
+      creationDate: video.archiveCreationDate || pass0Data.creationDate || '',
+      showCreateForm: false,
+    };
+  };
+
+  const updateArchiveDraftForVideo = (
+    video: VideoRecord,
+    patch: Partial<{ name: string; creatorName: string; creationDate: string; showCreateForm?: boolean }>
+  ) => {
+    setArchiveDraftMap((prev) => {
+      const base = prev[video.videoId] || getArchiveDraftForVideo(video);
+      return {
+        ...prev,
+        [video.videoId]: {
+          ...base,
+          ...patch,
+        },
+      };
+    });
+  };
+
+  const handleAssociateArchive = async (videoId: string, archiveIdToAssign?: string) => {
+    const archId = archiveIdToAssign || assigningArchiveMap[videoId] || archives[0]?.id;
+    if (!archId) return;
+
+    setIsAssigningArchiveMap((prev) => ({ ...prev, [videoId]: true }));
+    try {
+      const result = await apiService.associateVideoArchive(videoId, archId, {
+        customerId: tenant.customerId,
+        databaseId: tenant.databaseId,
+      });
+      if (result.success) {
+        const canonicalName = result.archiveName || archives.find((a) => a.id === archId)?.name || archId;
+        const canonicalCreator =
+          result.archiveCreatorName ?? archives.find((a) => a.id === archId)?.creatorName ?? null;
+        const canonicalDate =
+          result.archiveCreationDate ?? archives.find((a) => a.id === archId)?.creationDate ?? null;
+
+        setVideos((prev) =>
+          prev.map((v) =>
+            v.videoId === videoId
+              ? {
+                  ...v,
+                  ...(result.video || {}),
+                  archiveId: result.archiveId,
+                  archiveName: canonicalName,
+                  archiveCreatorName: canonicalCreator ?? v.archiveCreatorName,
+                  archiveCreationDate: canonicalDate ?? v.archiveCreationDate,
+                  unmatchedArchiveName: null,
+                  archiveAssociationType: 'MANUAL',
+                }
+              : v
+          )
+        );
+        setPassesByVideo((prev) => {
+          const curPasses = prev[videoId];
+          if (!curPasses?.pass0?.data) return prev;
+          return {
+            ...prev,
+            [videoId]: {
+              ...curPasses,
+              pass0: {
+                ...curPasses.pass0,
+                data: {
+                  ...curPasses.pass0.data,
+                  archiveName: canonicalName,
+                  ...(canonicalCreator ? { creatorName: canonicalCreator } : {}),
+                  ...(canonicalDate ? { creationDate: canonicalDate } : {}),
+                  archiveIntent: 'APPEND',
+                  isAppending: true,
+                },
+              },
+            },
+          };
+        });
+        setAnalysisCache((prev) => {
+          const curAnalysis = prev[videoId];
+          if (!curAnalysis) return prev;
+          return {
+            ...prev,
+            [videoId]: {
+              ...curAnalysis,
+              archiveId: result.archiveId,
+              archiveName: canonicalName,
+              ...(canonicalCreator ? { creatorName: canonicalCreator } : {}),
+              ...(canonicalDate ? { creationDate: canonicalDate } : {}),
+              ...(curAnalysis.workflowClassification
+                ? {
+                    workflowClassification: {
+                      ...curAnalysis.workflowClassification,
+                      archiveName: canonicalName,
+                      ...(canonicalCreator ? { creatorName: canonicalCreator } : {}),
+                      ...(canonicalDate ? { creationDate: canonicalDate } : {}),
+                    },
+                  }
+                : {}),
+              ...(curAnalysis.workloadClassification
+                ? {
+                    workloadClassification: {
+                      ...curAnalysis.workloadClassification,
+                      archiveName: canonicalName,
+                      ...(canonicalCreator ? { creatorName: canonicalCreator } : {}),
+                      ...(canonicalDate ? { creationDate: canonicalDate } : {}),
+                    },
+                  }
+                : {}),
+            } as VideoAnalysisDoc,
+          };
+        });
+        setArchiveDraftMap((prev) => ({
+          ...prev,
+          [videoId]: {
+            name: canonicalName,
+            creatorName: canonicalCreator || prev[videoId]?.creatorName || '',
+            creationDate: canonicalDate || prev[videoId]?.creationDate || '',
+          },
+        }));
+        const targetVideo = videos.find((v) => v.videoId === videoId);
+        if (targetVideo && (selectedVideoId === videoId || activeStreamId === videoId)) {
+          const existingAnalysis = analysisCache[videoId];
+          const syncedAnalysis = existingAnalysis
+            ? ({
+                ...existingAnalysis,
+                archiveId: result.archiveId,
+                archiveName: canonicalName,
+                ...(canonicalCreator ? { creatorName: canonicalCreator } : {}),
+                ...(canonicalDate ? { creationDate: canonicalDate } : {}),
+                ...(existingAnalysis.workflowClassification
+                  ? {
+                      workflowClassification: {
+                        ...existingAnalysis.workflowClassification,
+                        archiveName: canonicalName,
+                      },
+                    }
+                  : {}),
+                ...(existingAnalysis.workloadClassification
+                  ? {
+                      workloadClassification: {
+                        ...existingAnalysis.workloadClassification,
+                        archiveName: canonicalName,
+                      },
+                    }
+                  : {}),
+              } as VideoAnalysisDoc)
+            : undefined;
+          onSelectActiveStream?.(
+            {
+              ...targetVideo,
+              ...(result.video || {}),
+              archiveId: result.archiveId,
+              archiveName: canonicalName,
+              archiveCreatorName: canonicalCreator ?? targetVideo.archiveCreatorName,
+              archiveCreationDate: canonicalDate ?? targetVideo.archiveCreationDate,
+              unmatchedArchiveName: null,
+              archiveAssociationType: 'MANUAL',
+            },
+            syncedAnalysis
+          );
+        }
+        await loadArchives();
+        setStatusBanner(
+          `Successfully associated ${videoId} with archive "${canonicalName}".`
+        );
+      }
+    } catch (err: any) {
+      console.error(`[VideoManager] Failed to associate archive for ${videoId}:`, err);
+      setStatusBanner(`Failed to associate archive: ${err?.message || 'Unknown error'}`);
+    } finally {
+      setIsAssigningArchiveMap((prev) => ({ ...prev, [videoId]: false }));
+    }
+  };
+
+  const handleConfirmCreateArchive = async (video: VideoRecord) => {
+    const draft = getArchiveDraftForVideo(video);
+    const trimmedName = draft.name.trim();
+    if (!trimmedName) {
+      setStatusBanner('Archive name is required to initialize a new archive.');
+      return;
+    }
+
+    setIsAssigningArchiveMap((prev) => ({ ...prev, [video.videoId]: true }));
+    try {
+      const created = await apiService.createArchive(
+        {
+          name: trimmedName,
+          creatorName: draft.creatorName.trim() || null,
+          creationDate: draft.creationDate.trim() || null,
+          videoId: video.videoId,
+        },
+        {
+          customerId: tenant.customerId,
+          databaseId: tenant.databaseId,
+        }
+      );
+
+      setVideos((prev) =>
+        prev.map((v) =>
+          v.videoId === video.videoId
+            ? {
+                ...v,
+                ...(created.video || {}),
+                archiveId: created.id,
+                archiveName: created.name,
+                archiveCreatorName: created.creatorName ?? null,
+                archiveCreationDate: created.creationDate ?? null,
+                unmatchedArchiveName: null,
+                archiveAssociationType: 'MANUAL',
+              }
+            : v
+        )
+      );
+      setPassesByVideo((prev) => {
+        const curPasses = prev[video.videoId];
+        if (!curPasses?.pass0?.data) return prev;
+        return {
+          ...prev,
+          [video.videoId]: {
+            ...curPasses,
+            pass0: {
+              ...curPasses.pass0,
+              data: {
+                ...curPasses.pass0.data,
+                archiveName: created.name,
+                creatorName: created.creatorName ?? curPasses.pass0.data.creatorName ?? null,
+                creationDate: created.creationDate ?? curPasses.pass0.data.creationDate ?? null,
+              },
+            },
+          },
+        };
+      });
+      await loadArchives();
+      setStatusBanner(
+        `Created and confirmed experiment archive "${created.name}" (${created.id}) for video ${video.videoId}.`
+      );
+    } catch (err: any) {
+      console.error(`[VideoManager] Failed to create archive for ${video.videoId}:`, err);
+      setStatusBanner(`Failed to create archive: ${err?.message || 'Unknown error'}`);
+    } finally {
+      setIsAssigningArchiveMap((prev) => ({ ...prev, [video.videoId]: false }));
+    }
+  };
 
   const handleAssignInventory = async (videoId: string, inventoryIdToAssign?: string) => {
     const invId = inventoryIdToAssign || assigningInventoryMap[videoId];
@@ -832,14 +1211,58 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         [`${videoId}_${passKey}`]: true,
       }));
 
+      const latestFromList = videos.find((v) => v.videoId === videoId);
+      const effectiveArchiveId = latestFromList?.archiveId ?? video.archiveId;
+      const effectiveArchiveName = latestFromList?.archiveName ?? video.archiveName;
+      const effectiveArchiveCreator = latestFromList?.archiveCreatorName ?? video.archiveCreatorName;
+      const effectiveArchiveDate = latestFromList?.archiveCreationDate ?? video.archiveCreationDate;
+      const effectiveArchiveAssocType =
+        latestFromList?.archiveAssociationType ?? video.archiveAssociationType;
+
+      if (effectiveArchiveName && updatedPasses.pass0?.data) {
+        updatedPasses.pass0 = {
+          ...updatedPasses.pass0,
+          data: {
+            ...updatedPasses.pass0.data,
+            archiveName: effectiveArchiveName,
+            ...(effectiveArchiveCreator ? { creatorName: effectiveArchiveCreator } : {}),
+            ...(effectiveArchiveDate ? { creationDate: effectiveArchiveDate } : {}),
+          },
+        };
+      }
+
       const updatedVideo: VideoRecord = {
         ...video,
+        ...(latestFromList || {}),
+        ...(effectiveArchiveId !== undefined ? { archiveId: effectiveArchiveId } : {}),
+        ...(effectiveArchiveName !== undefined ? { archiveName: effectiveArchiveName } : {}),
+        ...(effectiveArchiveCreator !== undefined
+          ? { archiveCreatorName: effectiveArchiveCreator }
+          : {}),
+        ...(effectiveArchiveDate !== undefined ? { archiveCreationDate: effectiveArchiveDate } : {}),
+        ...(effectiveArchiveAssocType !== undefined
+          ? { archiveAssociationType: effectiveArchiveAssocType }
+          : {}),
         status: res.status || (passNum === 3 ? 'ANALYSIS_COMPLETE' : video.status),
         geminiFileUri: res.geminiFileUri || video.geminiFileUri,
         passes: updatedPasses,
       };
 
-      setVideos((prev) => prev.map((v) => (v.videoId === videoId ? updatedVideo : v)));
+      setVideos((prev) =>
+        prev.map((v) =>
+          v.videoId === videoId
+            ? {
+                ...updatedVideo,
+                archiveId: v.archiveId ?? updatedVideo.archiveId,
+                archiveName: v.archiveName ?? updatedVideo.archiveName,
+                archiveCreatorName: v.archiveCreatorName ?? updatedVideo.archiveCreatorName,
+                archiveCreationDate: v.archiveCreationDate ?? updatedVideo.archiveCreationDate,
+                archiveAssociationType:
+                  v.archiveAssociationType ?? updatedVideo.archiveAssociationType,
+              }
+            : v
+        )
+      );
       if (latestUploadedVideo?.videoId === videoId) {
         setLatestUploadedVideo(updatedVideo);
       }
@@ -858,9 +1281,10 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         onSelectActiveStream?.(updatedVideo, analysisCache[videoId]);
       }
 
-      // If Pass 0 completed, refresh video list from Firestore to pull automatic inventory association
+      // If Pass 0 completed, refresh video list from Firestore to pull automatic inventory/archive association
       if (passNum === 0) {
         await fetchVideos(false);
+        await loadArchives();
       }
 
       setStatusBanner(
@@ -897,8 +1321,9 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   };
 
   /**
-   * Master "Run All Passes" handler: executes Pass 0 -> Pass 1 -> Pass 2 -> Pass 3 sequentially
-   * so each pass card shows real-time spinners and updates its JSON output as it completes.
+   * Master "Run All Passes" handler: executes Pass 1 -> Pass 2 -> Pass 3 sequentially
+   * (Pass 0 is executed automatically upon completion of the uploading & transcoding stage).
+   * Each pass card shows real-time spinners and updates its JSON output as it completes.
    */
   const handleRunAllPasses = async (video: VideoRecord) => {
     const { videoId } = video;
@@ -913,13 +1338,12 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     }
 
     try {
-      await handleRunSinglePass(video, 0);
       await handleRunSinglePass(video, 1);
       await handleRunSinglePass(video, 2);
       const res3 = await handleRunSinglePass(video, 3);
 
       setStatusBanner(
-        `All 4 AI Passes (Pass 0 – Pass 3) completed for ${video.originalName} (${videoId}) and persisted to Firestore video_analyses/${videoId}.`
+        `AI Passes (Pass 1 – Pass 3) completed for ${video.originalName} (${videoId}) and persisted to Firestore video_analyses/${videoId}.`
       );
 
       if (res3?.analysis) {
@@ -943,26 +1367,189 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
    * Inspect Results / Review in Sign-Off Tab handler.
    */
   const handleInspectResults = (video: VideoRecord, forceHitlTab: boolean = false) => {
-    const cachedAnalysis = analysisCache[video.videoId];
+    const rawCached = analysisCache[video.videoId];
+    const passes = (passesByVideo[video.videoId] || video.passes) as Record<string, any> | undefined;
+    const pass0Data = passes?.pass0?.data;
+    const rawPass1 = passes?.pass1?.data;
+    const pass1Actions = Array.isArray(rawPass1)
+      ? rawPass1
+      : Array.isArray(rawPass1?.actions)
+      ? rawPass1.actions
+      : [];
+    const rawPass2 = passes?.pass2?.data;
+    const pass2Events = Array.isArray(rawPass2)
+      ? rawPass2
+      : Array.isArray(rawPass2?.events)
+      ? rawPass2.events
+      : [];
+    const rawPass3 = passes?.pass3?.data;
+    const pass3Refinements = Array.isArray(rawPass3)
+      ? rawPass3
+      : Array.isArray(rawPass3?.refinements)
+      ? rawPass3.refinements
+      : [];
+    const pass3Reagents = Array.isArray(passes?.pass3?.reagents)
+      ? passes.pass3.reagents
+      : Array.isArray(rawPass3?.reagents)
+      ? rawPass3.reagents
+      : undefined;
+    const pass3WorkSteps = Array.isArray(passes?.pass3?.workSteps)
+      ? passes.pass3.workSteps
+      : Array.isArray(rawPass3?.workSteps)
+      ? rawPass3.workSteps
+      : undefined;
+    const pass3Transcriptions = Array.isArray(passes?.pass3?.labelTranscriptions)
+      ? passes.pass3.labelTranscriptions
+      : Array.isArray(rawPass3?.labelTranscriptions)
+      ? rawPass3.labelTranscriptions
+      : undefined;
+    const currentArchiveEdits = hitlArchiveEdits[video.videoId] || {};
+
+    const detectedWorkflow =
+      rawCached?.workflowClassification?.workflowType ||
+      rawCached?.workloadClassification?.workflowType ||
+      pass0Data?.workflowType;
+    const isArchiveWorkflow =
+      detectedWorkflow === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+      Boolean(video.archiveId) ||
+      video.originalName.toLowerCase().includes('archive') ||
+      video.videoId.toLowerCase().includes('archive') ||
+      pass1Actions.some((a: any) => {
+        const cls = String(a?.actionType || a?.actionClass || '').toUpperCase();
+        return cls.includes('MIX') || cls.includes('SEED');
+      });
+
+    const candidateArchiveName =
+      video.archiveName ||
+      (rawCached as any)?.archiveName ||
+      pass0Data?.archiveName;
+    const matchedArchive = isArchiveWorkflow
+      ? archives.find(
+          (a) =>
+            (video.archiveId && a.id === video.archiveId) ||
+            (Array.isArray(a.videoIds) && a.videoIds.includes(video.videoId)) ||
+            (candidateArchiveName &&
+              a.name &&
+              a.name.trim().toLowerCase() === String(candidateArchiveName).trim().toLowerCase())
+        )
+      : undefined;
+    const assignedArchiveId = assigningArchiveMap[video.videoId];
+    const resolvedArchiveId =
+      video.archiveId ||
+      (assignedArchiveId && assignedArchiveId !== '__NEW__' ? assignedArchiveId : undefined) ||
+      matchedArchive?.id ||
+      (rawCached as any)?.archiveId ||
+      (isArchiveWorkflow ? archives[0]?.id : undefined);
+    const resolvedArchiveName =
+      matchedArchive?.name ||
+      video.archiveName ||
+      candidateArchiveName;
+    const resolvedCreatorName =
+      matchedArchive?.creatorName ||
+      video.archiveCreatorName ||
+      (rawCached as any)?.creatorName ||
+      pass0Data?.creatorName;
+    const resolvedCreationDate =
+      matchedArchive?.creationDate ||
+      video.archiveCreationDate ||
+      (rawCached as any)?.creationDate ||
+      pass0Data?.creationDate;
+
+    const mergedReagents =
+      currentArchiveEdits.reagents ??
+      (Array.isArray(rawCached?.reagents) && rawCached.reagents.length > 0
+        ? rawCached.reagents
+        : pass3Reagents);
+    const mergedWorkSteps =
+      currentArchiveEdits.workSteps ??
+      (Array.isArray(rawCached?.workSteps) && rawCached.workSteps.length > 0
+        ? rawCached.workSteps
+        : pass3WorkSteps);
+    const mergedTranscriptions =
+      currentArchiveEdits.labelTranscriptions ??
+      (Array.isArray((rawCached as any)?.labelTranscriptions) &&
+      (rawCached as any).labelTranscriptions.length > 0
+        ? (rawCached as any).labelTranscriptions
+        : pass3Transcriptions);
+
+    const hasPassData =
+      Boolean(rawCached) ||
+      Boolean(pass0Data) ||
+      pass1Actions.length > 0 ||
+      pass2Events.length > 0 ||
+      pass3Refinements.length > 0 ||
+      Boolean(mergedReagents && mergedReagents.length > 0) ||
+      Boolean(mergedWorkSteps && mergedWorkSteps.length > 0);
+
+    const baseClassification =
+      rawCached?.workflowClassification ||
+      rawCached?.workloadClassification ||
+      pass0Data;
+    const syncedClassification = baseClassification
+      ? {
+          ...baseClassification,
+          ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
+          ...(resolvedCreatorName ? { creatorName: resolvedCreatorName } : {}),
+          ...(resolvedCreationDate ? { creationDate: resolvedCreationDate } : {}),
+        }
+      : undefined;
+
+    const cachedAnalysis: VideoAnalysisDoc | undefined = hasPassData
+      ? ({
+          videoId: video.videoId,
+          ...rawCached,
+          ...(syncedClassification
+            ? {
+                workflowClassification: syncedClassification,
+                workloadClassification: syncedClassification,
+              }
+            : {}),
+          actions:
+            Array.isArray(rawCached?.actions) && rawCached.actions.length > 0
+              ? rawCached.actions
+              : pass1Actions,
+          events:
+            Array.isArray(rawCached?.events) && rawCached.events.length > 0
+              ? rawCached.events
+              : pass2Events,
+          refinements:
+            Array.isArray(rawCached?.refinements) && rawCached.refinements.length > 0
+              ? rawCached.refinements
+              : pass3Refinements,
+          ...(mergedReagents ? { reagents: mergedReagents } : {}),
+          ...(mergedWorkSteps ? { workSteps: mergedWorkSteps } : {}),
+          ...(mergedTranscriptions ? { labelTranscriptions: mergedTranscriptions } : {}),
+          ...(resolvedArchiveId ? { archiveId: resolvedArchiveId } : {}),
+          ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
+          ...(resolvedCreatorName ? { creatorName: resolvedCreatorName } : {}),
+          ...(resolvedCreationDate ? { creationDate: resolvedCreationDate } : {}),
+          ...(video.inventoryId ? { inventoryId: video.inventoryId } : {}),
+          isSignedOff: Boolean(
+            (video as any).isSignedOff ||
+              rawCached?.isSignedOff ||
+              passes?.hitl?.status === 'COMPLETED'
+          ),
+        } as VideoAnalysisDoc)
+      : undefined;
+
+    if (cachedAnalysis) {
+      setAnalysisCache((prev) => ({ ...prev, [video.videoId]: cachedAnalysis }));
+    }
     onSelectActiveStream?.(video, cachedAnalysis);
 
     if (forceHitlTab) {
+      if (isArchiveWorkflow && resolvedArchiveId) {
+        onNavigateToArchive?.(resolvedArchiveId, video.videoId);
+      }
       onSelectVideoForReview(video.videoId, 'hitl', cachedAnalysis);
       return;
     }
 
-    const passes = passesByVideo[video.videoId] || video.passes;
-    const detectedWorkflow =
-      cachedAnalysis?.workflowClassification?.workflowType ||
-      cachedAnalysis?.workloadClassification?.workflowType ||
-      passes?.pass0?.data?.workflowType;
-    const targetTab: 'inventory' | 'archive' =
-      detectedWorkflow === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
-      video.originalName.toLowerCase().includes('archive') ||
-      video.videoId.toLowerCase().includes('archive')
-        ? 'archive'
-        : 'inventory';
+    const targetTab: 'inventory' | 'archive' = isArchiveWorkflow ? 'archive' : 'inventory';
 
+    if (targetTab === 'archive' && resolvedArchiveId) {
+      onNavigateToArchive?.(resolvedArchiveId, video.videoId);
+    }
     onSelectVideoForReview(video.videoId, targetTab, cachedAnalysis);
   };
 
@@ -1173,6 +1760,316 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     }
 
     return null;
+  };
+
+  const renderArchiveBadge = (video: VideoRecord) => {
+    const vPasses = ensurePasses(passesByVideo[video.videoId] || video.passes);
+    const pass0Data = vPasses.pass0.data;
+    const isArchiveWorkflow =
+      pass0Data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+      Boolean(video.archiveId) ||
+      Boolean(video.archiveAssociationType);
+
+    if (!isArchiveWorkflow) {
+      return null;
+    }
+
+    // 1. Matched / Confirmed / Associated Archive
+    if (video.archiveId) {
+      const matchTypeLabel =
+        video.archiveAssociationType === 'AUTOMATIC' ? 'High-Confidence Auto-Match' : 'Confirmed';
+      const creatorLabel = video.archiveCreatorName || pass0Data?.creatorName;
+      const dateLabel = video.archiveCreationDate || pass0Data?.creationDate;
+
+      return (
+        <div
+          className="flex items-center gap-1.5 flex-wrap mt-1.5"
+          onClick={(e) => e.stopPropagation()}
+          data-testid={`archive-associated-badge-${video.videoId}`}
+        >
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-950/80 text-emerald-300 border border-emerald-600/60 font-mono">
+            <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
+            <span>
+              Linked to Archive: {video.archiveName || video.archiveId} ({matchTypeLabel})
+            </span>
+          </span>
+          {creatorLabel && (
+            <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-slate-900 text-slate-300 border border-slate-700">
+              Creator: {creatorLabel}
+            </span>
+          )}
+          {dateLabel && (
+            <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-slate-900 text-slate-300 border border-slate-700">
+              Date: {dateLabel}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              const rawCached = analysisCache[video.videoId];
+              const enrichedCached = rawCached
+                ? ({
+                    ...rawCached,
+                    ...(video.archiveId ? { archiveId: video.archiveId } : {}),
+                    ...(video.archiveName ? { archiveName: video.archiveName } : {}),
+                    ...(video.archiveCreatorName ? { creatorName: video.archiveCreatorName } : {}),
+                    ...(video.archiveCreationDate ? { creationDate: video.archiveCreationDate } : {}),
+                  } as VideoAnalysisDoc)
+                : undefined;
+              onSelectActiveStream?.(video, enrichedCached);
+              if (video.archiveId) {
+                onNavigateToArchive?.(video.archiveId, video.videoId);
+              }
+              onSelectVideoForReview(video.videoId, 'archive', enrichedCached);
+            }}
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-indigo-950 hover:bg-indigo-900 text-indigo-300 border border-indigo-800 transition-colors"
+            title="Open in Experiment Archive"
+          >
+            <span>Open in Experiment Archive</span>
+            <ExternalLink className="w-2.5 h-2.5" />
+          </button>
+        </div>
+      );
+    }
+
+    const intent: 'CREATE' | 'APPEND' =
+      video.archiveIntent ||
+      pass0Data?.archiveIntent ||
+      (pass0Data?.isAppending === true
+        ? 'APPEND'
+        : video.archiveAssociationType === 'UNMATCHED'
+        ? 'APPEND'
+        : 'CREATE');
+
+    const draft = getArchiveDraftForVideo(video);
+    const isBusy = Boolean(isAssigningArchiveMap[video.videoId]);
+    const selectedArch = assigningArchiveMap[video.videoId] || (archives[0]?.id ?? '');
+
+    // 2. Appending to existing archive, but no high-confidence match found in database
+    if (video.archiveAssociationType === 'UNMATCHED' || intent === 'APPEND') {
+      const unmatchedName =
+        video.unmatchedArchiveName || pass0Data?.archiveName || 'Unspecified Archive';
+
+      return (
+        <div
+          className="mt-2 p-2.5 rounded-lg bg-amber-950/30 border border-amber-700/60 space-y-2"
+          onClick={(e) => e.stopPropagation()}
+          data-testid={`archive-unmatched-prompt-${video.videoId}`}
+        >
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-amber-300 font-mono">
+              <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <span>
+                Append target &ldquo;{unmatchedName}&rdquo; has no high-confidence match. Associate with an existing archive or create a new one:
+              </span>
+            </span>
+          </div>
+
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <select
+              aria-label={`Select existing archive for ${video.videoId}`}
+              value={selectedArch}
+              onChange={(e) =>
+                setAssigningArchiveMap((prev) => ({
+                  ...prev,
+                  [video.videoId]: e.target.value,
+                }))
+              }
+              className="bg-slate-950 border border-slate-700 text-slate-200 text-[11px] rounded px-2 py-1 font-mono focus:border-cyan-500 focus:outline-none"
+            >
+              <option value="" disabled>
+                Select existing archive...
+              </option>
+              {archives.map((arch) => (
+                <option key={arch.id} value={arch.id}>
+                  {arch.name} ({arch.id})
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              disabled={!selectedArch || isBusy}
+              onClick={() => handleAssociateArchive(video.videoId, selectedArch)}
+              className="px-2.5 py-1 rounded text-[11px] font-semibold bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50 transition-colors flex items-center gap-1"
+            >
+              {isBusy && <Loader2 className="w-3 h-3 animate-spin" />}
+              <span>Associate Existing Archive</span>
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                updateArchiveDraftForVideo(video, { showCreateForm: !draft.showCreateForm })
+              }
+              className="px-2.5 py-1 rounded text-[11px] font-semibold bg-indigo-950 hover:bg-indigo-900 text-indigo-200 border border-indigo-700/70 transition-colors"
+            >
+              {draft.showCreateForm ? 'Hide New Archive Form' : 'Create New Archive Instead'}
+            </button>
+          </div>
+
+          {draft.showCreateForm && (
+            <div className="pt-2 border-t border-amber-800/40 grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <div>
+                <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                  Archive Name (Required) *
+                </label>
+                <input
+                  type="text"
+                  value={draft.name}
+                  onChange={(e) => updateArchiveDraftForVideo(video, { name: e.target.value })}
+                  placeholder="Archive Name"
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-100 focus:border-cyan-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                  Creator Name (Optional)
+                </label>
+                <input
+                  type="text"
+                  value={draft.creatorName}
+                  onChange={(e) =>
+                    updateArchiveDraftForVideo(video, { creatorName: e.target.value })
+                  }
+                  placeholder="e.g., Dr. Jane Smith"
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-100 focus:border-cyan-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                  Creation Date (Optional)
+                </label>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={draft.creationDate}
+                    onChange={(e) =>
+                      updateArchiveDraftForVideo(video, { creationDate: e.target.value })
+                    }
+                    placeholder="YYYY-MM-DD"
+                    className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-100 focus:border-cyan-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    disabled={!draft.name.trim() || isBusy}
+                    onClick={() => handleConfirmCreateArchive(video)}
+                    className="shrink-0 px-2.5 py-1 rounded text-[11px] font-semibold bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50 transition-colors flex items-center gap-1"
+                  >
+                    {isBusy && <Loader2 className="w-3 h-3 animate-spin" />}
+                    <span>Create &amp; Associate</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // 3. Creating a new archive (auto-populated from transcribed audio, awaiting user confirmation)
+    return (
+      <div
+        className="mt-2 p-2.5 rounded-lg bg-indigo-950/40 border border-indigo-700/60 space-y-2"
+        onClick={(e) => e.stopPropagation()}
+        data-testid={`archive-create-confirmation-${video.videoId}`}
+      >
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-indigo-200 font-mono">
+            <Sparkles className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+            <span>
+              New Experiment Archive detected from audio transcript — Confirm archive creation:
+            </span>
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <div>
+            <label className="block text-[10px] font-mono text-slate-300 mb-0.5">
+              Archive Name (Required) *
+            </label>
+            <input
+              type="text"
+              aria-label={`Archive Name for ${video.videoId}`}
+              value={draft.name}
+              onChange={(e) => updateArchiveDraftForVideo(video, { name: e.target.value })}
+              placeholder="Archive Name"
+              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-100 focus:border-indigo-400 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="block text-[10px] font-mono text-slate-300 mb-0.5">
+              Creator Name (Optional)
+            </label>
+            <input
+              type="text"
+              aria-label={`Creator Name for ${video.videoId}`}
+              value={draft.creatorName}
+              onChange={(e) => updateArchiveDraftForVideo(video, { creatorName: e.target.value })}
+              placeholder="Not specified in audio"
+              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-100 focus:border-indigo-400 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="block text-[10px] font-mono text-slate-300 mb-0.5">
+              Creation Date (Optional)
+            </label>
+            <input
+              type="text"
+              aria-label={`Creation Date for ${video.videoId}`}
+              value={draft.creationDate}
+              onChange={(e) => updateArchiveDraftForVideo(video, { creationDate: e.target.value })}
+              placeholder="Not specified in audio"
+              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-100 focus:border-indigo-400 focus:outline-none"
+            />
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between gap-2 flex-wrap pt-1">
+          <button
+            type="button"
+            disabled={!draft.name.trim() || isBusy}
+            onClick={() => handleConfirmCreateArchive(video)}
+            className="px-3 py-1 rounded text-[11px] font-semibold bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50 transition-colors flex items-center gap-1.5"
+          >
+            {isBusy ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <CheckCircle2 className="w-3.5 h-3.5" />
+            )}
+            <span>Confirm &amp; Create Archive</span>
+          </button>
+
+          {archives.length > 0 && (
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] font-mono text-slate-400">Or link existing:</span>
+              <select
+                value={selectedArch}
+                onChange={(e) =>
+                  setAssigningArchiveMap((prev) => ({
+                    ...prev,
+                    [video.videoId]: e.target.value,
+                  }))
+                }
+                className="bg-slate-950 border border-slate-700 text-slate-200 text-[11px] rounded px-2 py-0.5 font-mono focus:border-cyan-500 focus:outline-none"
+              >
+                {archives.map((arch) => (
+                  <option key={arch.id} value={arch.id}>
+                    {arch.name}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                disabled={!selectedArch || isBusy}
+                onClick={() => handleAssociateArchive(video.videoId, selectedArch)}
+                className="px-2 py-0.5 rounded text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600 disabled:opacity-50 transition-colors"
+              >
+                Associate
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
   };
 
   const isUploadingOrTranscoding =
@@ -1509,6 +2406,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                               />
                             </div>
                             {renderInventoryBadge(video)}
+                            {renderArchiveBadge(video)}
                           </div>
                         </div>
                       </td>
@@ -1773,6 +2671,24 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                         </p>
                       )}
                       {step.passKey === 'pass0' && renderInventoryBadge(selectedVideo)}
+                      {step.passKey === 'pass0' && renderArchiveBadge(selectedVideo)}
+                      {step.passKey === 'pass0' && pass0Data?.identificationEvent && (
+                        <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs font-mono bg-slate-900/90 border border-slate-800 rounded-lg px-2.5 py-1.5">
+                          <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-indigo-950/80 text-indigo-300 border border-indigo-700/60">
+                            {pass0Data.identificationEvent.eventClass}
+                          </span>
+                          <span className="text-[11px] text-cyan-300 flex items-center gap-1">
+                            <Clock className="w-3 h-3" />
+                            {Number(pass0Data.identificationEvent.startTime || 0).toFixed(1)}s–
+                            {Number(pass0Data.identificationEvent.endTime || 0).toFixed(1)}s
+                          </span>
+                          {pass0Data.identificationEvent.description && (
+                            <span className="text-[11px] text-slate-300 font-sans">
+                              {pass0Data.identificationEvent.description}
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-2">
@@ -2004,6 +2920,11 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             : [];
                           const totalDetected = pass1Data?.totalActionsDetected ?? rawActions.length;
                           const workflowCtx = pass1Data?.workflowContext;
+                          const isArchiveWorkflow =
+                            selectedPasses.pass0?.data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                            selectedVideo.passes?.pass0?.data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                            Boolean(selectedVideo.archiveId) ||
+                            Boolean(selectedVideo.archiveAssociationType);
 
                           if (rawActions.length === 0 && pass1Events.length === 0) {
                             return (
@@ -2055,12 +2976,19 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                   }`;
                                   const durationSec = Math.max(0, endSec - startSec).toFixed(1);
                                   const actType = actionItem.actionType || actionItem.actionClass || 'ACTION';
+                                  const isArchiveAct =
+                                    actType.toUpperCase().includes('SEED') ||
+                                    actType.toUpperCase().includes('MIX') ||
+                                    Boolean(actionItem.seedReagentsData) ||
+                                    Boolean(actionItem.mixReagentsData);
                                   const targetCoord =
-                                    actionItem.targetCoordinate ||
-                                    actionItem.targetLocation?.coordinate ||
-                                    (actionItem.boxRowId
-                                      ? `${actionItem.boxRowId}${actionItem.boxColId || ''}`
-                                      : undefined);
+                                    !isArchiveAct && !isArchiveWorkflow
+                                      ? actionItem.targetCoordinate ||
+                                        actionItem.targetLocation?.coordinate ||
+                                        (actionItem.boxRowId
+                                          ? `${actionItem.boxRowId}${actionItem.boxColId || ''}`
+                                          : undefined)
+                                      : undefined;
                                   const confidence = Math.round(
                                     (typeof actionItem.confidenceScore === 'number'
                                       ? actionItem.confidenceScore
@@ -2141,9 +3069,9 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                         <div className="text-[10px] font-mono bg-emerald-950/35 border border-emerald-800/50 rounded-lg p-2 space-y-1">
                                           <div className="text-emerald-300 font-semibold flex items-center justify-between">
                                             <span>Pass 3 Appended Action JSON ({`action_${actId}.json`})</span>
-                                            {(actionItem.boxWellLocation?.coordinate || targetCoord) && (
+                                            {(actionItem.boxWellLocation?.coordinate || targetCoord) && !isArchiveAct && !isArchiveWorkflow && (
                                               <span className="px-1.5 py-0.5 rounded bg-emerald-900/60 border border-emerald-600/50 text-emerald-200">
-                                                Well {actionItem.boxWellLocation?.coordinate || targetCoord} (Origin: Top-Right Black A1)
+                                                Well {actionItem.boxWellLocation?.coordinate || targetCoord} (Origin: Top-Left Black A1)
                                               </span>
                                             )}
                                           </div>
@@ -2182,15 +3110,114 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                         </div>
                                       )}
 
+                                      {actionItem.mixReagentsData && (
+                                        <div className="text-[10px] font-mono bg-indigo-950/35 border border-indigo-800/50 rounded-lg p-2 space-y-1">
+                                          <div className="text-indigo-300 font-semibold">
+                                            Action: Mix Reagents ({`action_${actId}.json`})
+                                          </div>
+                                          <div className="grid grid-cols-2 gap-1 text-slate-300">
+                                            <span>
+                                              First Reagent:{' '}
+                                              <strong className="text-white">
+                                                {actionItem.mixReagentsData.firstReagentName || 'N/A'}
+                                              </strong>
+                                            </span>
+                                            <span>
+                                              First Amount:{' '}
+                                              <strong className="text-indigo-200">
+                                                {actionItem.mixReagentsData.firstReagentAmount || 'N/A'}
+                                              </strong>
+                                            </span>
+                                            <span>
+                                              Second Reagent:{' '}
+                                              <strong className="text-white">
+                                                {actionItem.mixReagentsData.secondReagentName || 'N/A'}
+                                              </strong>
+                                            </span>
+                                            <span>
+                                              Second Amount:{' '}
+                                              <strong className="text-indigo-200">
+                                                {actionItem.mixReagentsData.secondReagentAmount || 'N/A'}
+                                              </strong>
+                                            </span>
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {actionItem.seedReagentsData && (
+                                        <div className="text-[10px] font-mono bg-emerald-950/35 border border-emerald-800/50 rounded-lg p-2 space-y-1">
+                                          <div className="text-emerald-300 font-semibold flex items-center justify-between">
+                                            <span>Action: Seed Reagents ({`action_${actId}.json`})</span>
+                                            <span
+                                              className={`px-1.5 py-0.5 rounded border ${
+                                                actionItem.seedReagentsData.isSeedingCountCorrect !== false
+                                                  ? 'bg-emerald-900/60 border-emerald-600/50 text-emerald-200'
+                                                  : 'bg-amber-900/60 border-amber-600/50 text-amber-200'
+                                              }`}
+                                            >
+                                              Seeding Events: {actionItem.seedReagentsData.seedingEventsCount ?? 0}
+                                              {actionItem.seedReagentsData.expectedSeedingEventsCount !== undefined
+                                                ? ` / ${actionItem.seedReagentsData.expectedSeedingEventsCount}`
+                                                : ''}
+                                            </span>
+                                          </div>
+                                          <div className="grid grid-cols-2 gap-1 text-slate-300">
+                                            <span>
+                                              Plate:{' '}
+                                              <strong className="text-white">
+                                                {actionItem.seedReagentsData.plateType || 'N/A'}
+                                              </strong>
+                                            </span>
+                                            <span>
+                                              Pipette:{' '}
+                                              <strong className="text-white">
+                                                {actionItem.seedReagentsData.pipetteType || 'N/A'}
+                                              </strong>
+                                            </span>
+                                            <span>
+                                              Cells:{' '}
+                                              <strong className="text-white">
+                                                {actionItem.seedReagentsData.cellsSeeded || 'N/A'}
+                                              </strong>
+                                            </span>
+                                            <span>
+                                              Cells / Well:{' '}
+                                              <strong className="text-emerald-200">
+                                                {actionItem.seedReagentsData.cellsPerWell || 'N/A'}
+                                              </strong>
+                                            </span>
+                                          </div>
+                                          {Array.isArray(actionItem.seedReagentsData.seededColumns) &&
+                                            actionItem.seedReagentsData.seededColumns.length > 0 && (
+                                              <div className="text-slate-300 pt-0.5">
+                                                Seeded Columns:{' '}
+                                                <strong className="text-cyan-300">
+                                                  {actionItem.seedReagentsData.seededColumns.join(', ')}
+                                                </strong>{' '}
+                                                (1–12, Left to Right)
+                                              </div>
+                                            )}
+                                        </div>
+                                      )}
+
                                       {/* Bottom Row: Metadata Chips + Seek Button */}
                                       <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-800/60 text-xs">
                                         <div className="flex flex-wrap items-center gap-2">
-                                          {targetCoord && (
+                                          {targetCoord && !isArchiveAct && !isArchiveWorkflow && (
                                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-mono bg-slate-950 text-indigo-300 border border-slate-800">
                                               <MapPin className="w-3 h-3 text-indigo-400" />
                                               <span>Target: {targetCoord}</span>
                                             </span>
                                           )}
+                                          {actionItem.seedReagentsData &&
+                                            Array.isArray(actionItem.seedReagentsData.seededColumns) &&
+                                            actionItem.seedReagentsData.seededColumns.length > 0 && (
+                                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-mono bg-slate-950 text-cyan-300 border border-slate-800">
+                                                <span>
+                                                  Cols {actionItem.seedReagentsData.seededColumns.join(', ')} (1–12)
+                                                </span>
+                                              </span>
+                                            )}
                                           <span
                                             className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-mono border ${
                                               confidence >= 90
@@ -2235,7 +3262,9 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                 <div className="rounded-xl bg-slate-950/90 border border-slate-800 p-3.5 space-y-2.5">
                                   <div className="flex items-center justify-between text-xs font-mono">
                                     <span className="font-semibold text-cyan-300">
-                                      Pass 1 Label Presentation Events & Action Associations (1 fps)
+                                      {isArchiveWorkflow
+                                        ? 'Pass 1 Reagent Label Presentation Events & Action Associations (1 fps)'
+                                        : 'Pass 1 Label Presentation Events & Action Associations (1 fps)'}
                                     </span>
                                     <span className="text-[11px] text-slate-400">
                                       Best frames extracted at 4 fps in Pass 2
@@ -2267,9 +3296,12 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                   : 'bg-emerald-950/80 text-emerald-300 border-emerald-700/60'
                                               }`}
                                             >
-                                              {isBoxEvt
-                                                ? 'BOX_LABEL_PRESENTATION'
-                                                : 'VIAL_LABEL_PRESENTATION'}
+                                              {evt.eventClass ||
+                                                (isBoxEvt
+                                                  ? 'BOX_LABEL_PRESENTATION'
+                                                  : isArchiveWorkflow
+                                                  ? 'REAGENT_LABEL_PRESENTATION_EVENT'
+                                                  : 'VIAL_LABEL_PRESENTATION')}
                                             </span>
                                             <button
                                               type="button"
@@ -2297,14 +3329,20 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                             <span className="text-slate-400">
                                               Associated Actions ({assocIds.length}):
                                             </span>
-                                            {assocIds.map((aid) => (
-                                              <span
-                                                key={aid}
-                                                className="px-1.5 py-0.5 rounded bg-indigo-950/70 text-indigo-200 border border-indigo-700/50"
-                                              >
-                                                {aid}
+                                            {assocIds.length > 0 ? (
+                                              assocIds.map((aid) => (
+                                                <span
+                                                  key={aid}
+                                                  className="px-1.5 py-0.5 rounded bg-indigo-950/70 text-indigo-200 border border-indigo-700/50"
+                                                >
+                                                  {aid}
+                                                </span>
+                                              ))
+                                            ) : (
+                                              <span className="text-slate-500 italic">
+                                                None (standalone event)
                                               </span>
-                                            ))}
+                                            )}
                                           </div>
                                         </div>
                                       );
@@ -2318,11 +3356,29 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                       ) : step.passKey === 'pass2' && hasJsonData && !showRawJsonMap[drawerKey] ? (
                         (() => {
                           const pass2Data = passState.data;
-                          const rawEvents: any[] = Array.isArray(pass2Data)
+                          const isArchiveWorkflow =
+                            selectedPasses.pass0?.data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                            selectedVideo.passes?.pass0?.data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                            Boolean(selectedVideo.archiveId) ||
+                            Boolean(selectedVideo.archiveAssociationType);
+                          const unfilteredEvents: any[] = Array.isArray(pass2Data)
                             ? pass2Data
                             : Array.isArray(pass2Data?.events)
                             ? pass2Data.events
                             : [];
+                          const rawEvents: any[] = isArchiveWorkflow
+                            ? unfilteredEvents.filter((evt: any) => {
+                                const cls = String(evt?.eventClass || evt?.actionType || '').toUpperCase();
+                                return (
+                                  (cls.includes('REAGENT_LABEL') ||
+                                    cls.includes('SEEDING') ||
+                                    cls.includes('WELL_SEEDING')) &&
+                                  !cls.includes('AUDIO_UTTERANCE') &&
+                                  !cls.includes('STATEMENT_EVENT') &&
+                                  evt?.eventTrack !== 'audio'
+                                );
+                              })
+                            : unfilteredEvents;
                           const pass1Raw = selectedPasses.pass1?.data;
                           const pass1Actions: any[] = Array.isArray(pass1Raw)
                             ? pass1Raw
@@ -2346,7 +3402,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                               <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono px-1">
                                 <span className="text-purple-300 font-semibold flex items-center gap-1.5">
                                   <Sparkles className="w-3.5 h-3.5" />
-                                  Detected Presentation Events: {rawEvents.length} (Box Labels &amp; Vial Labels)
+                                  Detected Presentation Events: {rawEvents.length} {isArchiveWorkflow ? '(Reagent Labels)' : '(Box Labels & Vial Labels)'}
                                 </span>
                                 <span className="px-2 py-0.5 text-[11px] rounded bg-cyan-950/60 text-cyan-300 border border-cyan-700/50">
                                   4 FPS Action Boundary Refinement Window: [Pass1 Start - 1s, Pass1 End + 1s]
@@ -2362,7 +3418,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                 <div className="space-y-3">
                                   {rawEvents.map((evt: any, idx: number) => {
                                     const evtId = evt.eventId || `evt_${idx + 1}`;
-                                    const evtClass = String(evt.eventClass || 'VIAL_LABEL_PRESENTATION');
+                                    const defaultEvtClass = isArchiveWorkflow ? 'REAGENT_LABEL_PRESENTATION_EVENT' : 'VIAL_LABEL_PRESENTATION';
+                                    const evtClass = String(evt.eventClass || defaultEvtClass);
                                     const isBoxLabel = evtClass.toUpperCase().includes('BOX_LABEL');
                                     const startSec = Number(evt.startTime || 0);
                                     const endSec = Number(evt.endTime || startSec);
@@ -2399,11 +3456,38 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               className={`text-[11px] font-mono px-2.5 py-0.5 rounded border font-semibold ${
                                                 isBoxLabel
                                                   ? 'bg-amber-950/80 text-amber-300 border-amber-700/80'
+                                                  : evtClass.toUpperCase().includes('REAGENT_LABEL')
+                                                  ? 'bg-cyan-950/80 text-cyan-300 border-cyan-700/80'
+                                                  : evtClass.toUpperCase().includes('MIXING') ||
+                                                    evtClass.toUpperCase().includes('SEEDING')
+                                                  ? 'bg-emerald-950/80 text-emerald-300 border-emerald-700/80'
                                                   : 'bg-purple-950/80 text-purple-300 border-purple-700/80'
                                               }`}
                                             >
-                                              {isBoxLabel ? '📦 BOX LABEL PRESENTATION' : '🧪 VIAL LABEL PRESENTATION'}
+                                              {isBoxLabel
+                                                ? '📦 BOX LABEL PRESENTATION'
+                                                : evtClass.toUpperCase().includes('REAGENT_LABEL')
+                                                ? '🧪 REAGENT LABEL PRESENTATION'
+                                                : evtClass.toUpperCase().includes('MIXING_AMOUNT')
+                                                ? '🎙 MIXING AMOUNT STATEMENT'
+                                                : evtClass.toUpperCase().includes('SEEDING_PARAMETER')
+                                                ? '🎙 SEEDING PARAMETER STATEMENT'
+                                                : evtClass.toUpperCase().includes('WELL_SEEDING') ||
+                                                  evtClass.toUpperCase().includes('SEEDING')
+                                                ? '💧 WELL SEEDING EVENT'
+                                                : isArchiveWorkflow
+                                                ? '🧪 REAGENT LABEL PRESENTATION'
+                                                : '🧪 VIAL LABEL PRESENTATION'}
                                             </span>
+                                            {(evt.seededColumn != null ||
+                                              evt.metadata?.seededColumn != null ||
+                                              evt.targetLocation) && (
+                                              <span className="text-xs font-mono text-emerald-300 bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-800/60 font-semibold">
+                                                {evt.seededColumn != null || evt.metadata?.seededColumn != null
+                                                  ? `Column ${evt.seededColumn ?? evt.metadata?.seededColumn} (1–12, Left to Right)`
+                                                  : `Well ${evt.targetLocation}`}
+                                              </span>
+                                            )}
                                             <span className="text-xs font-mono text-cyan-300 bg-cyan-950/60 px-2 py-0.5 rounded border border-cyan-800/60">
                                               {startSec.toFixed(2)}s – {endSec.toFixed(2)}s
                                             </span>
@@ -2643,6 +3727,19 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             : Array.isArray(cachedDoc?.refinements)
                             ? cachedDoc.refinements
                             : [];
+                          const pass2EventsList: any[] = Array.isArray(selectedPasses.pass2?.data)
+                            ? selectedPasses.pass2.data
+                            : Array.isArray((selectedPasses.pass2?.data as any)?.events)
+                            ? (selectedPasses.pass2.data as any).events
+                            : Array.isArray(cachedDoc?.events)
+                            ? cachedDoc.events
+                            : [];
+                          const isArchiveWorkflowForPass3 =
+                            (selectedPasses.pass0?.data as any)?.workflowType ===
+                              'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                            cachedDoc?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                            (selectedVideo as any).workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW';
+                          const isArchiveWorkflow = isArchiveWorkflowForPass3;
                           const labelTranscriptions: any[] = Array.isArray(
                             (passState as any).labelTranscriptions
                           )
@@ -2652,24 +3749,42 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             : Array.isArray(cachedDoc?.labelTranscriptions)
                             ? cachedDoc.labelTranscriptions
                             : refinementsList
-                                .filter((r: any) => r.vialLabelData || r.refinementClass === 'OCR_CONFLATION')
+                                .filter(
+                                  (r: any) =>
+                                    r.vialLabelData ||
+                                    r.reagentData ||
+                                    r.refinementClass === 'OCR_CONFLATION' ||
+                                    r.refinementClass === 'REAGENT_OCR_CONFLATION'
+                                )
                                 .map((r: any) => ({
                                   eventId: r.eventId,
+                                  eventClass: r.eventClass,
                                   actionIds: r.actionIds || (r.actionId ? [r.actionId] : []),
-                                  isVialLabel: true,
+                                  isVialLabel: !r.reagentData,
+                                  isReagentLabel: Boolean(r.reagentData),
                                   highestContrastShotText:
                                     r.highestContrastShotText || r.frame1Text || r.transcriptionText,
                                   minimalBlurShotText:
                                     r.minimalBlurShotText || r.frame2Text || r.transcriptionText,
                                   conflatedText:
-                                    r.vialLabelData?.fullText || r.fullText || r.transcriptionText,
-                                  vialLabelData: r.vialLabelData || {
-                                    cellLineName:
-                                      r.cellLineName || r.transcriptionText?.split(/\s+/)[0] || '',
-                                    userInitials: r.userInitials,
-                                    dateFrozen: r.dateFrozen,
-                                    fullText: r.fullText || r.transcriptionText || '',
-                                  },
+                                    r.reagentData?.rawLabelText ||
+                                    r.vialLabelData?.fullText ||
+                                    r.fullText ||
+                                    r.transcriptionText,
+                                  ...(r.reagentData ? { reagentData: r.reagentData } : {}),
+                                  ...(r.vialLabelData
+                                    ? { vialLabelData: r.vialLabelData }
+                                    : !r.reagentData
+                                    ? {
+                                        vialLabelData: {
+                                          cellLineName:
+                                            r.cellLineName || r.transcriptionText?.split(/\s+/)[0] || '',
+                                          userInitials: r.userInitials,
+                                          dateFrozen: r.dateFrozen,
+                                          fullText: r.fullText || r.transcriptionText || '',
+                                        },
+                                      }
+                                    : {}),
                                 }));
                           const actionWellLocations: any[] = Array.isArray(
                             (passState as any).actionWellLocations
@@ -2722,6 +3837,13 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                   <div className="grid grid-cols-1 gap-2.5">
                                     {labelTranscriptions.map((lt: any, idx: number) => {
                                       const vData = lt.vialLabelData || {};
+                                      const rData = lt.reagentData || {};
+                                      const matchedPass2Evt = pass2EventsList.find(
+                                        (e: any) => e && e.eventId === lt.eventId
+                                      );
+                                      const evtClsUpper = String(
+                                        lt.eventClass || matchedPass2Evt?.eventClass || ''
+                                      ).toUpperCase();
                                       const actIds: string[] = Array.isArray(lt.actionIds)
                                         ? lt.actionIds
                                         : [];
@@ -2731,6 +3853,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                         lt.conflatedText ||
                                         lt.fullText ||
                                         vData.fullText ||
+                                        rData.rawLabelText ||
                                         '';
                                       const shot2Text =
                                         lt.minimalBlurShotText ||
@@ -2738,6 +3861,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                         lt.conflatedText ||
                                         lt.fullText ||
                                         vData.fullText ||
+                                        rData.rawLabelText ||
                                         '';
                                       const resolvedCellLine =
                                         vData.cellLineName || lt.cellLineName || '';
@@ -2746,7 +3870,67 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                       const resolvedDate =
                                         vData.dateFrozen || lt.dateFrozen || '';
                                       const resolvedFullText =
-                                        vData.fullText || lt.fullText || lt.conflatedText || '';
+                                        vData.fullText ||
+                                        rData.rawLabelText ||
+                                        lt.fullText ||
+                                        lt.conflatedText ||
+                                        '';
+                                      const isReagent =
+                                        Boolean(lt.isReagentLabel || lt.reagentData) ||
+                                        evtClsUpper.includes('REAGENT_LABEL') ||
+                                        (isArchiveWorkflowForPass3 && !evtClsUpper.includes('BOX_LABEL')) ||
+                                        isLikelyReagentBottleLabelText(shot1Text || resolvedFullText);
+                                      const parsedFallbackReagent = isReagent
+                                        ? parseReagentLabelFields(shot1Text || resolvedFullText, {
+                                            ...lt,
+                                            ...rData,
+                                          })
+                                        : null;
+                                      const resolvedReagentName =
+                                        (rData.reagentName && rData.reagentName !== 'N/A'
+                                          ? rData.reagentName
+                                          : '') ||
+                                        (lt.reagentName && lt.reagentName !== 'N/A'
+                                          ? lt.reagentName
+                                          : '') ||
+                                        parsedFallbackReagent?.reagentName ||
+                                        'N/A';
+                                      const resolvedReagentAcronym =
+                                        (rData.reagentAcronym && rData.reagentAcronym !== 'N/A'
+                                          ? rData.reagentAcronym
+                                          : '') ||
+                                        (lt.reagentAcronym && lt.reagentAcronym !== 'N/A'
+                                          ? lt.reagentAcronym
+                                          : '') ||
+                                        parsedFallbackReagent?.reagentAcronym ||
+                                        'N/A';
+                                      const resolvedManufacturer =
+                                        (rData.manufacturer && rData.manufacturer !== 'N/A'
+                                          ? rData.manufacturer
+                                          : '') ||
+                                        (lt.manufacturer && lt.manufacturer !== 'N/A'
+                                          ? lt.manufacturer
+                                          : '') ||
+                                        parsedFallbackReagent?.manufacturer ||
+                                        'N/A';
+                                      const resolvedCatalogNumber =
+                                        (rData.catalogNumber && rData.catalogNumber !== 'N/A'
+                                          ? rData.catalogNumber
+                                          : '') ||
+                                        (lt.catalogNumber && lt.catalogNumber !== 'N/A'
+                                          ? lt.catalogNumber
+                                          : '') ||
+                                        parsedFallbackReagent?.catalogNumber ||
+                                        'N/A';
+                                      const resolvedLotNumber =
+                                        (rData.lotNumber && rData.lotNumber !== 'N/A'
+                                          ? rData.lotNumber
+                                          : '') ||
+                                        (lt.lotNumber && lt.lotNumber !== 'N/A'
+                                          ? lt.lotNumber
+                                          : '') ||
+                                        parsedFallbackReagent?.lotNumber ||
+                                        'N/A';
                                       return (
                                         <div
                                           key={lt.eventId || idx}
@@ -2756,6 +3940,11 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                             <div className="flex items-center gap-2">
                                               <span className="font-bold text-cyan-300">
                                                 Event: {lt.eventId}
+                                              </span>
+                                              <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300 text-[10px]">
+                                                {isReagent
+                                                  ? 'REAGENT_LABEL_PRESENTATION'
+                                                  : lt.eventClass || (isArchiveWorkflowForPass3 ? 'REAGENT_LABEL_PRESENTATION_EVENT' : 'VIAL_LABEL_PRESENTATION')}
                                               </span>
                                               <span className="px-2 py-0.5 rounded bg-indigo-950/70 border border-indigo-700/60 text-indigo-300 text-[10px]">
                                                 label_transcription_{lt.eventId}.json
@@ -2787,40 +3976,93 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                             </div>
                                           </div>
 
-                                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 pt-1 border-t border-slate-800/80 text-[11px]">
-                                            <div>
-                                              <span className="text-slate-400 block text-[10px]">
-                                                Cell Line Name (Required)
-                                              </span>
-                                              <span className="font-bold text-white">
-                                                {resolvedCellLine || '(none)'}
-                                              </span>
+                                          {isReagent ? (
+                                            <div className="grid grid-cols-2 md:grid-cols-6 gap-2 pt-1 border-t border-slate-800/80 text-[11px]">
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  Reagent Name
+                                                </span>
+                                                <span className="font-bold text-white">
+                                                  {resolvedReagentName}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  Reagent Acronym
+                                                </span>
+                                                <span className="font-bold text-emerald-300">
+                                                  {resolvedReagentAcronym}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  Manufacturer
+                                                </span>
+                                                <span className="font-bold text-white">
+                                                  {resolvedManufacturer}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  Catalog / Ref #
+                                                </span>
+                                                <span className="font-bold text-white">
+                                                  {resolvedCatalogNumber}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  Lot #
+                                                </span>
+                                                <span className="font-bold text-white">
+                                                  {resolvedLotNumber}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  Full Label Text
+                                                </span>
+                                                <span className="font-bold text-cyan-200">
+                                                  {resolvedFullText || 'N/A'}
+                                                </span>
+                                              </div>
                                             </div>
-                                            <div>
-                                              <span className="text-slate-400 block text-[10px]">
-                                                User Initials (Optional)
-                                              </span>
-                                              <span className="font-bold text-white">
-                                                {resolvedInitials || '—'}
-                                              </span>
+                                          ) : (
+                                            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 pt-1 border-t border-slate-800/80 text-[11px]">
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  Cell Line Name (Required)
+                                                </span>
+                                                <span className="font-bold text-white">
+                                                  {resolvedCellLine || '(none)'}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  User Initials (Optional)
+                                                </span>
+                                                <span className="font-bold text-white">
+                                                  {resolvedInitials || '—'}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  Date Frozen (Optional)
+                                                </span>
+                                                <span className="font-bold text-white">
+                                                  {resolvedDate || '—'}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-slate-400 block text-[10px]">
+                                                  Full Label Text (Required)
+                                                </span>
+                                                <span className="font-bold text-cyan-200">
+                                                  {resolvedFullText || '(none)'}
+                                                </span>
+                                              </div>
                                             </div>
-                                            <div>
-                                              <span className="text-slate-400 block text-[10px]">
-                                                Date Frozen (Optional)
-                                              </span>
-                                              <span className="font-bold text-white">
-                                                {resolvedDate || '—'}
-                                              </span>
-                                            </div>
-                                            <div>
-                                              <span className="text-slate-400 block text-[10px]">
-                                                Full Label Text (Required)
-                                              </span>
-                                              <span className="font-bold text-cyan-200">
-                                                {resolvedFullText || '(none)'}
-                                              </span>
-                                            </div>
-                                          </div>
+                                          )}
                                         </div>
                                       );
                                     })}
@@ -2829,56 +4071,61 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                               </div>
 
                               {/* 2. Vial Insertion/Removal Well Locations (Top-Left Black Corner Origin) */}
-                              <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-3">
-                                <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
-                                  <span className="font-semibold text-cyan-300 flex items-center gap-1.5">
-                                    <MapPin className="w-3.5 h-3.5" />
-                                    2. Vial Insertion/Removal Box Well Locations
-                                  </span>
-                                  <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-700 text-amber-300 text-[10px]">
-                                    Origin A1 (Row A, Col 1) = Top-Left Black Corner (TOP_LEFT_BLACK)
-                                  </span>
-                                </div>
+                              {!isArchiveWorkflow && (
+                                <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-3">
+                                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                                    <span className="font-semibold text-cyan-300 flex items-center gap-1.5">
+                                      <MapPin className="w-3.5 h-3.5" />
+                                      2. Vial Insertion/Removal Box Well Locations
+                                    </span>
+                                    <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-700 text-amber-300 text-[10px]">
+                                      Origin A1 (Row A, Col 1) = Top-Left Black Corner (TOP_LEFT_BLACK)
+                                    </span>
+                                  </div>
 
-                                {actionWellLocations.length === 0 ? (
-                                  <div className="text-xs font-mono text-slate-400">
-                                    No vial insertion/removal well coordinates extracted.
-                                  </div>
-                                ) : (
-                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
-                                    {actionWellLocations.map((wl: any, idx: number) => (
-                                      <div
-                                        key={wl.actionId || idx}
-                                        className="rounded-lg bg-slate-950 border border-slate-800 p-3 text-xs font-mono flex items-center justify-between gap-3"
-                                      >
-                                        <div className="space-y-1">
-                                          <div className="flex items-center gap-2">
-                                            <span className="font-bold text-indigo-300">
-                                              {wl.actionId}
-                                            </span>
-                                            <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] text-slate-300">
-                                              {wl.actionType || 'VIAL_INSERTION'}
-                                            </span>
+                                  {actionWellLocations.length === 0 ? (
+                                    <div className="text-xs font-mono text-slate-400">
+                                      No vial insertion/removal well coordinates extracted.
+                                    </div>
+                                  ) : (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                                      {actionWellLocations.map((wl: any, idx: number) => (
+                                        <div
+                                          key={wl.actionId || idx}
+                                          className="rounded-lg bg-slate-950 border border-slate-800 p-3 text-xs font-mono flex items-center justify-between gap-3"
+                                        >
+                                          <div className="space-y-1">
+                                            <div className="flex items-center gap-2">
+                                              <span className="font-bold text-indigo-300">
+                                                {wl.actionId}
+                                              </span>
+                                              <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] text-slate-300">
+                                                {wl.actionType || 'VIAL_INSERTION'}
+                                              </span>
+                                            </div>
+                                            <div className="text-[11px] text-slate-400">
+                                              Row <strong className="text-white">{wl.row}</strong> • Col{' '}
+                                              <strong className="text-white">{wl.col}</strong> • Origin:{' '}
+                                              <span className="text-amber-300">
+                                                {wl.originCorner || 'TOP_LEFT_BLACK'}
+                                              </span>
+                                            </div>
                                           </div>
-                                          <div className="text-[11px] text-slate-400">
-                                            Row <strong className="text-white">{wl.row}</strong> • Col{' '}
-                                            <strong className="text-white">{wl.col}</strong> • Origin:{' '}
-                                            <span className="text-amber-300">
-                                              {wl.originCorner || 'TOP_LEFT_BLACK'}
-                                            </span>
+                                          <div className="px-3 py-1.5 rounded-lg bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 font-bold text-sm">
+                                            Well {wl.coordinate || `${wl.row}${wl.col}`}
                                           </div>
                                         </div>
-                                        <div className="px-3 py-1.5 rounded-lg bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 font-bold text-sm">
-                                          Well {wl.coordinate || `${wl.row}${wl.col}`}
-                                        </div>
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
-                              </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
 
                               {/* 3. Appended Inventory Update Action JSONs (action_{id}.json) */}
-                              {pass1ActionsList.length > 0 && (
+                              {!isArchiveWorkflow && pass1ActionsList.filter((a: any) => {
+                                const cls = String(a.actionType || a.actionClass || '').toUpperCase();
+                                return !cls.includes('MIX') && !cls.includes('SEED');
+                              }).length > 0 && (
                                 <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-2.5">
                                   <div className="text-xs font-mono font-semibold text-emerald-300 flex items-center justify-between">
                                     <span>
@@ -2889,71 +4136,166 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                     </span>
                                   </div>
                                   <div className="grid grid-cols-1 gap-2">
-                                    {pass1ActionsList.map((act: any, idx: number) => {
-                                      const actId = act.actionId || `act_${idx + 1}`;
-                                      const isActRemoval = String(
-                                        act.actionType || act.actionClass || ''
-                                      )
-                                        .toUpperCase()
-                                        .includes('REMOVAL');
-                                      return (
-                                        <div
-                                          key={actId}
-                                          className="rounded-lg bg-slate-950 border border-slate-800 p-2.5 text-[11px] font-mono flex flex-wrap items-center justify-between gap-2"
-                                        >
-                                          <div className="flex flex-wrap items-center gap-2">
-                                            <span className="px-2 py-0.5 rounded bg-emerald-950/70 border border-emerald-700/60 text-emerald-300 font-bold">
-                                              action_{actId}.json
-                                            </span>
-                                            <span className="text-slate-300">
-                                              Cell Line:{' '}
-                                              <strong className="text-white">
-                                                {act.vialLabelData?.cellLineName ||
-                                                  act.cellLineName ||
-                                                  act.cellLineInfo?.name ||
-                                                  (isActRemoval ? '—' : '(untranscribed)')}
-                                              </strong>
-                                            </span>
-                                            <span className="text-slate-300">
-                                              Initials:{' '}
-                                              <strong className="text-white">
-                                                {act.vialLabelData?.userInitials ||
-                                                  act.cellLineInfo?.userInitials ||
-                                                  '—'}
-                                              </strong>
-                                            </span>
-                                            <span className="text-slate-300">
-                                              Date Frozen:{' '}
-                                              <strong className="text-white">
-                                                {act.vialLabelData?.dateFrozen ||
-                                                  act.cellLineInfo?.dateFrozen ||
-                                                  '—'}
-                                              </strong>
-                                            </span>
-                                            <span className="text-cyan-300">
-                                              Well:{' '}
-                                              <strong>
-                                                {act.boxWellLocation?.coordinate ||
-                                                  act.targetCoordinate ||
-                                                  (act.boxRowId
-                                                    ? `${act.boxRowId}${act.boxColId || 1}`
-                                                    : 'A1')}
-                                              </strong>
+                                    {pass1ActionsList
+                                      .filter((a: any) => {
+                                        const cls = String(a.actionType || a.actionClass || '').toUpperCase();
+                                        return !cls.includes('MIX') && !cls.includes('SEED');
+                                      })
+                                      .map((act: any, idx: number) => {
+                                        const actId = act.actionId || `act_${idx + 1}`;
+                                        const isActRemoval = String(
+                                          act.actionType || act.actionClass || ''
+                                        )
+                                          .toUpperCase()
+                                          .includes('REMOVAL');
+                                        return (
+                                          <div
+                                            key={actId}
+                                            className="rounded-lg bg-slate-950 border border-slate-800 p-2.5 text-[11px] font-mono flex flex-wrap items-center justify-between gap-2"
+                                          >
+                                            <div className="flex flex-wrap items-center gap-2">
+                                              <span className="px-2 py-0.5 rounded bg-emerald-950/70 border border-emerald-700/60 text-emerald-300 font-bold">
+                                                action_{actId}.json
+                                              </span>
+                                              <span className="text-slate-300">
+                                                Cell Line:{' '}
+                                                <strong className="text-white">
+                                                  {act.vialLabelData?.cellLineName ||
+                                                    act.cellLineName ||
+                                                    act.cellLineInfo?.name ||
+                                                    (isActRemoval ? '—' : '(untranscribed)')}
+                                                </strong>
+                                              </span>
+                                              <span className="text-slate-300">
+                                                Initials:{' '}
+                                                <strong className="text-white">
+                                                  {act.vialLabelData?.userInitials ||
+                                                    act.cellLineInfo?.userInitials ||
+                                                    '—'}
+                                                </strong>
+                                              </span>
+                                              <span className="text-slate-300">
+                                                Date Frozen:{' '}
+                                                <strong className="text-white">
+                                                  {act.vialLabelData?.dateFrozen ||
+                                                    act.cellLineInfo?.dateFrozen ||
+                                                    '—'}
+                                                </strong>
+                                              </span>
+                                              <span className="text-cyan-300">
+                                                Well:{' '}
+                                                <strong>
+                                                  {act.boxWellLocation?.coordinate ||
+                                                    act.targetCoordinate ||
+                                                    (act.boxRowId
+                                                      ? `${act.boxRowId}${act.boxColId || 1}`
+                                                      : 'A1')}
+                                                </strong>
+                                              </span>
+                                            </div>
+                                            <span className="text-[10px] text-slate-400 truncate max-w-md">
+                                              Full Text:{' '}
+                                              {act.vialLabelData?.fullText ||
+                                                act.conflatedLabelText ||
+                                                act.cellLineInfo?.fullText ||
+                                                '—'}
                                             </span>
                                           </div>
-                                          <span className="text-[10px] text-slate-400 truncate max-w-md">
-                                            Full Text:{' '}
-                                            {act.vialLabelData?.fullText ||
-                                              act.conflatedLabelText ||
-                                              act.cellLineInfo?.fullText ||
-                                              '—'}
-                                          </span>
-                                        </div>
-                                      );
-                                    })}
+                                        );
+                                      })}
                                   </div>
                                 </div>
                               )}
+
+                              {/* 4. Experiment Archive Pass 3 Reagents & Conflated Work Steps */}
+                              {(Array.isArray(pass3Raw?.reagents) && pass3Raw.reagents.length > 0) ||
+                              (Array.isArray(pass3Raw?.workSteps) && pass3Raw.workSteps.length > 0) ? (
+                                <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-3">
+                                  <div className="text-xs font-mono font-semibold text-indigo-300 flex items-center justify-between">
+                                    <span>
+                                      Experiment Archive Pass 3: OCR Reagent Table &amp; Conflated Work Steps
+                                    </span>
+                                    <span className="text-[10px] text-slate-400">
+                                      Reagent Acronym from First Letters • Mix &amp; Seed Conflation
+                                    </span>
+                                  </div>
+
+                                  {Array.isArray(pass3Raw?.reagents) && pass3Raw.reagents.length > 0 && (
+                                    <div className="overflow-x-auto border border-slate-800 rounded-lg">
+                                      <table className="w-full text-left text-[11px] font-mono">
+                                        <thead className="bg-slate-950 border-b border-slate-800 text-slate-400">
+                                          <tr>
+                                            <th className="py-1.5 px-2.5">Reagent Name</th>
+                                            <th className="py-1.5 px-2.5">Reagent Acronym</th>
+                                            <th className="py-1.5 px-2.5">Manufacturer</th>
+                                            <th className="py-1.5 px-2.5">Catalog / Ref #</th>
+                                            <th className="py-1.5 px-2.5">Lot #</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-800/70">
+                                          {pass3Raw.reagents.map((r: any, rIdx: number) => (
+                                            <tr key={rIdx} className="bg-slate-950/60">
+                                              <td className="py-1.5 px-2.5 text-slate-100 font-semibold">
+                                                {r.reagentName || 'N/A'}
+                                              </td>
+                                              <td className="py-1.5 px-2.5 text-cyan-300 font-bold">
+                                                {r.reagentAcronym ||
+                                                  generateReagentAcronym(r.reagentName || '')}
+                                              </td>
+                                              <td className="py-1.5 px-2.5 text-slate-300">
+                                                {r.manufacturer || 'N/A'}
+                                              </td>
+                                              <td className="py-1.5 px-2.5 text-slate-300">
+                                                {r.catalogNumber || 'N/A'}
+                                              </td>
+                                              <td className="py-1.5 px-2.5 text-slate-300">
+                                                {r.lotNumber || 'N/A'}
+                                              </td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  )}
+
+                                  {Array.isArray(pass3Raw?.workSteps) && pass3Raw.workSteps.length > 0 && (
+                                    <div className="space-y-2">
+                                      {pass3Raw.workSteps.map((ws: any, wsIdx: number) => (
+                                        <div
+                                          key={ws.stepId || wsIdx}
+                                          className="rounded-lg bg-slate-950 border border-slate-800 p-2.5 text-[11px] font-mono space-y-1"
+                                        >
+                                          <div className="flex items-center justify-between text-slate-200 font-semibold">
+                                            <span>
+                                              Step {wsIdx + 1}: {ws.actionType} — {ws.description}
+                                            </span>
+                                          </div>
+                                          {ws.mixReagentsData && (
+                                            <div className="text-slate-300">
+                                              First: <strong className="text-white">{ws.mixReagentsData.firstReagentName}</strong> ({ws.mixReagentsData.firstReagentAmount}) • Second: <strong className="text-white">{ws.mixReagentsData.secondReagentName}</strong> ({ws.mixReagentsData.secondReagentAmount})
+                                            </div>
+                                          )}
+                                          {ws.seedReagentsData && (
+                                            <div className="text-slate-300 space-y-1 pt-1">
+                                              <div>
+                                                Plate: <strong className="text-white">{ws.seedReagentsData.plateType || 'N/A'}</strong> • Pipette: <strong className="text-white">{ws.seedReagentsData.pipetteType || 'N/A'}</strong> • Cells: <strong className="text-white">{ws.seedReagentsData.cellsSeeded || 'N/A'}</strong> ({ws.seedReagentsData.cellsPerWell ? (String(ws.seedReagentsData.cellsPerWell).toLowerCase().includes('well') || ws.seedReagentsData.cellsPerWell === 'N/A' ? ws.seedReagentsData.cellsPerWell : `${ws.seedReagentsData.cellsPerWell}/well`) : 'N/A'}) • Seeding Events: <strong className="text-emerald-300">{ws.seedReagentsData.seedingEventsCount ?? 0}</strong> / {ws.seedReagentsData.expectedSeedingEventsCount ?? 12}
+                                              </div>
+                                              {Array.isArray(ws.seedReagentsData.seededColumns) && ws.seedReagentsData.seededColumns.length > 0 && (
+                                                <div className="text-cyan-300 text-[10px]">
+                                                  Columns Seeded: <strong>{ws.seedReagentsData.seededColumns.join(', ')}</strong> (1–12, Left to Right)
+                                                </div>
+                                              )}
+                                              <pre className="bg-slate-900/90 p-2 rounded border border-slate-800 text-[9px] font-mono text-emerald-300 overflow-x-auto whitespace-pre">
+                                                {render96WellPlateMarkdown(ws.seedReagentsData.seededColumns, ws.seedReagentsData.seededWells)}
+                                              </pre>
+                                            </div>
+                                          )}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              ) : null}
                             </div>
                           );
                         })()
@@ -3014,7 +4356,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                     </div>
                   </div>
 
-              {/* Inline Editable HITL Inventory Update Actions Table */}
+              {/* Inline Editable HITL Inventory / Experiment Archive Actions Table */}
               {(() => {
                 const rawPass1 = selectedPasses.pass1?.data as any;
                 const pass1Actions: any[] = Array.isArray(rawPass1)
@@ -3022,6 +4364,789 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                   : Array.isArray(rawPass1?.actions)
                   ? rawPass1.actions
                   : analysisCache[selectedVideo.videoId]?.actions || [];
+
+                const isArchiveWorkflow =
+                  selectedPasses.pass0?.data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                  selectedVideo.passes?.pass0?.data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                  pass1Actions.some((a) => {
+                    const cls = String(a?.actionType || a?.actionClass || '').toUpperCase();
+                    return cls.includes('MIX') || cls.includes('SEED');
+                  });
+
+                if (isArchiveWorkflow) {
+                  const pass3Step = (selectedPasses.pass3 ||
+                    selectedVideo.passes?.pass3 ||
+                    {}) as any;
+                  const rawPass3 = (pass3Step.data || {}) as any;
+                  const pass3ReagentList = Array.isArray(pass3Step.reagents)
+                    ? pass3Step.reagents
+                    : Array.isArray(rawPass3.reagents)
+                    ? rawPass3.reagents
+                    : undefined;
+                  const pass3WorkStepList = Array.isArray(pass3Step.workSteps)
+                    ? pass3Step.workSteps
+                    : Array.isArray(rawPass3.workSteps)
+                    ? rawPass3.workSteps
+                    : undefined;
+                  const pass3TranscriptionList = Array.isArray(pass3Step.labelTranscriptions)
+                    ? pass3Step.labelTranscriptions
+                    : Array.isArray(rawPass3.labelTranscriptions)
+                    ? rawPass3.labelTranscriptions
+                    : undefined;
+                  const currentArchiveEdits = hitlArchiveEdits[selectedVideo.videoId] || {};
+                  const archiveReagents: ArchiveReagent[] = currentArchiveEdits.reagents ?? (
+                    pass3ReagentList && pass3ReagentList.length > 0
+                      ? pass3ReagentList
+                      : analysisCache[selectedVideo.videoId]?.reagents || []
+                  );
+                  const archiveWorkSteps: ArchiveWorkStep[] = currentArchiveEdits.workSteps ?? (
+                    pass3WorkStepList && pass3WorkStepList.length > 0
+                      ? pass3WorkStepList
+                      : Array.isArray(analysisCache[selectedVideo.videoId]?.workSteps) &&
+                        analysisCache[selectedVideo.videoId]!.workSteps!.length > 0
+                      ? analysisCache[selectedVideo.videoId]!.workSteps!
+                      : pass1Actions.map((act: any, idx: number) => {
+                          const cls = String(act.actionType || act.actionClass || '').toUpperCase();
+                          const isSeed = cls.includes('SEED');
+                          return {
+                            stepId: act.actionId || `step_${idx + 1}`,
+                            actionType: isSeed ? 'SEED_REAGENTS' : 'MIX_REAGENTS',
+                            startTimeSeconds: Number(act.startTimestampSeconds ?? act.startTime ?? 0),
+                            endTimeSeconds: Number(act.endTimestampSeconds ?? act.endTime ?? 0),
+                            description:
+                              act.description ||
+                              (isSeed ? 'Seed reagents into plate' : 'Mix two reagents'),
+                            mixReagentsData: act.mixReagentsData,
+                            seedReagentsData: act.seedReagentsData,
+                          };
+                        })
+                  );
+                  const rawLabelTranscriptions: string[] = currentArchiveEdits.labelTranscriptions ?? (
+                    pass3TranscriptionList && pass3TranscriptionList.length > 0
+                      ? pass3TranscriptionList.map((lt: any) =>
+                          typeof lt === 'string'
+                            ? lt
+                            : lt.fullText || lt.conflatedText || lt.shot1Text || ''
+                        ).filter(Boolean)
+                      : Array.isArray((analysisCache[selectedVideo.videoId] as any)?.labelTranscriptions)
+                      ? (analysisCache[selectedVideo.videoId] as any).labelTranscriptions
+                          .map((lt: any) =>
+                            typeof lt === 'string'
+                              ? lt
+                              : lt?.fullText || lt?.conflatedText || lt?.shot1Text || ''
+                          )
+                          .filter(Boolean)
+                      : []
+                  );
+
+                  const updateArchiveReagent = (idx: number, patch: Partial<ArchiveReagent>) => {
+                    const updated = archiveReagents.map((r, i) => (i === idx ? { ...r, ...patch } : r));
+                    setHitlArchiveEdits((prev) => ({
+                      ...prev,
+                      [selectedVideo.videoId]: {
+                        ...prev[selectedVideo.videoId],
+                        reagents: updated,
+                      },
+                    }));
+                  };
+
+                  const updateArchiveWorkStep = (idx: number, patch: Partial<ArchiveWorkStep>) => {
+                    const updated = archiveWorkSteps.map((ws, i) => (i === idx ? { ...ws, ...patch } : ws));
+                    setHitlArchiveEdits((prev) => ({
+                      ...prev,
+                      [selectedVideo.videoId]: {
+                        ...prev[selectedVideo.videoId],
+                        workSteps: updated,
+                      },
+                    }));
+                  };
+
+                  const handleCommitArchiveHitl = async () => {
+                    setIsCommittingHitl(true);
+                    setHitlCommitError(null);
+                    setHitlCommitSuccess(null);
+                    try {
+                      const targetArchiveId =
+                        selectedVideo.archiveId ||
+                        pass1Actions[0]?.archiveId ||
+                        archives[0]?.id ||
+                        'archive_exp_402';
+                      const matchedArchive = archives.find((a) => a.id === targetArchiveId);
+                      const archiveName =
+                        matchedArchive?.name ||
+                        selectedVideo.archiveName ||
+                        selectedPasses.pass0?.data?.archiveName ||
+                        targetArchiveId;
+                      const creatorName =
+                        matchedArchive?.creatorName ||
+                        selectedVideo.archiveCreatorName ||
+                        selectedPasses.pass0?.data?.creatorName ||
+                        'N/A';
+                      const creationDate =
+                        matchedArchive?.creationDate ||
+                        selectedVideo.archiveCreationDate ||
+                        selectedPasses.pass0?.data?.creationDate ||
+                        new Date().toISOString().split('T')[0];
+
+                      const markdownDoc = compileArchiveMarkdownFromAnalysis({
+                        videoId: selectedVideo.videoId,
+                        workflow: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+                        status: 'COMPLETED',
+                        reagents: archiveReagents,
+                        workSteps: archiveWorkSteps,
+                        labelTranscriptions: rawLabelTranscriptions,
+                        actions: pass1Actions,
+                        events: [],
+                        refinements: [],
+                        updatedAt: new Date().toISOString(),
+                        archiveName,
+                        creatorName,
+                        creationDate,
+                      });
+
+                      const res = await apiService.commitArchiveSignOff(
+                        tenant.databaseId,
+                        selectedVideo.videoId,
+                        targetArchiveId,
+                        markdownDoc,
+                        {
+                          archiveName,
+                          creatorName,
+                          creationDate,
+                          reagents: archiveReagents,
+                          labelTranscriptions: rawLabelTranscriptions,
+                          workSteps: archiveWorkSteps.map((ws) => ({
+                            ...ws,
+                            videoId: ws.videoId || selectedVideo.videoId,
+                          })),
+                        }
+                      );
+
+                      const committedArchiveName =
+                        typeof (res as any).archiveName === 'string' && (res as any).archiveName
+                          ? (res as any).archiveName
+                          : matchedArchive?.name || archiveName;
+                      const committedReagents = Array.isArray((res as any).reagents)
+                        ? (res as any).reagents
+                        : archiveReagents;
+                      const committedWorkSteps = Array.isArray((res as any).workSteps)
+                        ? (res as any).workSteps
+                        : archiveWorkSteps;
+                      const committedTranscriptions = Array.isArray((res as any).labelTranscriptions)
+                        ? (res as any).labelTranscriptions
+                        : rawLabelTranscriptions;
+                      const committedMarkdown =
+                        typeof (res as any).markdownDoc === 'string'
+                          ? (res as any).markdownDoc
+                          : markdownDoc;
+
+                      setArchives((prev) =>
+                        prev.map((a) =>
+                          a.id === targetArchiveId
+                            ? {
+                                ...a,
+                                name: a.name || committedArchiveName,
+                                reagents: committedReagents,
+                                labelTranscriptions: committedTranscriptions,
+                                workSteps: committedWorkSteps,
+                                markdownDoc: committedMarkdown,
+                                videoIds: Array.from(
+                                  new Set([...(a.videoIds || []), selectedVideo.videoId])
+                                ),
+                                updatedAt: res.signedOffAt,
+                              }
+                            : a
+                        )
+                      );
+
+                      const updatedAnalysisDoc: VideoAnalysisDoc = {
+                        ...(analysisCache[selectedVideo.videoId] || {
+                          videoId: selectedVideo.videoId,
+                          actions: pass1Actions,
+                          events: [],
+                          refinements: [],
+                        }),
+                        videoId: selectedVideo.videoId,
+                        archiveId: targetArchiveId,
+                        archiveName: committedArchiveName,
+                        creatorName,
+                        creationDate,
+                        reagents: archiveReagents,
+                        workSteps: archiveWorkSteps.map((ws) => ({
+                          ...ws,
+                          videoId: ws.videoId || selectedVideo.videoId,
+                        })),
+                        isSignedOff: true,
+                        signedOffAt: res.signedOffAt,
+                        updatedAt: res.signedOffAt,
+                      };
+                      setAnalysisCache((prev) => ({
+                        ...prev,
+                        [selectedVideo.videoId]: updatedAnalysisDoc,
+                      }));
+                      onSelectActiveStream?.(
+                        {
+                          ...selectedVideo,
+                          archiveId: targetArchiveId,
+                          archiveName: committedArchiveName,
+                        },
+                        updatedAnalysisDoc
+                      );
+
+                      const successMsg = `Committed Experiment Archive Notebook (${archiveReagents.length} reagent(s), ${archiveWorkSteps.length} work step(s)) to Archive Database (${targetArchiveId}).`;
+                      setHitlCommitSuccess(successMsg);
+                      setStatusBanner(successMsg);
+                      setPassesByVideo((prev) => {
+                        const cur = ensurePasses(
+                          prev[selectedVideo.videoId] || selectedVideo.passes
+                        );
+                        return {
+                          ...prev,
+                          [selectedVideo.videoId]: {
+                            ...cur,
+                            hitl: {
+                              status: 'COMPLETED',
+                              completedAt: res.signedOffAt,
+                              data: {
+                                archiveId: targetArchiveId,
+                                signedOffAt: res.signedOffAt,
+                                reagents: archiveReagents,
+                                workSteps: archiveWorkSteps,
+                              },
+                            } as any,
+                          },
+                        };
+                      });
+                      onNavigateToArchive?.(targetArchiveId, selectedVideo.videoId);
+                    } catch (err: any) {
+                      const errMsg = `Failed to commit HITL archive notebook: ${err?.message || 'Unknown error'}`;
+                      setHitlCommitError(errMsg);
+                      setStatusBanner(errMsg);
+                    } finally {
+                      setIsCommittingHitl(false);
+                    }
+                  };
+
+                  return (
+                    <div className="space-y-3 pt-2 border-t border-slate-800/80">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                        <span className="text-indigo-300 font-semibold">
+                          Experiment Archive HITL Review: {archiveReagents.length} Reagent(s) &amp;{' '}
+                          {archiveWorkSteps.length} Work Step(s)
+                        </span>
+                      </div>
+
+                      {/* Section A: Editable Reagents Table */}
+                      <div className="space-y-2 bg-slate-900/80 border border-slate-800/80 rounded-lg p-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-mono font-bold text-slate-300 uppercase tracking-wider">
+                            Reagents Table ({archiveReagents.length})
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const newReagent: ArchiveReagent = {
+                                id: `reagent_${Date.now()}`,
+                                reagentName: 'New Reagent',
+                                reagentAcronym: 'NR',
+                                manufacturer: '',
+                                catalogNumber: '',
+                                lotNumber: '',
+                              };
+                              setHitlArchiveEdits((prev) => ({
+                                ...prev,
+                                [selectedVideo.videoId]: {
+                                  ...prev[selectedVideo.videoId],
+                                  reagents: [...archiveReagents, newReagent],
+                                },
+                              }));
+                            }}
+                            className="text-[10px] font-mono text-indigo-400 hover:text-indigo-300 underline"
+                          >
+                            + Add Reagent
+                          </button>
+                        </div>
+                        {archiveReagents.length === 0 ? (
+                          <p className="text-xs text-slate-500 font-mono italic">No reagents detected yet.</p>
+                        ) : (
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-left text-xs font-mono">
+                              <thead>
+                                <tr className="border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                                  <th className="pb-1">Reagent Name</th>
+                                  <th className="pb-1">Acronym</th>
+                                  <th className="pb-1">Manufacturer</th>
+                                  <th className="pb-1">Catalog #</th>
+                                  <th className="pb-1">Lot #</th>
+                                  <th className="pb-1 w-8"></th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-800/60">
+                                {archiveReagents.map((reagent, rIdx) => (
+                                  <tr key={reagent.id || `r_${rIdx}`}>
+                                    <td className="py-1.5 pr-2">
+                                      <input
+                                        type="text"
+                                        value={reagent.reagentName}
+                                        onChange={(e) =>
+                                          updateArchiveReagent(rIdx, { reagentName: e.target.value })
+                                        }
+                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
+                                      />
+                                    </td>
+                                    <td className="py-1.5 pr-2 w-24">
+                                      <input
+                                        type="text"
+                                        value={reagent.reagentAcronym || ''}
+                                        onChange={(e) =>
+                                          updateArchiveReagent(rIdx, { reagentAcronym: e.target.value })
+                                        }
+                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none font-bold text-cyan-300"
+                                      />
+                                    </td>
+                                    <td className="py-1.5 pr-2">
+                                      <input
+                                        type="text"
+                                        value={reagent.manufacturer || ''}
+                                        onChange={(e) =>
+                                          updateArchiveReagent(rIdx, { manufacturer: e.target.value })
+                                        }
+                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
+                                      />
+                                    </td>
+                                    <td className="py-1.5 pr-2 w-28">
+                                      <input
+                                        type="text"
+                                        value={reagent.catalogNumber || ''}
+                                        onChange={(e) =>
+                                          updateArchiveReagent(rIdx, { catalogNumber: e.target.value })
+                                        }
+                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
+                                      />
+                                    </td>
+                                    <td className="py-1.5 pr-2 w-28">
+                                      <input
+                                        type="text"
+                                        value={reagent.lotNumber || ''}
+                                        onChange={(e) =>
+                                          updateArchiveReagent(rIdx, { lotNumber: e.target.value })
+                                        }
+                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
+                                      />
+                                    </td>
+                                    <td className="py-1.5 text-center">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const updated = archiveReagents.filter((_, i) => i !== rIdx);
+                                          setHitlArchiveEdits((prev) => ({
+                                            ...prev,
+                                            [selectedVideo.videoId]: {
+                                              ...prev[selectedVideo.videoId],
+                                              reagents: updated,
+                                            },
+                                          }));
+                                        }}
+                                        className="text-red-400 hover:text-red-300"
+                                        title="Remove Reagent"
+                                      >
+                                        &times;
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Section B: Editable Work Steps with 96-Well Plate Map */}
+                      <div className="space-y-3 bg-slate-900/80 border border-slate-800/80 rounded-lg p-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-mono font-bold text-slate-300 uppercase tracking-wider">
+                            Work Steps ({archiveWorkSteps.length})
+                          </span>
+                        </div>
+                        {archiveWorkSteps.length === 0 ? (
+                          <p className="text-xs text-slate-500 font-mono italic">No work steps detected yet.</p>
+                        ) : (
+                          <div className="space-y-3">
+                            {archiveWorkSteps.map((step, wsIdx) => {
+                              const isSeed = step.actionType === 'SEED_REAGENTS';
+                              const isMix = step.actionType === 'MIX_REAGENTS';
+                              const curMix = step.mixReagentsData || {
+                                firstReagentName: '',
+                                firstReagentAmount: '',
+                                secondReagentName: '',
+                                secondReagentAmount: '',
+                              };
+                              const curSeed = step.seedReagentsData || {
+                                plateType: 'N/A',
+                                pipetteType: 'N/A',
+                                cellsSeeded: 'N/A',
+                                cellsPerWell: 'N/A',
+                                seedingEventsCount: 0,
+                              };
+                              const currentCols = curSeed.seededColumns || [];
+                              const currentColsText = currentCols.join(', ');
+
+                              return (
+                                <div
+                                  key={step.stepId || `ws_${wsIdx}`}
+                                  className="p-3 rounded-lg bg-slate-950/70 border border-slate-800 space-y-2 text-xs font-mono"
+                                >
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2">
+                                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-950 border border-indigo-700/60 text-indigo-300">
+                                        Step #{wsIdx + 1}
+                                      </span>
+                                      <span className="font-semibold text-slate-200">
+                                        {isSeed ? '🌱 SEED_REAGENTS' : isMix ? '🧪 MIX_REAGENTS' : step.actionType}
+                                      </span>
+                                      <span className="text-slate-400 text-[11px]">
+                                        ({step.startTimeSeconds ?? 0}s – {step.endTimeSeconds ?? 0}s)
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      <select
+                                        value={step.actionType}
+                                        onChange={(e) =>
+                                          updateArchiveWorkStep(wsIdx, {
+                                            actionType: e.target.value as 'SEED_REAGENTS' | 'MIX_REAGENTS',
+                                          })
+                                        }
+                                        className="bg-slate-900 border border-slate-700 text-slate-300 text-[11px] rounded px-2 py-0.5 focus:outline-none"
+                                      >
+                                        <option value="SEED_REAGENTS">SEED_REAGENTS</option>
+                                        <option value="MIX_REAGENTS">MIX_REAGENTS</option>
+                                      </select>
+                                    </div>
+                                  </div>
+
+                                  <div>
+                                    <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
+                                      Description
+                                    </label>
+                                    <input
+                                      type="text"
+                                      value={step.description}
+                                      onChange={(e) =>
+                                        updateArchiveWorkStep(wsIdx, { description: e.target.value })
+                                      }
+                                      className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
+                                    />
+                                  </div>
+
+                                  {isMix && (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1 border-t border-slate-800/60">
+                                      <div>
+                                        <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
+                                          First Reagent (Name / Amount)
+                                        </label>
+                                        <div className="flex gap-2">
+                                          <input
+                                            type="text"
+                                            placeholder="e.g. Media"
+                                            value={curMix.firstReagentName || ''}
+                                            onChange={(e) =>
+                                              updateArchiveWorkStep(wsIdx, {
+                                                mixReagentsData: {
+                                                  ...curMix,
+                                                  firstReagentName: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            className="w-2/3 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
+                                          />
+                                          <input
+                                            type="text"
+                                            placeholder="e.g. 50 µL"
+                                            value={curMix.firstReagentAmount || ''}
+                                            onChange={(e) =>
+                                              updateArchiveWorkStep(wsIdx, {
+                                                mixReagentsData: {
+                                                  ...curMix,
+                                                  firstReagentAmount: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            className="w-1/3 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
+                                          />
+                                        </div>
+                                      </div>
+                                      <div>
+                                        <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
+                                          Second Reagent (Name / Amount)
+                                        </label>
+                                        <div className="flex gap-2">
+                                          <input
+                                            type="text"
+                                            placeholder="e.g. Buffer"
+                                            value={curMix.secondReagentName || ''}
+                                            onChange={(e) =>
+                                              updateArchiveWorkStep(wsIdx, {
+                                                mixReagentsData: {
+                                                  ...curMix,
+                                                  secondReagentName: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            className="w-2/3 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
+                                          />
+                                          <input
+                                            type="text"
+                                            placeholder="e.g. 10 µL"
+                                            value={curMix.secondReagentAmount || ''}
+                                            onChange={(e) =>
+                                              updateArchiveWorkStep(wsIdx, {
+                                                mixReagentsData: {
+                                                  ...curMix,
+                                                  secondReagentAmount: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            className="w-1/3 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
+                                          />
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {isSeed && (
+                                    <div className="space-y-2 pt-1 border-t border-slate-800/60">
+                                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                                        <div>
+                                          <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
+                                            Plate Type
+                                          </label>
+                                          <input
+                                            type="text"
+                                            placeholder="e.g. 96-well plate"
+                                            value={curSeed.plateType || ''}
+                                            onChange={(e) =>
+                                              updateArchiveWorkStep(wsIdx, {
+                                                seedReagentsData: {
+                                                  ...curSeed,
+                                                  plateType: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
+                                          />
+                                        </div>
+                                        <div>
+                                          <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
+                                            Pipette Type
+                                          </label>
+                                          <input
+                                            type="text"
+                                            placeholder="e.g. 8-channel pipette"
+                                            value={curSeed.pipetteType || ''}
+                                            onChange={(e) =>
+                                              updateArchiveWorkStep(wsIdx, {
+                                                seedReagentsData: {
+                                                  ...curSeed,
+                                                  pipetteType: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
+                                          />
+                                        </div>
+                                        <div>
+                                          <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
+                                            Cells Seeded
+                                          </label>
+                                          <input
+                                            type="text"
+                                            placeholder="e.g. Jurkat T-cells"
+                                            value={curSeed.cellsSeeded || ''}
+                                            onChange={(e) =>
+                                              updateArchiveWorkStep(wsIdx, {
+                                                seedReagentsData: {
+                                                  ...curSeed,
+                                                  cellsSeeded: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
+                                          />
+                                        </div>
+                                        <div>
+                                          <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
+                                            Cells Per Well
+                                          </label>
+                                          <input
+                                            type="text"
+                                            placeholder="e.g. 10000"
+                                            value={curSeed.cellsPerWell || ''}
+                                            onChange={(e) =>
+                                              updateArchiveWorkStep(wsIdx, {
+                                                seedReagentsData: {
+                                                  ...curSeed,
+                                                  cellsPerWell: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
+                                          />
+                                        </div>
+                                      </div>
+
+                                      <div>
+                                        <div className="flex items-center justify-between mb-0.5">
+                                          <label className="text-[10px] uppercase text-slate-400">
+                                            Seeded Columns (1–12, Left to Right)
+                                          </label>
+                                          <span className="text-[10px] text-cyan-400">
+                                            {currentCols.length > 0
+                                              ? `${currentCols.length} column(s) selected: [${currentCols.join(', ')}]`
+                                              : 'No columns selected'}
+                                          </span>
+                                        </div>
+                                        <input
+                                          type="text"
+                                          placeholder="e.g. 1, 2, 3 or 1-12"
+                                          value={currentColsText}
+                                          onChange={(e) => {
+                                            const cols = parseColumnNumbersFromText(e.target.value);
+                                            const resolved = resolveSeededColumnsAndWells({ seededColumns: cols });
+                                            updateArchiveWorkStep(wsIdx, {
+                                              seedReagentsData: {
+                                                ...curSeed,
+                                                seededColumns: resolved.seededColumns,
+                                                seededWells: resolved.seededWells,
+                                                seedingEventsCount: resolved.seededColumns.length,
+                                                isSeedingCountCorrect: resolved.seededColumns.length === 12,
+                                              },
+                                            });
+                                          }}
+                                          className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
+                                        />
+                                        <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                                          <span className="text-[10px] text-slate-500">Quick set:</span>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              const allCols = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+                                              const resolved = resolveSeededColumnsAndWells({ seededColumns: allCols });
+                                              updateArchiveWorkStep(wsIdx, {
+                                                seedReagentsData: {
+                                                  ...curSeed,
+                                                  seededColumns: resolved.seededColumns,
+                                                  seededWells: resolved.seededWells,
+                                                  seedingEventsCount: 12,
+                                                  isSeedingCountCorrect: true,
+                                                },
+                                              });
+                                            }}
+                                            className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 text-[10px]"
+                                          >
+                                            All 12 Columns (Full Plate)
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              const resolved = resolveSeededColumnsAndWells({ seededColumns: [] });
+                                              updateArchiveWorkStep(wsIdx, {
+                                                seedReagentsData: {
+                                                  ...curSeed,
+                                                  seededColumns: [],
+                                                  seededWells: [],
+                                                  seedingEventsCount: 0,
+                                                  isSeedingCountCorrect: false,
+                                                },
+                                              });
+                                            }}
+                                            className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 text-[10px]"
+                                          >
+                                            Clear
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      {/* 96-Well Plate Map Preview */}
+                                      <div className="pt-2">
+                                        <span className="text-[10px] uppercase text-slate-400 font-semibold block mb-1">
+                                          96-Well Plate Map (Columns 1–12 Left to Right, Rows A–H)
+                                        </span>
+                                        <pre className="p-2.5 rounded bg-slate-950/90 border border-slate-800 text-[10px] font-mono text-cyan-300 leading-tight overflow-x-auto whitespace-pre">
+                                          {render96WellPlateMarkdown(
+                                            curSeed.seededColumns,
+                                            curSeed.seededWells
+                                          )}
+                                        </pre>
+                                        <p className="text-[10px] text-slate-500 mt-1">
+                                          96-well plate does not use cryo-box top-left black marker. Rows A–H, columns 1–12 left to right. [X] = Seeded well, [ ] = Unseeded well.
+                                        </p>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      {hitlCommitError && (
+                        <div className="flex items-start gap-2 p-3 rounded-lg bg-red-950/60 border border-red-800/80 text-red-200 text-xs font-mono">
+                          <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                          <span>{hitlCommitError}</span>
+                        </div>
+                      )}
+
+                      {hitlCommitSuccess && (
+                        <div className="flex items-start gap-2 p-3 rounded-lg bg-emerald-950/60 border border-emerald-800/80 text-emerald-200 text-xs font-mono">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                          <span>{hitlCommitSuccess}</span>
+                        </div>
+                      )}
+
+                      {isHitlCommitted ? (
+                        <div className="flex items-center justify-end gap-3 pt-1">
+                          <div className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-xs font-mono font-semibold">
+                            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                            <span>Experiment Archive Notebook has been committed to database.</span>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={isUndoingHitl}
+                            onClick={() => handleUndoHitlCommit(selectedVideo.videoId)}
+                            data-testid="hitl-undo-commit-archive-btn"
+                            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-amber-300 border border-amber-500/40 hover:border-amber-500 transition-all shadow-sm"
+                            title="Unlock notebook notes to edit and re-commit"
+                          >
+                            {isUndoingHitl ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <RotateCcw className="w-3.5 h-3.5" />
+                            )}
+                            <span>Undo Commit</span>
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex justify-end pt-1">
+                          <button
+                            type="button"
+                            disabled={isCommittingHitl}
+                            onClick={handleCommitArchiveHitl}
+                            data-testid="hitl-commit-archive-btn"
+                            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white shadow-lg shadow-indigo-600/20 transition-all"
+                          >
+                            {isCommittingHitl ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                            )}
+                            <span>Commit to Database (Experiment Archive Notebook)</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                }
 
                 if (pass1Actions.length === 0) return null;
 
@@ -3435,12 +5560,27 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                     {isHitlCommitted ? (
                       <div
                         data-testid="hitl-actions-committed-status"
-                        className="flex items-center justify-end pt-1"
+                        className="flex items-center justify-end gap-3 pt-1"
                       >
                         <div className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-xs font-mono font-semibold">
                           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                           <span>Inventory update actions have been committed.</span>
                         </div>
+                        <button
+                          type="button"
+                          disabled={isUndoingHitl}
+                          onClick={() => handleUndoHitlCommit(selectedVideo.videoId)}
+                          data-testid="hitl-undo-commit-inventory-btn"
+                          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-amber-300 border border-amber-500/40 hover:border-amber-500 transition-all shadow-sm"
+                          title="Unlock inventory actions to edit and re-commit"
+                        >
+                          {isUndoingHitl ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <RotateCcw className="w-3.5 h-3.5" />
+                          )}
+                          <span>Undo Commit</span>
+                        </button>
                       </div>
                     ) : (
                       <div className="flex justify-end pt-1">

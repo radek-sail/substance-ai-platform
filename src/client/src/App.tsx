@@ -1,10 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { RibbonNav, WorkflowTab } from './components/layout/RibbonNav';
 import { VideoPlayer } from './components/timeline/VideoPlayer';
 import { TimelineViewer } from './components/timeline/TimelineViewer';
 import { BoxGridView } from './components/inventory/BoxGridView';
 import { VialInspector, HumanEditedVialData } from './components/inventory/VialInspector';
 import { CryoInventory } from './components/inventory/CryoInventory';
+import { ExperimentArchive } from './components/archive/ExperimentArchive';
 import { MicroplateView } from './components/archive/MicroplateView';
 import {
   NotebookEditor,
@@ -22,6 +23,7 @@ import {
   SAMPLE_INVENTORY_ANALYSIS,
   SAMPLE_ARCHIVE_ANALYSIS,
   compileArchiveMarkdownFromAnalysis,
+  deriveArchiveDataFromAnalysis,
 } from './services/api.service';
 import type { VideoAnalysisDoc, VideoRecord } from '@sail/shared';
 import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
@@ -161,6 +163,7 @@ export const App: React.FC = () => {
   // Navigation tab state
   const [activeTab, setActiveTab] = useState<WorkflowTab>('inventory');
   const [selectedInventoryId, setSelectedInventoryId] = useState<string | null>(null);
+  const [selectedArchiveId, setSelectedArchiveId] = useState<string | null>(null);
 
   // Multi-tenant configuration
   const [tenant, setTenant] = useState<TenantConfig>(DEFAULT_TENANT_CONFIG);
@@ -192,6 +195,12 @@ export const App: React.FC = () => {
   const [markdownDoc, setMarkdownDoc] = useState<string>(DEFAULT_EXPERIMENT_MARKDOWN);
   const [reagentMappings] = useState<ReagentMapping[]>(DEFAULT_REAGENTS);
 
+  // Derived structured archive data from active video analysis
+  const derivedArchiveData = useMemo(
+    () => deriveArchiveDataFromAnalysis(analysis),
+    [analysis]
+  );
+
   // Sign-Off & Lock State
   const [isSignedOff, setIsSignedOff] = useState<boolean>(false);
   const [isSignOffModalOpen, setIsSignOffModalOpen] = useState<boolean>(false);
@@ -217,6 +226,22 @@ export const App: React.FC = () => {
     setActiveVideoId(videoId);
     setAnalysis(doc);
     setIsSignedOff(Boolean(doc.isSignedOff));
+
+    const rawActionArchiveId = doc.actions?.[0]?.archiveId;
+    const validActionArchiveId =
+      typeof rawActionArchiveId === 'string' &&
+      rawActionArchiveId.trim().length > 0 &&
+      !/\s/.test(rawActionArchiveId.trim())
+        ? rawActionArchiveId.trim()
+        : undefined;
+    const docArchiveId = (doc as any)?.archiveId || validActionArchiveId;
+    if (docArchiveId) {
+      setSelectedArchiveId(docArchiveId);
+    }
+    const docInventoryId = (doc as any)?.inventoryId || doc.actions?.[0]?.inventoryId;
+    if (docInventoryId) {
+      setSelectedInventoryId(docInventoryId);
+    }
 
     const maxEnd = doc.events?.reduce((max, e) => Math.max(max, e.endTime || 0), 0) || 0;
     const fallbackDuration = targetTab === 'archive' ? 45.0 : 35.0;
@@ -279,6 +304,12 @@ export const App: React.FC = () => {
   ) => {
     const videoId = video.videoId;
     setActiveVideoId(videoId);
+    if (video.archiveId) {
+      setSelectedArchiveId(video.archiveId);
+    }
+    if (video.inventoryId) {
+      setSelectedInventoryId(video.inventoryId);
+    }
 
     if (cachedAnalysis) {
       applyAnalysisDocument(videoId, cachedAnalysis);
@@ -329,14 +360,21 @@ export const App: React.FC = () => {
     targetTab: 'inventory' | 'archive' | 'hitl',
     analysisDoc?: VideoAnalysisDoc
   ) => {
+    const isArchiveDoc =
+      analysisDoc?.workflowClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+      analysisDoc?.workloadClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+      Boolean((analysisDoc as any)?.archiveId) ||
+      (Array.isArray(analysisDoc?.reagents) && analysisDoc.reagents.length > 0) ||
+      (Array.isArray(analysisDoc?.workSteps) && analysisDoc.workSteps.length > 0) ||
+      (Array.isArray(analysisDoc?.actions) &&
+        analysisDoc.actions.some((a: any) => {
+          const cls = String(a?.actionType || a?.actionClass || '').toUpperCase();
+          return cls.includes('MIX') || cls.includes('SEED');
+        })) ||
+      videoId.toLowerCase().includes('archive');
+
     const resolvedTab: WorkflowTab =
-      targetTab === 'hitl'
-        ? analysisDoc?.workflowClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
-          analysisDoc?.workloadClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
-          videoId.toLowerCase().includes('archive')
-          ? 'archive'
-          : 'inventory'
-        : targetTab;
+      targetTab === 'hitl' ? (isArchiveDoc ? 'archive' : 'inventory') : targetTab;
 
     setActiveVideoId(videoId);
     setActiveTab(resolvedTab);
@@ -348,6 +386,44 @@ export const App: React.FC = () => {
         showToast('info', `Opened HITL Sign-Off review for ${videoId}`);
       } else {
         showToast('info', `Loaded stream ${videoId} into ${resolvedTab} manager`);
+      }
+
+      // If archive analysisDoc was constructed from partial client cache without reagents/workSteps,
+      // refresh from backend video_analyses/{videoId} and merge without losing client overrides
+      const isNonDemo =
+        videoId !== 'vid_cryo_demo_01' && videoId !== 'vid_archive_demo_02';
+      const needsServerEnrichment =
+        isNonDemo &&
+        resolvedTab === 'archive' &&
+        (!Array.isArray(analysisDoc.reagents) || analysisDoc.reagents.length === 0 ||
+          !Array.isArray(analysisDoc.workSteps) || analysisDoc.workSteps.length === 0);
+      if (needsServerEnrichment) {
+        try {
+          const fetchedDoc = await apiService.fetchVideoAnalysis(videoId, {
+            customerId: tenant.customerId,
+            databaseId: tenant.databaseId,
+          });
+          const mergedDoc: VideoAnalysisDoc = {
+            ...fetchedDoc,
+            ...analysisDoc,
+            reagents:
+              Array.isArray(analysisDoc.reagents) && analysisDoc.reagents.length > 0
+                ? analysisDoc.reagents
+                : fetchedDoc.reagents,
+            workSteps:
+              Array.isArray(analysisDoc.workSteps) && analysisDoc.workSteps.length > 0
+                ? analysisDoc.workSteps
+                : fetchedDoc.workSteps,
+            labelTranscriptions:
+              Array.isArray((analysisDoc as any).labelTranscriptions) &&
+              (analysisDoc as any).labelTranscriptions.length > 0
+                ? (analysisDoc as any).labelTranscriptions
+                : (fetchedDoc as any).labelTranscriptions,
+          };
+          applyAnalysisDocument(videoId, mergedDoc, resolvedTab);
+        } catch {
+          // keep local analysisDoc
+        }
       }
       return;
     }
@@ -399,6 +475,19 @@ export const App: React.FC = () => {
     setSignOffVersion((v) => v + 1);
     setActiveTab('inventory');
     showToast('info', `Navigated to Cryo-Inventory${inventoryId ? ` (${inventoryId})` : ''}`);
+  };
+
+  // Handle direct navigation to archive tab with pre-selected archive ID
+  const handleNavigateToArchive = (archiveId?: string, videoId?: string) => {
+    if (archiveId) {
+      setSelectedArchiveId(archiveId);
+    }
+    if (videoId) {
+      setActiveVideoId(videoId);
+    }
+    setSignOffVersion((v) => v + 1);
+    setActiveTab('archive');
+    showToast('info', `Navigated to Experiment Archive${archiveId ? ` (${archiveId})` : ''}`);
   };
 
   // Handle seeking from timeline
@@ -461,10 +550,50 @@ export const App: React.FC = () => {
 
   // Handle sign-off commit success
   const handleSignOffSuccess = (res: SignOffResponse) => {
+    const details = (res.details || res) as Record<string, any>;
+    const committedArchiveId = details?.archiveId || derivedArchiveData.archiveId;
     setIsSignedOff(true);
+    if (typeof details?.markdownDoc === 'string' && details.markdownDoc.trim()) {
+      setMarkdownDoc(details.markdownDoc);
+    }
+    setAnalysis((prev) =>
+      prev
+        ? ({
+            ...prev,
+            isSignedOff: true,
+            ...(committedArchiveId ? { archiveId: committedArchiveId } : {}),
+            ...(Array.isArray(details?.reagents) ? { reagents: details.reagents } : {}),
+            ...(Array.isArray(details?.labelTranscriptions)
+              ? { labelTranscriptions: details.labelTranscriptions }
+              : {}),
+            ...(Array.isArray(details?.workSteps) ? { workSteps: details.workSteps } : {}),
+            ...(typeof details?.markdownDoc === 'string'
+              ? { markdownDoc: details.markdownDoc }
+              : {}),
+          } as VideoAnalysisDoc)
+        : prev
+    );
+    if (committedArchiveId) {
+      setSelectedArchiveId(committedArchiveId);
+    }
     setSignOffVersion((v) => v + 1);
-    setAnalysis((prev) => (prev ? { ...prev, isSignedOff: true } : prev));
     showToast('success', res.message);
+  };
+
+  const handleUndoSignOff = async () => {
+    if (!activeVideoId) return;
+    try {
+      await apiService.undoVideoCommit(activeVideoId, {
+        customerId: tenant.customerId,
+        databaseId: tenant.databaseId,
+      });
+      setIsSignedOff(false);
+      setSignOffVersion((v) => v + 1);
+      setAnalysis((prev) => (prev ? { ...prev, isSignedOff: false, signedOffAt: undefined } : prev));
+      showToast('success', 'Sign-off undone. Experiment notes can now be modified and re-committed.');
+    } catch (err: any) {
+      showToast('error', `Failed to undo sign-off: ${err?.message || 'Unknown error'}`);
+    }
   };
 
   // Parse row and col for BoxGridView with safe fallback
@@ -510,6 +639,7 @@ export const App: React.FC = () => {
           showToast('success', 'Tenant context updated');
         }}
         isSignedOff={isSignedOff}
+        onUndoSignOff={handleUndoSignOff}
         onOpenSignOffModal={async () => {
           if (
             !analysis &&
@@ -525,6 +655,8 @@ export const App: React.FC = () => {
             } catch {
               // Proceed to open sign-off modal with current state
             }
+          } else if (activeTab === 'archive' && (!analysis || analysis.videoId === 'vid_cryo_demo_01')) {
+            applyAnalysisDocument('vid_archive_demo_02', SAMPLE_ARCHIVE_ANALYSIS, 'archive');
           }
           setIsSignOffModalOpen(true);
         }}
@@ -600,6 +732,7 @@ export const App: React.FC = () => {
             onSelectActiveStream={handleSelectActiveStream}
             onSelectVideoForReview={handleSelectVideoFromManager}
             onNavigateToInventory={handleNavigateToInventory}
+            onNavigateToArchive={handleNavigateToArchive}
             onSeekVideo={handleTimelineSeek}
             currentTime={currentTime}
           />
@@ -668,62 +801,17 @@ export const App: React.FC = () => {
                 signOffVersion={signOffVersion}
               />
             ) : (
-              <div className="space-y-6">
-                {/* Top Workspace: Synchronized Video & Timeline Scrubber */}
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-                  {/* HTML5 Programmatic Video Player */}
-                  <div className="lg:col-span-5">
-                    <VideoPlayer
-                      currentTime={currentTime}
-                      duration={duration}
-                      isPlaying={isPlaying}
-                      onTimeUpdate={setCurrentTime}
-                      onDurationChange={setDuration}
-                      onPlayPause={setIsPlaying}
-                      seekTarget={seekTarget}
-                      onSeekHandled={() => setSeekTarget(null)}
-                    />
-                  </div>
-
-                  {/* Synchronized Recharts Audio Waveform & Multi-Track Timeline */}
-                  <div className="lg:col-span-7">
-                    <TimelineViewer
-                      duration={duration}
-                      currentTime={currentTime}
-                      actions={safeActions}
-                      events={safeEvents}
-                      selectedActionId={selectedActionId}
-                      selectedEventId={selectedEventId}
-                      onSeek={handleTimelineSeek}
-                      onSelectAction={handleSelectAction}
-                      onSelectEvent={handleSelectEvent}
-                    />
-                  </div>
-                </div>
-
-                {/* Bottom Workspace: Domain Specific Panels */}
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-                  {/* 96-Well Microplate View with 8-Channel Multichannel Pipette Confirmation */}
-                  <div className="lg:col-span-6">
-                    <MicroplateView
-                      seededColumns={seededColumns}
-                      volumePerWellUls={100}
-                      onToggleColumn={handleTogglePlateColumn}
-                      readOnly={isSignedOff}
-                    />
-                  </div>
-
-                  {/* ELN Markdown Editor & Reagent Acronym Resolver */}
-                  <div className="lg:col-span-6">
-                    <NotebookEditor
-                      markdownDoc={markdownDoc}
-                      onChangeMarkdown={setMarkdownDoc}
-                      reagentMappings={reagentMappings}
-                      readOnly={isSignedOff}
-                    />
-                  </div>
-                </div>
-              </div>
+              <ExperimentArchive
+                tenant={tenant}
+                selectedArchiveId={
+                  selectedArchiveId ||
+                  (activeTab === 'archive' && derivedArchiveData.archiveId ? derivedArchiveData.archiveId : null)
+                }
+                onSelectArchiveId={setSelectedArchiveId}
+                onSeekVideo={handleTimelineSeek}
+                signOffVersion={signOffVersion}
+                activeAnalysis={analysis}
+              />
             )}
           </div>
         )}
@@ -748,6 +836,9 @@ export const App: React.FC = () => {
           'tank_alpha_01'
         }
         archiveId={
+          selectedArchiveId ||
+          (analysis as any)?.archiveId ||
+          derivedArchiveData.archiveId ||
           analysis?.actions?.[0]?.archiveId ||
           analysis?.workflowClassification?.archiveName ||
           'archive_exp_402'
@@ -758,7 +849,19 @@ export const App: React.FC = () => {
           setEditedInventoryData((prev) => ({ ...prev, [field]: val }))
         }
         inventoryActions={safeActions}
-        markdownDoc={markdownDoc}
+        markdownDoc={
+          activeTab === 'archive' ||
+          analysis?.workflowClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+          analysis?.workloadClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+            ? (derivedArchiveData.markdownDoc || markdownDoc)
+            : markdownDoc
+        }
+        archiveName={derivedArchiveData.archiveName}
+        creatorName={derivedArchiveData.creatorName}
+        creationDate={derivedArchiveData.creationDate}
+        reagents={derivedArchiveData.reagents}
+        labelTranscriptions={derivedArchiveData.labelTranscriptions}
+        workSteps={derivedArchiveData.workSteps}
         onCommitSuccess={handleSignOffSuccess}
       />
     </div>

@@ -17,12 +17,19 @@ import {
   type InventoryBox,
   type InventoryCell,
   type CreateInventoryInput,
+  type ArchiveRecord,
+  type ArchiveReagent,
+  type ArchiveWorkStep,
+  type CreateArchiveInput,
+  render96WellPlateMarkdown,
+  generateReagentAcronym,
   DEFAULT_VIDEO_PASSES,
 } from '@sail/shared';
 import { auth } from '../firebase';
 
 export type { VideoRecord, VideoStatus, VideoPasses, PassStepState, PassStatus };
 export type { InventoryRecord, InventoryBox, InventoryCell, CreateInventoryInput };
+export type { ArchiveRecord, ArchiveReagent, ArchiveWorkStep, CreateArchiveInput };
 export { DEFAULT_VIDEO_PASSES };
 
 export interface TenantConfig {
@@ -643,6 +650,230 @@ export class ApiService {
   }
 
   /**
+   * GET all archives from `/api/archives`.
+   */
+  public async fetchArchives(options?: { customerId?: string; databaseId?: string }): Promise<ArchiveRecord[]> {
+    try {
+      const headers = await this.getHeaders({
+        'x-customer-id': options?.customerId || this.tenant.customerId,
+        'x-database-id': options?.databaseId || this.tenant.databaseId,
+      });
+      const res = await fetch(`${this.baseUrl}/api/archives`, {
+        method: 'GET',
+        headers,
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json)) return json as ArchiveRecord[];
+        if (json && Array.isArray(json.archives)) return json.archives as ArchiveRecord[];
+      }
+    } catch (err) {
+      console.warn('[ApiService] Failed to fetch archives from /api/archives:', err);
+    }
+    return [];
+  }
+
+  /**
+   * GET single archive from `/api/archives/:id`.
+   */
+  public async fetchArchiveById(
+    id: string,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<ArchiveRecord | null> {
+    try {
+      const headers = await this.getHeaders({
+        'x-customer-id': options?.customerId || this.tenant.customerId,
+        'x-database-id': options?.databaseId || this.tenant.databaseId,
+      });
+      const res = await fetch(`${this.baseUrl}/api/archives/${encodeURIComponent(id)}`, {
+        method: 'GET',
+        headers,
+      });
+      if (res.ok) {
+        return (await res.json()) as ArchiveRecord;
+      }
+    } catch (err) {
+      console.warn(`[ApiService] Failed to fetch archive ${id}:`, err);
+    }
+    return null;
+  }
+
+  /**
+   * POST to `/api/archives` to create a new experiment archive.
+   */
+  public async createArchive(
+    payload: CreateArchiveInput,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<ArchiveRecord & { video?: VideoRecord }> {
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
+    const customerId = options?.customerId || this.tenant.customerId;
+
+    const headers = await this.getHeaders({
+      'Content-Type': 'application/json',
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+    });
+
+    const res = await fetch(`${this.baseUrl}/api/archives`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to create archive: status ${res.status}`);
+    }
+
+    return await res.json();
+  }
+
+  /**
+   * POST to `/api/archives/:id/empty` (or `/api/archives/:id/erase`) to erase notebook content.
+   */
+  public async emptyArchive(
+    id: string,
+    options?: {
+      customerId?: string;
+      databaseId?: string;
+      name?: string;
+      creatorName?: string | null;
+      creationDate?: string | null;
+    }
+  ): Promise<ArchiveRecord | null> {
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
+    const customerId = options?.customerId || this.tenant.customerId;
+
+    const headers = await this.getHeaders({
+      'Content-Type': 'application/json',
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+    });
+
+    const res = await fetch(`${this.baseUrl}/api/archives/${encodeURIComponent(id)}/empty`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        databaseId,
+        ...(options?.name ? { name: options.name } : {}),
+        ...(options?.creatorName !== undefined ? { creatorName: options.creatorName } : {}),
+        ...(options?.creationDate !== undefined ? { creationDate: options.creationDate } : {}),
+      }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to erase archive notebook content: status ${res.status}`);
+    }
+
+    const json = await res.json();
+    return (json?.archive || json) as ArchiveRecord;
+  }
+
+  /**
+   * DELETE `/api/archives/:id` to delete an experiment archive.
+   */
+  public async deleteArchive(
+    id: string,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<{ success: boolean; deletedId: string }> {
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
+    const customerId = options?.customerId || this.tenant.customerId;
+
+    const headers = await this.getHeaders({
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+    });
+
+    const res = await fetch(`${this.baseUrl}/api/archives/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers,
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to delete archive: status ${res.status}`);
+    }
+
+    return await res.json();
+  }
+
+  /**
+   * POST /api/videos/:videoId/associate-archive
+   * Manually associates an uploaded video with an archive record.
+   */
+  public async associateVideoArchive(
+    videoId: string,
+    archiveId: string,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<{
+    success: boolean;
+    video: VideoRecord;
+    archiveId: string;
+    archiveName: string;
+    archiveCreatorName?: string | null;
+    archiveCreationDate?: string | null;
+  }> {
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
+    const customerId = options?.customerId || this.tenant.customerId;
+
+    const headers = await this.getHeaders({
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+      'Content-Type': 'application/json',
+    });
+
+    const res = await fetch(`${this.baseUrl}/api/videos/${encodeURIComponent(videoId)}/associate-archive`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ archiveId }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to associate archive: status ${res.status}`);
+    }
+
+    return await res.json();
+  }
+
+  /**
+   * POST /api/videos/:videoId/undo-commit
+   * Reverts HITL sign-off and resets video commit state to PENDING.
+   */
+  public async undoVideoCommit(
+    videoId: string,
+    options?: { customerId?: string; databaseId?: string }
+  ): Promise<{ success: boolean; videoId: string; passes?: VideoPasses; isSignedOff?: boolean }> {
+    const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
+    const databaseId = rawDbId === 'customer-alpha-db' ? '(default)' : rawDbId;
+    const customerId = options?.customerId || this.tenant.customerId;
+
+    const headers = await this.getHeaders({
+      'x-customer-id': customerId,
+      'x-database-id': databaseId,
+      'Content-Type': 'application/json',
+    });
+
+    const res = await fetch(`${this.baseUrl}/api/videos/${encodeURIComponent(videoId)}/undo-commit`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ databaseId }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Failed to undo commit for video ${videoId}: status ${res.status}`);
+    }
+
+    return await res.json();
+  }
+
+  /**
    * POST /api/videos/:videoId/associate-inventory
    * Manually associates an uploaded video with an inventory record.
    */
@@ -708,7 +939,10 @@ export class ApiService {
         const json = await response.json();
         const parsed = VideoAnalysisDocSchema.safeParse(json);
         if (parsed.success) {
-          return parsed.data;
+          return {
+            ...json,
+            ...parsed.data,
+          } as VideoAnalysisDoc;
         }
         return json as VideoAnalysisDoc;
       }
@@ -717,25 +951,83 @@ export class ApiService {
       if (!isDemoStream) {
         try {
           const passesRes = await this.fetchVideoPasses(videoId, { customerId, databaseId });
-          const p = passesRes?.passes;
+          const p = passesRes?.passes as Record<string, any> | undefined;
           if (
             p &&
             (p.pass2?.status === 'COMPLETED' || p.pass3?.status === 'COMPLETED')
           ) {
-            const classification = p.pass0?.data || {
+            const topArchiveId = (passesRes as any)?.archiveId || undefined;
+            const topArchiveName = (passesRes as any)?.archiveName || undefined;
+            const topCreatorName = (passesRes as any)?.archiveCreatorName || undefined;
+            const topCreationDate = (passesRes as any)?.archiveCreationDate || undefined;
+            const rawClassification = p.pass0?.data || {
               workflowType: 'INVENTORY_UPDATE_WORKFLOW',
               transcribedAudio: '',
             };
+            const classification = topArchiveName
+              ? {
+                  ...rawClassification,
+                  archiveName: topArchiveName,
+                  ...(topCreatorName ? { creatorName: topCreatorName } : {}),
+                  ...(topCreationDate ? { creationDate: topCreationDate } : {}),
+                }
+              : rawClassification;
+            const rawPass1 = p.pass1?.data;
+            const actions = Array.isArray(rawPass1)
+              ? rawPass1
+              : Array.isArray(rawPass1?.actions)
+              ? rawPass1.actions
+              : [];
+            const rawPass2 = p.pass2?.data;
+            const events = Array.isArray(rawPass2)
+              ? rawPass2
+              : Array.isArray(rawPass2?.events)
+              ? rawPass2.events
+              : [];
+            const rawPass3 = p.pass3?.data;
+            const refinements = Array.isArray(rawPass3)
+              ? rawPass3
+              : Array.isArray(rawPass3?.refinements)
+              ? rawPass3.refinements
+              : [];
+            const reagents = Array.isArray(p.hitl?.data?.reagents)
+              ? p.hitl.data.reagents
+              : Array.isArray(p.pass3?.reagents)
+              ? p.pass3.reagents
+              : Array.isArray(rawPass3?.reagents)
+              ? rawPass3.reagents
+              : undefined;
+            const workSteps = Array.isArray(p.hitl?.data?.workSteps)
+              ? p.hitl.data.workSteps
+              : Array.isArray(p.pass3?.workSteps)
+              ? p.pass3.workSteps
+              : Array.isArray(rawPass3?.workSteps)
+              ? rawPass3.workSteps
+              : undefined;
+            const labelTranscriptions = Array.isArray(p.hitl?.data?.labelTranscriptions)
+              ? p.hitl.data.labelTranscriptions
+              : Array.isArray(p.pass3?.labelTranscriptions)
+              ? p.pass3.labelTranscriptions
+              : Array.isArray(rawPass3?.labelTranscriptions)
+              ? rawPass3.labelTranscriptions
+              : undefined;
             return {
               videoId,
+              ...(topArchiveId ? { archiveId: topArchiveId } : {}),
+              ...(topArchiveName ? { archiveName: topArchiveName } : {}),
+              ...(topCreatorName ? { creatorName: topCreatorName } : {}),
+              ...(topCreationDate ? { creationDate: topCreationDate } : {}),
               workflowClassification: classification,
               workloadClassification: classification,
-              actions: Array.isArray(p.pass1?.data) ? p.pass1.data : [],
-              events: Array.isArray(p.pass2?.data) ? p.pass2.data : [],
-              refinements: Array.isArray(p.pass3?.data) ? p.pass3.data : [],
+              actions,
+              events,
+              refinements,
+              ...(reagents ? { reagents } : {}),
+              ...(workSteps ? { workSteps } : {}),
+              ...(labelTranscriptions ? { labelTranscriptions } : {}),
               isSignedOff: p.hitl?.status === 'COMPLETED',
               updatedAt: p.pass3?.completedAt || p.pass2?.completedAt || new Date().toISOString(),
-            };
+            } as VideoAnalysisDoc;
           }
         } catch {
           // Ignore pass fallback error
@@ -1032,13 +1324,29 @@ export class ApiService {
     databaseId: string,
     videoId: string,
     archiveId: string,
-    markdownDoc: string
+    markdownDoc: string,
+    notebookData?: {
+      archiveName?: string;
+      creatorName?: string | null;
+      creationDate?: string | null;
+      reagents?: ArchiveReagent[];
+      labelTranscriptions?: string[];
+      workSteps?: ArchiveWorkStep[];
+      replaceArchiveContent?: boolean;
+    }
   ): Promise<SignOffResponse> {
     const payload: ArchiveSignOffPayload = {
       databaseId,
       videoId,
       archiveId,
       markdownDoc,
+      ...(notebookData?.archiveName ? { archiveName: notebookData.archiveName } : {}),
+      ...(notebookData?.creatorName !== undefined ? { creatorName: notebookData.creatorName } : {}),
+      ...(notebookData?.creationDate !== undefined ? { creationDate: notebookData.creationDate } : {}),
+      ...(notebookData?.reagents ? { reagents: notebookData.reagents } : {}),
+      ...(notebookData?.labelTranscriptions ? { labelTranscriptions: notebookData.labelTranscriptions } : {}),
+      ...(notebookData?.workSteps ? { workSteps: notebookData.workSteps } : {}),
+      ...(notebookData?.replaceArchiveContent ? { replaceArchiveContent: true } : {}),
       signedOffAt: new Date().toISOString(),
       operatorInitials: this.tenant.operatorInitials,
     };
@@ -1167,8 +1475,365 @@ export const commitArchiveSignOff = (
   databaseId: string,
   videoId: string,
   archiveId: string,
-  markdownDoc: string
-) => apiService.commitArchiveSignOff(databaseId, videoId, archiveId, markdownDoc);
+  markdownDoc: string,
+  notebookData?: {
+    archiveName?: string;
+    creatorName?: string | null;
+    creationDate?: string | null;
+    reagents?: ArchiveReagent[];
+    labelTranscriptions?: string[];
+    workSteps?: ArchiveWorkStep[];
+    replaceArchiveContent?: boolean;
+  }
+) => apiService.commitArchiveSignOff(databaseId, videoId, archiveId, markdownDoc, notebookData);
+
+export const fetchArchives = (options?: { customerId?: string; databaseId?: string }) =>
+  apiService.fetchArchives(options);
+
+export const createArchive = (payload: CreateArchiveInput, options?: { customerId?: string; databaseId?: string }) =>
+  apiService.createArchive(payload, options);
+
+export const emptyArchive = (
+  id: string,
+  options?: {
+    customerId?: string;
+    databaseId?: string;
+    name?: string;
+    creatorName?: string | null;
+    creationDate?: string | null;
+  }
+) => apiService.emptyArchive(id, options);
+
+export const deleteArchive = (id: string, options?: { customerId?: string; databaseId?: string }) =>
+  apiService.deleteArchive(id, options);
+
+export const associateVideoArchive = (
+  videoId: string,
+  archiveId: string,
+  options?: { customerId?: string; databaseId?: string }
+) => apiService.associateVideoArchive(videoId, archiveId, options);
+
+export const undoVideoCommit = (videoId: string, options?: { customerId?: string; databaseId?: string }) =>
+  apiService.undoVideoCommit(videoId, options);
+
+/**
+ * Derives structured archive notebook metadata and tables from a VideoAnalysisDoc.
+ */
+export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null): {
+  archiveId: string;
+  archiveName: string;
+  creatorName: string;
+  creationDate: string;
+  reagents: ArchiveReagent[];
+  labelTranscriptions: string[];
+  workSteps: ArchiveWorkStep[];
+  markdownDoc: string;
+} {
+  if (!analysis) {
+    return {
+      archiveId: 'archive_exp_default',
+      archiveName: 'Experiment Archive',
+      creatorName: 'Lab Technician',
+      creationDate: new Date().toISOString().split('T')[0],
+      reagents: [],
+      labelTranscriptions: [],
+      workSteps: [],
+      markdownDoc: '',
+    };
+  }
+
+  const raw = analysis as Record<string, any>;
+  const classification = raw.workflowClassification || raw.workloadClassification || {};
+  const actionArchiveId = raw.actions?.[0]?.archiveId;
+  const isActionArchiveIdSlug =
+    typeof actionArchiveId === 'string' &&
+    actionArchiveId.trim().length > 0 &&
+    !/\s/.test(actionArchiveId.trim());
+  const archiveId =
+    raw.archiveId ||
+    (isActionArchiveIdSlug ? actionArchiveId : undefined) ||
+    (classification.archiveName ? classification.archiveName.toLowerCase().replace(/[^a-z0-9_-]/g, '_') : undefined) ||
+    'archive_exp_402';
+  const archiveName =
+    raw.archiveName ||
+    classification.archiveName ||
+    (!isActionArchiveIdSlug && actionArchiveId ? actionArchiveId : undefined) ||
+    'Experiment Archive';
+  const creatorName =
+    raw.creatorName ||
+    raw.archiveCreatorName ||
+    classification.creatorName ||
+    'Lab Technician';
+  const creationDate =
+    raw.creationDate ||
+    raw.archiveCreationDate ||
+    classification.creationDate ||
+    new Date().toISOString().split('T')[0];
+
+  const rawReagentCandidates =
+    Array.isArray(raw.reagents) && raw.reagents.length > 0
+      ? raw.reagents
+      : Array.isArray(raw.passes?.pass3?.reagents) && raw.passes.pass3.reagents.length > 0
+      ? raw.passes.pass3.reagents
+      : Array.isArray(raw.passes?.pass3?.data?.reagents) && raw.passes.pass3.data.reagents.length > 0
+      ? raw.passes.pass3.data.reagents
+      : [];
+
+  const reagents: ArchiveReagent[] = [...rawReagentCandidates];
+  const refinements = Array.isArray(raw.refinements) ? raw.refinements : [];
+  const events = Array.isArray(raw.events) ? raw.events : [];
+  const actions = Array.isArray(raw.actions) ? raw.actions : [];
+
+  if (reagents.length === 0) {
+    // Synthesize reagents from refinements, events, or actions when top-level reagents array is absent
+    const parseReagentText = (text: string, idx: number, eventId?: string): ArchiveReagent | null => {
+      const trimmed = String(text || '').trim();
+      if (!trimmed) return null;
+      const parts = trimmed.split('|').map((p) => p.trim());
+      const namePart = parts[0] || trimmed;
+      const acronymMatch = namePart.match(/\(([A-Za-z0-9_-]{2,12})\)\s*$/);
+      const reagentName = acronymMatch
+        ? namePart.slice(0, acronymMatch.index).trim()
+        : namePart;
+      let reagentAcronym = acronymMatch ? acronymMatch[1] : generateReagentAcronym(reagentName);
+      let manufacturer = 'N/A';
+      let catalogNumber = 'N/A';
+      let lotNumber = 'N/A';
+
+      for (const seg of parts.slice(1)) {
+        const mfgMatch = seg.match(/^(?:mfg|manufacturer)\s*[:=-]?\s*(.+)$/i);
+        const catMatch = seg.match(/^(?:cat(?:alog)?|ref)\s*#?\s*[:=-]?\s*(.+)$/i);
+        const lotMatch = seg.match(/^(?:lot)\s*#?\s*[:=-]?\s*(.+)$/i);
+        if (mfgMatch) manufacturer = mfgMatch[1].trim();
+        else if (catMatch) catalogNumber = catMatch[1].trim();
+        else if (lotMatch) lotNumber = lotMatch[1].trim();
+        else if (manufacturer === 'N/A') manufacturer = seg;
+      }
+
+      return {
+        id: `reagent_${idx + 1}`,
+        reagentName: reagentName || 'Unknown Reagent',
+        reagentAcronym: reagentAcronym || 'N/A',
+        manufacturer,
+        catalogNumber,
+        lotNumber,
+        rawLabelText: trimmed,
+        ...(eventId ? { eventId } : {}),
+      };
+    };
+
+    for (const ref of refinements) {
+      if (ref?.reagentData && typeof ref.reagentData === 'object' && ref.reagentData.reagentName) {
+        const rd = ref.reagentData;
+        reagents.push({
+          id: rd.id || `reagent_${reagents.length + 1}`,
+          reagentName: rd.reagentName,
+          reagentAcronym: rd.reagentAcronym || generateReagentAcronym(rd.reagentName),
+          manufacturer: rd.manufacturer || 'N/A',
+          catalogNumber: rd.catalogNumber || 'N/A',
+          lotNumber: rd.lotNumber || 'N/A',
+          ...(ref.transcriptionText ? { rawLabelText: ref.transcriptionText } : {}),
+          ...(ref.eventId ? { eventId: ref.eventId } : {}),
+        });
+      } else if (
+        ref?.refinementClass === 'REAGENT_OCR_CONFLATION' ||
+        ref?.refinementClass === 'ACRONYM_MAPPING' ||
+        ref?.refinementClass === 'REAGENT_ACRONYM_RESOLUTION'
+      ) {
+        const parsed = parseReagentText(ref.transcriptionText, reagents.length, ref.eventId);
+        if (parsed) reagents.push(parsed);
+      }
+    }
+
+    if (reagents.length === 0) {
+      for (const ev of events) {
+        if (
+          ev?.eventClass === 'REAGENT_BOTTLE_LABEL_SCAN' ||
+          ev?.eventType === 'REAGENT_LABEL_SCAN'
+        ) {
+          const parsed = parseReagentText(
+            ev.conflatedLabelText || ev.shot1LabelText || '',
+            reagents.length,
+            ev.eventId
+          );
+          if (parsed) reagents.push(parsed);
+        }
+      }
+    }
+  }
+
+  const rawTranscriptionCandidates =
+    Array.isArray(raw.labelTranscriptions) && raw.labelTranscriptions.length > 0
+      ? raw.labelTranscriptions
+      : Array.isArray(raw.passes?.pass3?.labelTranscriptions) &&
+        raw.passes.pass3.labelTranscriptions.length > 0
+      ? raw.passes.pass3.labelTranscriptions
+      : Array.isArray(raw.passes?.pass3?.data?.labelTranscriptions) &&
+        raw.passes.pass3.data.labelTranscriptions.length > 0
+      ? raw.passes.pass3.data.labelTranscriptions
+      : [];
+
+  let labelTranscriptions: string[] = rawTranscriptionCandidates
+    .map((lt: any) =>
+      typeof lt === 'string' ? lt : lt?.fullText || lt?.conflatedText || lt?.shot1Text || ''
+    )
+    .filter(Boolean);
+
+  if (labelTranscriptions.length === 0) {
+    const fallbackTranscriptions: string[] = [];
+    for (const r of reagents) {
+      if (r.rawLabelText && !fallbackTranscriptions.includes(r.rawLabelText)) {
+        fallbackTranscriptions.push(r.rawLabelText);
+      }
+    }
+    for (const ref of refinements) {
+      if (
+        (ref?.refinementClass === 'REAGENT_OCR_CONFLATION' ||
+          ref?.refinementClass === 'ACRONYM_MAPPING' ||
+          ref?.refinementClass === 'REAGENT_ACRONYM_RESOLUTION') &&
+        ref.transcriptionText &&
+        !fallbackTranscriptions.includes(ref.transcriptionText)
+      ) {
+        fallbackTranscriptions.push(ref.transcriptionText);
+      }
+    }
+    for (const ev of events) {
+      const evText = ev?.conflatedLabelText || ev?.shot1LabelText;
+      if (
+        (ev?.eventClass === 'REAGENT_BOTTLE_LABEL_SCAN' ||
+          ev?.eventType === 'REAGENT_LABEL_SCAN') &&
+        evText &&
+        !fallbackTranscriptions.includes(evText)
+      ) {
+        fallbackTranscriptions.push(evText);
+      }
+    }
+    labelTranscriptions = fallbackTranscriptions;
+  }
+
+  const rawWorkStepCandidates =
+    Array.isArray(raw.workSteps) && raw.workSteps.length > 0
+      ? raw.workSteps
+      : Array.isArray(raw.passes?.pass3?.workSteps) && raw.passes.pass3.workSteps.length > 0
+      ? raw.passes.pass3.workSteps
+      : Array.isArray(raw.passes?.pass3?.data?.workSteps) &&
+        raw.passes.pass3.data.workSteps.length > 0
+      ? raw.passes.pass3.data.workSteps
+      : [];
+
+  const workSteps: ArchiveWorkStep[] = [...rawWorkStepCandidates];
+  if (workSteps.length === 0 && actions.length > 0) {
+    actions.forEach((act: Record<string, any>, idx: number) => {
+      const cls = String(act.actionType || act.actionClass || '').toUpperCase();
+      if (!cls.includes('MIX') && !cls.includes('SEED')) return;
+      const isSeed = cls.includes('SEED');
+      const relatedEventIds: string[] = Array.isArray(act.eventList) ? act.eventList : [];
+      const relatedEvents = events.filter((e: any) => relatedEventIds.includes(e.eventId));
+      const relatedRefs = refinements.filter((r: any) => relatedEventIds.includes(r.eventId));
+      const startTimeSeconds = Number(
+        act.startTimestampSeconds ??
+          act.startTime ??
+          (relatedEvents.length > 0
+            ? Math.min(...relatedEvents.map((e: any) => Number(e.startTime ?? 0)))
+            : 0)
+      );
+      const endTimeSeconds = Number(
+        act.endTimestampSeconds ??
+          act.endTime ??
+          (relatedEvents.length > 0
+            ? Math.max(...relatedEvents.map((e: any) => Number(e.endTime ?? 0)))
+            : 0)
+      );
+
+      let mixReagentsData = act.mixReagentsData;
+      let seedReagentsData = act.seedReagentsData;
+
+      if (!isSeed && !mixReagentsData) {
+        const r1 = reagents[0];
+        const r2 = reagents[1] || reagents[0];
+        const refText = relatedRefs.map((r: any) => r.transcriptionText || '').join(' ');
+        const volMatches = refText.match(/\d+(?:\.\d+)?\s*(?:mL|uL|µL|L)\b/gi) || [];
+        mixReagentsData = {
+          firstReagentName: r1?.reagentName || 'Reagent 1',
+          firstReagentAmount: volMatches[0] || '500 mL',
+          secondReagentName: r2?.reagentName || 'Reagent 2',
+          secondReagentAmount: volMatches[1] || '50 mL',
+        };
+      } else if (isSeed && !seedReagentsData) {
+        const seedingRef = relatedRefs.find(
+          (r: any) =>
+            r.refinementClass === 'SEEDING_COUNT_VERIFICATION' || r.seedingVerificationData
+        );
+        const sv = seedingRef?.seedingVerificationData;
+        const seededCols =
+          Array.isArray(act.seededPlateColumns) && act.seededPlateColumns.length > 0
+            ? act.seededPlateColumns
+            : Array.isArray(sv?.seededColumns) && sv.seededColumns.length > 0
+            ? sv.seededColumns
+            : [1, 2, 3];
+        const pipetteType: 'Single-Channel' | 'Multi-Channel' =
+          sv?.pipetteType === 'Single-Channel' ? 'Single-Channel' : 'Multi-Channel';
+        const seedingEventsCount = Number(sv?.seedingEventsCount ?? seededCols.length);
+        const expectedSeedingEventsCount = Number(
+          sv?.expectedSeedingEventsCount ?? seededCols.length
+        );
+        seedReagentsData = {
+          cellsSeeded: act.cellLineName || sv?.cellsSeeded || 'HEK293T',
+          cellsPerWell: sv?.cellsPerWell || '5.0 x 10^4',
+          plateType: sv?.plateType || '96-Well Microplate',
+          pipetteType,
+          seededColumns: seededCols,
+          seedingEventsCount,
+          expectedSeedingEventsCount,
+          isSeedingCountCorrect:
+            sv?.isSeedingCountCorrect ?? seedingEventsCount === expectedSeedingEventsCount,
+        };
+      }
+
+      const stepNumber = workSteps.length + 1;
+      workSteps.push({
+        id: act.actionId || `step_${stepNumber}`,
+        stepId: act.actionId || `step_${stepNumber}`,
+        stepNumber,
+        actionType: isSeed ? 'SEED_REAGENTS' : 'MIX_REAGENTS',
+        startTimeSeconds,
+        endTimeSeconds,
+        description:
+          act.description ||
+          (isSeed && seedReagentsData
+            ? `Seeded ${seedReagentsData.cellsSeeded} (${seedReagentsData.cellsPerWell}) into ${seedReagentsData.plateType}.`
+            : mixReagentsData
+            ? `Mixed ${mixReagentsData.firstReagentAmount} of ${mixReagentsData.firstReagentName} with ${mixReagentsData.secondReagentAmount} of ${mixReagentsData.secondReagentName}.`
+            : isSeed
+            ? 'Seed reagents into plate'
+            : 'Mix two reagents'),
+        ...(mixReagentsData ? { mixReagentsData } : {}),
+        ...(seedReagentsData ? { seedReagentsData } : {}),
+        ...(raw.videoId ? { videoId: raw.videoId } : {}),
+      });
+    });
+  }
+
+  const markdownDoc =
+    raw.markdownDoc ||
+    compileArchiveMarkdownFromAnalysis({
+      ...raw,
+      reagents,
+      labelTranscriptions,
+      workSteps,
+    });
+
+  return {
+    archiveId,
+    archiveName,
+    creatorName,
+    creationDate,
+    reagents,
+    labelTranscriptions,
+    workSteps,
+    markdownDoc,
+  };
+}
 
 /**
  * Compiles a structured Experiment Notebook Markdown document (`## Description`, `## Reagents Used`, `## Experiment Steps`)
@@ -1186,14 +1851,26 @@ export function compileArchiveMarkdownFromAnalysis(
     'Experiment notebook entry compiled from SAIL video analysis.';
 
   const reagentLines: string[] = [];
+  const rawReagents = Array.isArray(src.reagents) ? src.reagents : [];
+  for (const r of rawReagents) {
+    if (r && typeof r === 'object' && r.reagentName) {
+      reagentLines.push(
+        `- **${r.reagentName}** (${r.reagentAcronym || 'N/A'}) | Manufacturer: ${
+          r.manufacturer || 'N/A'
+        } | Catalog/Ref #: ${r.catalogNumber || 'N/A'} | Lot #: ${r.lotNumber || 'N/A'}`
+      );
+    }
+  }
   const refinements = Array.isArray(src.refinements) ? src.refinements : [];
-  for (const ref of refinements) {
-    if (
-      ref.refinementClass === 'REAGENT_OCR_CONFLATION' ||
-      ref.refinementClass === 'ACRONYM_MAPPING' ||
-      ref.refinementClass === 'REAGENT_ACRONYM_RESOLUTION'
-    ) {
-      reagentLines.push(`- ${ref.transcriptionText}`);
+  if (reagentLines.length === 0) {
+    for (const ref of refinements) {
+      if (
+        ref.refinementClass === 'REAGENT_OCR_CONFLATION' ||
+        ref.refinementClass === 'ACRONYM_MAPPING' ||
+        ref.refinementClass === 'REAGENT_ACRONYM_RESOLUTION'
+      ) {
+        reagentLines.push(`- ${ref.transcriptionText}`);
+      }
     }
   }
   const actions = Array.isArray(src.actions) ? src.actions : [];
@@ -1207,18 +1884,63 @@ export function compileArchiveMarkdownFromAnalysis(
   }
 
   const stepLines: string[] = [];
-  actions.forEach((act: Record<string, any>, idx: number) => {
-    const relatedRefs = refinements.filter((r: Record<string, any>) =>
-      (act.eventList || []).includes(r.eventId)
-    );
-    const refText =
-      relatedRefs.length > 0
-        ? ` — ${relatedRefs.map((r: Record<string, any>) => r.transcriptionText).join('; ')}`
-        : '';
-    stepLines.push(
-      `${idx + 1}. **${act.actionClass}** (${act.actionId}): ${(act.eventList || []).length} events${refText}`
-    );
-  });
+  const rawWorkSteps = Array.isArray(src.workSteps) && src.workSteps.length > 0 ? src.workSteps : [];
+
+  if (rawWorkSteps.length > 0) {
+    rawWorkSteps.forEach((ws: any, idx: number) => {
+      const stepNo = ws.stepNumber || idx + 1;
+      if (
+        (ws.actionType === 'MIX_REAGENTS' || ws.actionType === 'REAGENT_MIXING_ACTION') &&
+        ws.mixReagentsData
+      ) {
+        const m = ws.mixReagentsData;
+        stepLines.push(
+          `${stepNo}. **Mix Reagents**: Mixed ${m.firstReagentAmount || 'N/A'} of ${m.firstReagentName || 'N/A'} with ${m.secondReagentAmount || 'N/A'} of ${m.secondReagentName || 'N/A'}.`
+        );
+      } else if (
+        (ws.actionType === 'SEED_REAGENTS' || ws.actionType === 'REAGENT_SEEDING_ACTION') &&
+        ws.seedReagentsData
+      ) {
+        const s = ws.seedReagentsData;
+        const countStatus =
+          s.isSeedingCountCorrect === false
+            ? `Count Mismatch (${s.seedingEventsCount}/${s.expectedSeedingEventsCount || 'N/A'})`
+            : `Verified (${s.seedingEventsCount}/${s.expectedSeedingEventsCount || s.seedingEventsCount} events)`;
+        const plateMap = render96WellPlateMarkdown(s.seededColumns, s.seededWells);
+        stepLines.push(
+          `${stepNo}. **Seed Reagents**: Seeded ${s.cellsSeeded || 'N/A'} (${s.cellsPerWell || 'N/A'}) into ${s.plateType || 'N/A'} using ${s.pipetteType || 'N/A'} — Seeding Events: ${countStatus}.\n\n${plateMap}`
+        );
+      } else {
+        stepLines.push(`${stepNo}. **${ws.actionType || 'Work Step'}**: ${ws.description || 'Executed step.'}`);
+      }
+    });
+  } else {
+    actions.forEach((act: Record<string, any>, idx: number) => {
+      if (act.mixReagentsData) {
+        const m = act.mixReagentsData;
+        stepLines.push(
+          `${idx + 1}. **Mix Reagents** (${act.actionId}): Mixed ${m.firstReagentAmount} of ${m.firstReagentName} with ${m.secondReagentAmount} of ${m.secondReagentName}`
+        );
+      } else if (act.seedReagentsData) {
+        const s = act.seedReagentsData;
+        const plateMap = render96WellPlateMarkdown(s.seededColumns, s.seededWells);
+        stepLines.push(
+          `${idx + 1}. **Seed Reagents** (${act.actionId}): Seeded ${s.cellsSeeded} (${s.cellsPerWell}) into ${s.plateType} with ${s.pipetteType} (${s.seedingEventsCount} seeding events)\n\n${plateMap}`
+        );
+      } else {
+        const relatedRefs = refinements.filter((r: Record<string, any>) =>
+          (act.eventList || []).includes(r.eventId)
+        );
+        const refText =
+          relatedRefs.length > 0
+            ? ` — ${relatedRefs.map((r: Record<string, any>) => r.transcriptionText).join('; ')}`
+            : '';
+        stepLines.push(
+          `${idx + 1}. **${act.actionClass}** (${act.actionId}): ${(act.eventList || []).length} events${refText}`
+        );
+      }
+    });
+  }
   if (stepLines.length === 0) {
     stepLines.push('1. Executed experiment steps.');
   }

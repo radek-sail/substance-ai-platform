@@ -11,6 +11,7 @@ import {
   Sliders,
   Sparkles,
   LogOut,
+  RotateCcw,
 } from 'lucide-react';
 import { TenantConfig, DEFAULT_GCS_BUCKET } from '../../services/api.service';
 
@@ -23,6 +24,7 @@ interface RibbonNavProps {
   onUpdateTenant: (tenant: Partial<TenantConfig>) => void;
   isSignedOff?: boolean;
   onOpenSignOffModal?: () => void;
+  onUndoSignOff?: () => void;
   videoTitle?: string;
   userEmail?: string | null;
   onSignOut?: () => void;
@@ -36,6 +38,7 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
   onUpdateTenant,
   isSignedOff = false,
   onOpenSignOffModal,
+  onUndoSignOff,
   userEmail,
   onSignOut,
   authControls,
@@ -151,9 +154,23 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
               {/* Sign-off status & commit trigger (only shown on Archive tab) */}
               {activeTab === 'archive' && (
                 isSignedOff ? (
-                  <div className="flex items-center gap-1.5 bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm shadow-emerald-950">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span>Signed Off</span>
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5 bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm shadow-emerald-950">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      <span>Signed Off</span>
+                    </div>
+                    {onUndoSignOff && (
+                      <button
+                        type="button"
+                        onClick={onUndoSignOff}
+                        data-testid="ribbon-undo-signoff-btn"
+                        className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 hover:border-slate-600 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors shadow-sm"
+                        title="Re-open experiment notes for editing and re-committing"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Undo Sign-Off</span>
+                      </button>
+                    )}
                   </div>
                 ) : (
                   <button

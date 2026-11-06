@@ -9,10 +9,35 @@ import {
   User,
   ShieldCheck,
   Lock,
+  FlaskConical,
+  BookOpen,
+  Calendar,
+  ListChecks,
+  Beaker,
+  Pipette,
+  Plus,
+  Trash2,
+  RefreshCw,
 } from 'lucide-react';
-import { TenantConfig, DEFAULT_GCS_BUCKET, apiService, SignOffResponse } from '../../services/api.service';
+import {
+  TenantConfig,
+  DEFAULT_GCS_BUCKET,
+  apiService,
+  SignOffResponse,
+  compileArchiveMarkdownFromAnalysis,
+} from '../../services/api.service';
 import { HumanEditedVialData } from '../inventory/VialInspector';
-import type { Action, BoxUpdate } from '@sail/shared';
+import {
+  type Action,
+  type BoxUpdate,
+  type ArchiveReagent,
+  type ArchiveWorkStep,
+  render96WellPlateMarkdown,
+  parseColumnNumbersFromText,
+  resolveSeededColumnsAndWells,
+  generateReagentAcronym,
+  computeExpectedSeedingEvents,
+} from '@sail/shared';
 
 interface SignOffModalProps {
   isOpen: boolean;
@@ -28,6 +53,12 @@ interface SignOffModalProps {
   inventoryActions?: Action[];
   editedActionsMap?: Record<string, HumanEditedVialData>;
   markdownDoc?: string;
+  archiveName?: string;
+  creatorName?: string;
+  creationDate?: string;
+  reagents?: ArchiveReagent[];
+  labelTranscriptions?: string[];
+  workSteps?: ArchiveWorkStep[];
   onCommitSuccess: (res: SignOffResponse) => void;
 }
 
@@ -45,6 +76,12 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
   inventoryActions = [],
   editedActionsMap = {},
   markdownDoc = '',
+  archiveName,
+  creatorName,
+  creationDate,
+  reagents,
+  labelTranscriptions,
+  workSteps,
   onCommitSuccess,
 }) => {
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -56,6 +93,109 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
       tenant.operatorInitials ||
       'RS'
   );
+
+  const [modalArchiveName, setModalArchiveName] = useState(archiveName || 'archive_exp_402');
+  const [modalCreationDate, setModalCreationDate] = useState(
+    creationDate || new Date().toISOString().split('T')[0]
+  );
+  const [modalCreatorName, setModalCreatorName] = useState(creatorName || 'Lab Technician');
+
+  const [modalReagents, setModalReagents] = useState<ArchiveReagent[]>(reagents || []);
+  const [modalTranscriptions, setModalTranscriptions] = useState<string[]>(labelTranscriptions || []);
+  const [modalWorkSteps, setModalWorkSteps] = useState<ArchiveWorkStep[]>(workSteps || []);
+  const [modalMarkdown, setModalMarkdown] = useState<string>(markdownDoc || '');
+
+  useEffect(() => {
+    if (archiveName) setModalArchiveName(archiveName);
+  }, [archiveName, isOpen]);
+
+  useEffect(() => {
+    if (creationDate) setModalCreationDate(creationDate);
+  }, [creationDate, isOpen]);
+
+  useEffect(() => {
+    if (creatorName) setModalCreatorName(creatorName);
+  }, [creatorName, isOpen]);
+
+  useEffect(() => {
+    if (reagents) setModalReagents(reagents);
+  }, [reagents, isOpen]);
+
+  useEffect(() => {
+    if (labelTranscriptions) setModalTranscriptions(labelTranscriptions);
+  }, [labelTranscriptions, isOpen]);
+
+  useEffect(() => {
+    if (workSteps) setModalWorkSteps(workSteps);
+  }, [workSteps, isOpen]);
+
+  useEffect(() => {
+    if (markdownDoc) setModalMarkdown(markdownDoc);
+  }, [markdownDoc, isOpen]);
+
+  const handleRegenerateMarkdown = () => {
+    const regenerated = compileArchiveMarkdownFromAnalysis({
+      videoId,
+      workflow: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+      archiveName: modalArchiveName,
+      creatorName: modalCreatorName,
+      creationDate: modalCreationDate,
+      reagents: modalReagents,
+      workSteps: modalWorkSteps,
+      labelTranscriptions: modalTranscriptions,
+    });
+    setModalMarkdown(regenerated);
+  };
+
+  const handleUpdateReagent = (idx: number, field: keyof ArchiveReagent, val: string) => {
+    setModalReagents((prev) =>
+      prev.map((r, i) => {
+        if (i !== idx) return r;
+        const updated = { ...r, [field]: val };
+        if (field === 'reagentName' && (!r.reagentAcronym || r.reagentAcronym === generateReagentAcronym(r.reagentName || ''))) {
+          updated.reagentAcronym = generateReagentAcronym(val);
+        }
+        return updated;
+      })
+    );
+  };
+
+  const handleAddReagent = () => {
+    setModalReagents((prev) => [
+      ...prev,
+      {
+        reagentName: '',
+        reagentAcronym: '',
+        manufacturer: '',
+        catalogNumber: '',
+        lotNumber: '',
+      },
+    ]);
+  };
+
+  const handleRemoveReagent = (idx: number) => {
+    setModalReagents((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const handleUpdateTranscription = (idx: number, val: string) => {
+    setModalTranscriptions((prev) =>
+      prev.map((t, i) => (i === idx ? val : t))
+    );
+  };
+
+  const handleAddTranscription = () => {
+    setModalTranscriptions((prev) => [...prev, '']);
+  };
+
+  const handleRemoveTranscription = (idx: number) => {
+    setModalTranscriptions((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const handleUpdateWorkStep = (idx: number, patch: Partial<ArchiveWorkStep>) => {
+    setModalWorkSteps((prev) =>
+      prev.map((s, i) => (i === idx ? { ...s, ...patch } : s))
+    );
+  };
 
   // Local editable fallback state when parent does not provide onChangeInventoryField
   const [localEdited, setLocalEdited] = useState<HumanEditedVialData>({
@@ -285,11 +425,44 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
           boxUpdates
         );
       } else {
+        const effectiveArchiveName = modalArchiveName || archiveName || 'archive_exp_402';
+        const effectiveCreatorName = modalCreatorName || creatorName || 'Lab Technician';
+        const effectiveCreationDate =
+          modalCreationDate || creationDate || new Date().toISOString().split('T')[0];
+
+        const baseMarkdown = modalMarkdown || markdownDoc || '';
+        const shouldCompileFromStructured =
+          !baseMarkdown.trim() ||
+          baseMarkdown.includes('- Verified protocol reagents') ||
+          baseMarkdown.includes('1. Executed experiment steps.');
+        const effectiveMarkdown =
+          shouldCompileFromStructured &&
+          (modalReagents.length > 0 || modalWorkSteps.length > 0)
+            ? compileArchiveMarkdownFromAnalysis({
+                videoId,
+                workflow: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+                archiveName: effectiveArchiveName,
+                creatorName: effectiveCreatorName,
+                creationDate: effectiveCreationDate,
+                reagents: modalReagents,
+                workSteps: modalWorkSteps,
+                labelTranscriptions: modalTranscriptions,
+              })
+            : baseMarkdown;
+
         result = await apiService.commitArchiveSignOff(
           tenant.databaseId,
           videoId,
           archiveId,
-          markdownDoc
+          effectiveMarkdown,
+          {
+            archiveName: effectiveArchiveName,
+            creatorName: effectiveCreatorName,
+            creationDate: effectiveCreationDate,
+            reagents: modalReagents,
+            labelTranscriptions: modalTranscriptions,
+            workSteps: modalWorkSteps,
+          }
         );
       }
 
@@ -303,8 +476,8 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-5 animate-in fade-in zoom-in-95 duration-150 my-8">
+  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto">
+    <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-3xl w-full p-6 shadow-2xl space-y-5 animate-in fade-in zoom-in-95 duration-150 my-8 max-h-[90vh] overflow-y-auto">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-800 pb-4">
           <div className="flex items-center gap-3">
@@ -435,13 +608,454 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
             </div>
           </div>
         ) : (
-          <div>
-            <h3 className="text-xs font-semibold text-slate-300 mb-2 flex items-center gap-1.5">
-              <FileCheck2 className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Experiment Archive ELN Markdown Payload</span>
-            </h3>
-            <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 text-xs font-mono text-slate-300 max-h-40 overflow-y-auto whitespace-pre-wrap">
-              {markdownDoc}
+          <div className="space-y-4">
+            {/* Section 1: Identification */}
+            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 space-y-2">
+              <div className="flex items-center gap-2 border-b border-slate-800/80 pb-2">
+                <BookOpen className="w-4 h-4 text-indigo-400" />
+                <span className="text-xs font-bold font-mono text-slate-200">
+                  1. Experiment Notebook Identification
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs font-mono">
+                <div>
+                  <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Archive Name</span>
+                  <input
+                    type="text"
+                    value={modalArchiveName}
+                    onChange={(e) => setModalArchiveName(e.target.value)}
+                    className="w-full mt-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-slate-100 text-xs focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Creation Date</span>
+                  <input
+                    type="text"
+                    value={modalCreationDate}
+                    onChange={(e) => setModalCreationDate(e.target.value)}
+                    className="w-full mt-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-slate-100 text-xs focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Creator / Operator</span>
+                  <input
+                    type="text"
+                    value={modalCreatorName}
+                    onChange={(e) => setModalCreatorName(e.target.value)}
+                    className="w-full mt-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-slate-100 text-xs focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Section 2: Reagents Table with Acronyms */}
+            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 space-y-2">
+              <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                <div className="flex items-center gap-2">
+                  <FlaskConical className="w-4 h-4 text-cyan-400" />
+                  <span className="text-xs font-bold font-mono text-slate-200">
+                    2. Extracted Reagents & Acronyms ({modalReagents.length})
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddReagent}
+                  className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono font-semibold rounded bg-indigo-950 text-indigo-300 border border-indigo-700 hover:bg-indigo-900 transition-colors"
+                >
+                  <Plus className="w-3 h-3" />
+                  <span>Add Reagent</span>
+                </button>
+              </div>
+              {modalReagents.length > 0 ? (
+                <div className="border border-slate-800 rounded-lg overflow-x-auto text-xs">
+                  <table className="w-full text-left font-mono">
+                    <thead className="bg-slate-900 border-b border-slate-800 text-[10px] text-slate-400">
+                      <tr>
+                        <th className="py-1.5 px-2.5">Reagent Name</th>
+                        <th className="py-1.5 px-2.5">Acronym</th>
+                        <th className="py-1.5 px-2.5">Manufacturer</th>
+                        <th className="py-1.5 px-2.5">Catalog #</th>
+                        <th className="py-1.5 px-2.5">Lot #</th>
+                        <th className="py-1.5 px-1.5 text-center">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60 bg-slate-950/40 text-[11px]">
+                      {modalReagents.map((r, idx) => (
+                        <tr key={idx} className="hover:bg-slate-900/40">
+                          <td className="py-1 px-2">
+                            <input
+                              type="text"
+                              value={r.reagentName || ''}
+                              onChange={(e) => handleUpdateReagent(idx, 'reagentName', e.target.value)}
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
+                              placeholder="Reagent name"
+                            />
+                          </td>
+                          <td className="py-1 px-2">
+                            <input
+                              type="text"
+                              value={r.reagentAcronym || ''}
+                              onChange={(e) => handleUpdateReagent(idx, 'reagentAcronym', e.target.value)}
+                              className="w-20 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-indigo-300 font-bold"
+                              placeholder="Acronym"
+                            />
+                          </td>
+                          <td className="py-1 px-2">
+                            <input
+                              type="text"
+                              value={r.manufacturer || ''}
+                              onChange={(e) => handleUpdateReagent(idx, 'manufacturer', e.target.value)}
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-300"
+                              placeholder="Manufacturer"
+                            />
+                          </td>
+                          <td className="py-1 px-2">
+                            <input
+                              type="text"
+                              value={r.catalogNumber || ''}
+                              onChange={(e) => handleUpdateReagent(idx, 'catalogNumber', e.target.value)}
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-300"
+                              placeholder="Catalog #"
+                            />
+                          </td>
+                          <td className="py-1 px-2">
+                            <input
+                              type="text"
+                              value={r.lotNumber || ''}
+                              onChange={(e) => handleUpdateReagent(idx, 'lotNumber', e.target.value)}
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-300"
+                              placeholder="Lot #"
+                            />
+                          </td>
+                          <td className="py-1 px-1.5 text-center">
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveReagent(idx)}
+                              className="p-1 hover:bg-slate-800 text-slate-400 hover:text-rose-400 rounded transition-colors"
+                              title="Delete reagent"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-xs text-slate-400 font-mono italic">No reagents detected. Click "Add Reagent" to add one.</p>
+              )}
+            </div>
+
+            {/* Section 3: Bottle Label Transcriptions */}
+            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 space-y-2">
+              <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                <div className="flex items-center gap-2">
+                  <FileCheck2 className="w-4 h-4 text-amber-400" />
+                  <span className="text-xs font-bold font-mono text-slate-200">
+                    3. Bottle Label Transcriptions ({modalTranscriptions.length})
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddTranscription}
+                  className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono font-semibold rounded bg-amber-950 text-amber-300 border border-amber-700 hover:bg-amber-900 transition-colors"
+                >
+                  <Plus className="w-3 h-3" />
+                  <span>Add Transcription</span>
+                </button>
+              </div>
+              {modalTranscriptions.length > 0 ? (
+                <div className="space-y-1.5 max-h-32 overflow-y-auto">
+                  {modalTranscriptions.map((lt, idx) => (
+                    <div key={idx} className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={lt}
+                        onChange={(e) => handleUpdateTranscription(idx, e.target.value)}
+                        className="flex-1 bg-slate-900 border border-slate-800 rounded px-2.5 py-1 text-xs font-mono text-slate-200"
+                        placeholder="Transcription text"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveTranscription(idx)}
+                        className="p-1 text-slate-400 hover:text-rose-400 transition-colors"
+                        title="Delete transcription"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-slate-400 font-mono italic">No bottle label transcriptions recorded.</p>
+              )}
+            </div>
+
+            {/* Section 4: Work Steps */}
+            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 space-y-2">
+              <div className="flex items-center gap-2 border-b border-slate-800/80 pb-2">
+                <ListChecks className="w-4 h-4 text-emerald-400" />
+                <span className="text-xs font-bold font-mono text-slate-200">
+                  4. Protocol Work Steps ({modalWorkSteps.length})
+                </span>
+              </div>
+              {modalWorkSteps.length > 0 ? (
+                <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+                  {modalWorkSteps.map((step, idx) => (
+                    <div key={step.stepId || idx} className="bg-slate-900 border border-slate-800 rounded-lg p-2.5 text-xs font-mono space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-950 text-indigo-300 border border-indigo-800">
+                          {step.actionType}
+                        </span>
+                        <span className="text-[10px] text-slate-400">
+                          {step.startTimeSeconds ?? 0}s – {step.endTimeSeconds ?? 0}s
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-slate-400 block mb-0.5">Description:</span>
+                        <input
+                          type="text"
+                          value={step.description || ''}
+                          onChange={(e) => handleUpdateWorkStep(idx, { description: e.target.value })}
+                          className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200"
+                        />
+                      </div>
+                      {step.actionType === 'MIX_REAGENTS' && step.mixReagentsData && (
+                        <div className="text-[11px] text-slate-300 bg-slate-950/60 p-2 rounded border border-slate-800 grid grid-cols-2 gap-2">
+                          <div>
+                            <span className="text-[10px] text-slate-400 block">Reagent 1 Name &amp; Amount:</span>
+                            <div className="flex gap-1.5 mt-0.5">
+                              <input
+                                type="text"
+                                value={step.mixReagentsData.firstReagentName || ''}
+                                onChange={(e) =>
+                                  handleUpdateWorkStep(idx, {
+                                    mixReagentsData: {
+                                      ...step.mixReagentsData!,
+                                      firstReagentName: e.target.value,
+                                    },
+                                  })
+                                }
+                                className="flex-1 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
+                                placeholder="Name"
+                              />
+                              <input
+                                type="text"
+                                value={step.mixReagentsData.firstReagentAmount || ''}
+                                onChange={(e) =>
+                                  handleUpdateWorkStep(idx, {
+                                    mixReagentsData: {
+                                      ...step.mixReagentsData!,
+                                      firstReagentAmount: e.target.value,
+                                    },
+                                  })
+                                }
+                                className="w-20 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
+                                placeholder="Amount"
+                              />
+                            </div>
+                          </div>
+                          <div>
+                            <span className="text-[10px] text-slate-400 block">Reagent 2 Name &amp; Amount:</span>
+                            <div className="flex gap-1.5 mt-0.5">
+                              <input
+                                type="text"
+                                value={step.mixReagentsData.secondReagentName || ''}
+                                onChange={(e) =>
+                                  handleUpdateWorkStep(idx, {
+                                    mixReagentsData: {
+                                      ...step.mixReagentsData!,
+                                      secondReagentName: e.target.value,
+                                    },
+                                  })
+                                }
+                                className="flex-1 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
+                                placeholder="Name"
+                              />
+                              <input
+                                type="text"
+                                value={step.mixReagentsData.secondReagentAmount || ''}
+                                onChange={(e) =>
+                                  handleUpdateWorkStep(idx, {
+                                    mixReagentsData: {
+                                      ...step.mixReagentsData!,
+                                      secondReagentAmount: e.target.value,
+                                    },
+                                  })
+                                }
+                                className="w-20 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
+                                placeholder="Amount"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      {step.actionType === 'SEED_REAGENTS' && step.seedReagentsData && (
+                        <div className="text-[11px] text-slate-300 bg-slate-950/60 p-2.5 rounded border border-slate-800 space-y-2">
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            <div>
+                              <span className="text-[10px] text-slate-400 block">Plate Type:</span>
+                              <input
+                                type="text"
+                                value={step.seedReagentsData.plateType || 'N/A'}
+                                onChange={(e) =>
+                                  handleUpdateWorkStep(idx, {
+                                    seedReagentsData: {
+                                      ...step.seedReagentsData!,
+                                      plateType: e.target.value,
+                                    },
+                                  })
+                                }
+                                className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200 mt-0.5"
+                              />
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-slate-400 block">Pipette Type:</span>
+                              <input
+                                type="text"
+                                value={step.seedReagentsData.pipetteType || 'N/A'}
+                                onChange={(e) =>
+                                  handleUpdateWorkStep(idx, {
+                                    seedReagentsData: {
+                                      ...step.seedReagentsData!,
+                                      pipetteType: e.target.value,
+                                    },
+                                  })
+                                }
+                                className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200 mt-0.5"
+                              />
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-slate-400 block">Cells Seeded:</span>
+                              <input
+                                type="text"
+                                value={step.seedReagentsData.cellsSeeded || 'N/A'}
+                                onChange={(e) =>
+                                  handleUpdateWorkStep(idx, {
+                                    seedReagentsData: {
+                                      ...step.seedReagentsData!,
+                                      cellsSeeded: e.target.value,
+                                    },
+                                  })
+                                }
+                                className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200 mt-0.5"
+                              />
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-slate-400 block">Cells Per Well:</span>
+                              <input
+                                type="text"
+                                value={step.seedReagentsData.cellsPerWell || 'N/A'}
+                                onChange={(e) =>
+                                  handleUpdateWorkStep(idx, {
+                                    seedReagentsData: {
+                                      ...step.seedReagentsData!,
+                                      cellsPerWell: e.target.value,
+                                    },
+                                  })
+                                }
+                                className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200 mt-0.5"
+                              />
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-3 pt-1 border-t border-slate-800">
+                            <span className="text-[11px]">
+                              Events Detected:{' '}
+                              <input
+                                type="number"
+                                value={step.seedReagentsData.seedingEventsCount ?? 12}
+                                onChange={(e) => {
+                                  const count = parseInt(e.target.value, 10) || 0;
+                                  const exp = step.seedReagentsData?.expectedSeedingEventsCount ?? 12;
+                                  handleUpdateWorkStep(idx, {
+                                    seedReagentsData: {
+                                      ...step.seedReagentsData!,
+                                      seedingEventsCount: count,
+                                      isSeedingCountCorrect: count === exp,
+                                    },
+                                  });
+                                }}
+                                className="w-16 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
+                              />
+                            </span>
+                            <span className="text-[11px] text-slate-400">
+                              Expected: {step.seedReagentsData.expectedSeedingEventsCount ?? 12}
+                            </span>
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                step.seedReagentsData.isSeedingCountCorrect
+                                  ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                                  : 'bg-amber-950 text-amber-300 border border-amber-800'
+                              }`}
+                            >
+                              {step.seedReagentsData.isSeedingCountCorrect ? '✓ Verified (All Wells Seeded)' : '⚠ Discrepancy'}
+                            </span>
+                          </div>
+                          <div className="pt-1 border-t border-slate-800 space-y-1">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] text-slate-400">
+                                Seeded Columns (1–12, left to right):
+                              </span>
+                              <input
+                                type="text"
+                                value={step.seedReagentsData.seededColumns?.join(', ') || ''}
+                                onChange={(e) => {
+                                  const parsed = parseColumnNumbersFromText(e.target.value);
+                                  const resolved = resolveSeededColumnsAndWells({
+                                    seededColumns: parsed,
+                                    seedingEventsCount: step.seedReagentsData?.seedingEventsCount,
+                                  });
+                                  handleUpdateWorkStep(idx, {
+                                    seedReagentsData: {
+                                      ...step.seedReagentsData!,
+                                      seededColumns: resolved.seededColumns,
+                                      seededWells: resolved.seededWells,
+                                    },
+                                  });
+                                }}
+                                className="w-48 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-cyan-300"
+                                placeholder="1, 2, ..., 12"
+                              />
+                            </div>
+                            <pre className="bg-slate-950 p-2 rounded border border-slate-800 text-[10px] font-mono text-emerald-300 overflow-x-auto whitespace-pre">
+                              {render96WellPlateMarkdown(step.seedReagentsData.seededColumns, step.seedReagentsData.seededWells)}
+                            </pre>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-slate-400 font-mono italic">No work steps detected.</p>
+              )}
+            </div>
+
+            {/* Section 5: ELN Markdown Preview & Editor */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                  <FileCheck2 className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>5. Experiment Archive ELN Markdown Payload</span>
+                </h3>
+                <button
+                  type="button"
+                  onClick={handleRegenerateMarkdown}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-mono font-medium text-cyan-300 hover:text-cyan-200 border border-cyan-800/60 rounded bg-cyan-950/60 hover:bg-cyan-900/60 transition-colors"
+                  title="Regenerate Markdown from edited identification, reagents, and work steps"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  <span>Regenerate from Edits</span>
+                </button>
+              </div>
+              <textarea
+                rows={6}
+                value={modalMarkdown}
+                onChange={(e) => setModalMarkdown(e.target.value)}
+                className="w-full bg-slate-950 p-2.5 rounded-xl border border-slate-800 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-indigo-500 whitespace-pre"
+                placeholder="Markdown archive documentation..."
+              />
             </div>
           </div>
         )}

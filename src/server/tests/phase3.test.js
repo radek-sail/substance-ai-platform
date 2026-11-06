@@ -2060,5 +2060,109 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       );
       assert.ok(actions[0].endTimestampSeconds <= actions[1].startTimestampSeconds);
     });
+
+    it('should deduplicate reagent label presentation events in Pass 2 to a single event per reagent, selecting the one with best visibility (closest to camera, unoccluded)', async () => {
+      setGenAIClient({
+        models: {
+          generateContent: async () => {
+            return {
+              text: JSON.stringify({
+                events: [
+                  {
+                    eventId: 'evt_dmem_occluded',
+                    eventClass: 'REAGENT_LABEL_PRESENTATION_EVENT',
+                    reagentName: "Dulbecco's Modified Eagle Medium",
+                    reagentAcronym: 'DMEM',
+                    manufacturer: 'Gibco',
+                    catalogNumber: '11965-092',
+                    lotNumber: 'N/A',
+                    startTime: 10,
+                    endTime: 12,
+                    isOccluded: true,
+                    cameraCloseness: 'FAR',
+                    description: 'DMEM bottle held far in background, occluded by objects in foreground',
+                    actionId: 'act_archive_1',
+                    actionIds: ['act_archive_1'],
+                  },
+                  {
+                    eventId: 'evt_dmem_best_visible',
+                    eventClass: 'REAGENT_LABEL_PRESENTATION_EVENT',
+                    reagentName: 'DMEM',
+                    reagentAcronym: 'DMEM',
+                    manufacturer: 'Gibco',
+                    catalogNumber: '11965-092',
+                    lotNumber: 'LOT-2024-X',
+                    startTime: 25,
+                    endTime: 28,
+                    isOccluded: false,
+                    cameraCloseness: 'CLOSE',
+                    description: 'DMEM bottle held closest to camera and not occluded by objects in foreground',
+                    actionId: 'act_archive_2',
+                    actionIds: ['act_archive_2'],
+                  },
+                ],
+                refinedActions: [
+                  {
+                    actionId: 'act_archive_1',
+                    refinedStartTimestampSeconds: 8,
+                    refinedEndTimestampSeconds: 15,
+                  },
+                  {
+                    actionId: 'act_archive_2',
+                    refinedStartTimestampSeconds: 20,
+                    refinedEndTimestampSeconds: 30,
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      });
+
+      const actions = [
+        {
+          actionId: 'act_archive_1',
+          actionClass: 'REAGENT_MIXING_ACTION',
+          startTimestampSeconds: 8,
+          endTimestampSeconds: 15,
+          startTime: '00:08',
+          endTime: '00:15',
+        },
+        {
+          actionId: 'act_archive_2',
+          actionClass: 'REAGENT_MIXING_ACTION',
+          startTimestampSeconds: 20,
+          endTimestampSeconds: 30,
+          startTime: '00:20',
+          endTime: '00:30',
+        },
+      ];
+
+      const pass2Result = await runPass2EventDetection({
+        videoId: 'vid_archive_dedup_01',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_archive_dedup.mp4',
+        classification: {
+          workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+          transcribedAudio: 'Preparing DMEM growth media',
+        },
+        actions,
+      });
+
+      // Exactly 1 event should survive for DMEM
+      assert.strictEqual(pass2Result.length, 1, 'Expected exactly 1 reagent presentation event for DMEM');
+      const survivingEvent = pass2Result[0];
+      assert.strictEqual(survivingEvent.eventId, 'evt_dmem_best_visible', 'Expected best visible (close, unoccluded) event to be selected');
+      assert.strictEqual(survivingEvent.lotNumber, 'LOT-2024-X');
+      assert.strictEqual(survivingEvent.manufacturer, 'Gibco');
+
+      // Parent actionIds should be merged onto surviving event
+      assert.ok(survivingEvent.actionIds.includes('act_archive_1'));
+      assert.ok(survivingEvent.actionIds.includes('act_archive_2'));
+
+      // Both actions in refinedActions/actions should reference the surviving event in eventList
+      assert.ok(actions[0].eventList.includes('evt_dmem_best_visible'));
+      assert.ok(actions[1].eventList.includes('evt_dmem_best_visible'));
+      assert.strictEqual(actions[0].eventList.includes('evt_dmem_occluded'), false);
+    });
   });
 });

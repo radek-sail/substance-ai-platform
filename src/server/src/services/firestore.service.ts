@@ -5,12 +5,21 @@ import {
   type BoxUpdate,
   type InventorySignOffPayload,
   type ArchiveSignOffPayload,
+  type ArchiveReagent,
+  type ArchiveWorkStep,
   type VideoPasses,
   type PassStepState,
   DEFAULT_VIDEO_PASSES,
   BoxUpdateSchema,
   InventorySignOffPayloadSchema,
   ArchiveSignOffPayloadSchema,
+  ArchiveReagentSchema,
+  ArchiveWorkStepSchema,
+  generateReagentAcronym,
+  computeExpectedSeedingEvents,
+  render96WellPlateMarkdown,
+  areSameReagent,
+  mergeReagentRecords,
 } from '@sail/shared';
 
 export interface VideoRecord {
@@ -489,7 +498,18 @@ export async function updateVideoPass(
 export async function getVideoPasses(
   databaseId: string | undefined,
   videoId: string
-): Promise<{ videoId: string; status: string; geminiFileUri?: string; passes: VideoPasses } | null> {
+): Promise<{
+  videoId: string;
+  status: string;
+  geminiFileUri?: string;
+  archiveId?: string | null;
+  archiveName?: string | null;
+  archiveCreatorName?: string | null;
+  archiveCreationDate?: string | null;
+  archiveAssociationType?: string;
+  unmatchedArchiveName?: string | null;
+  passes: VideoPasses;
+} | null> {
   const dbId = normalizeDatabaseId(databaseId || '(default)');
   const db = getTenantFirestore(dbId);
   let data: Record<string, any> | undefined;
@@ -501,15 +521,37 @@ export async function getVideoPasses(
   } catch (err) {
     console.warn(`[FirestoreService] getVideoPasses fallback to memory for ${videoId}:`, err);
   }
+  const memDoc = getTenantMemoryStore(dbId).get(`videos/${videoId}`);
   if (!data) {
-    const memDoc = getTenantMemoryStore(dbId).get(`videos/${videoId}`);
     if (!memDoc) {
       return null;
     }
     data = memDoc;
+  } else if (memDoc) {
+    data = {
+      ...memDoc,
+      ...data,
+      passes: {
+        ...(memDoc.passes || {}),
+        ...(data.passes || {}),
+      },
+    };
   }
+  const rawPass0 = data.passes?.pass0 || { status: 'PENDING' };
+  const pass0WithCanonicalArchive =
+    data.archiveName && rawPass0.data && typeof rawPass0.data === 'object'
+      ? {
+          ...rawPass0,
+          data: {
+            ...rawPass0.data,
+            archiveName: data.archiveName,
+            ...(data.archiveCreatorName ? { creatorName: data.archiveCreatorName } : {}),
+            ...(data.archiveCreationDate ? { creationDate: data.archiveCreationDate } : {}),
+          },
+        }
+      : rawPass0;
   const passes: VideoPasses = {
-    pass0: data.passes?.pass0 || { status: 'PENDING' },
+    pass0: pass0WithCanonicalArchive,
     pass1: data.passes?.pass1 || { status: 'PENDING' },
     pass2: data.passes?.pass2 || { status: 'PENDING' },
     pass3: data.passes?.pass3 || { status: 'PENDING' },
@@ -544,6 +586,16 @@ export async function getVideoPasses(
     videoId: data.videoId || videoId,
     status: data.status || 'READY_FOR_ANALYSIS',
     geminiFileUri: data.geminiFileUri,
+    ...(data.archiveId !== undefined ? { archiveId: data.archiveId } : {}),
+    ...(data.archiveName !== undefined ? { archiveName: data.archiveName } : {}),
+    ...(data.archiveCreatorName !== undefined ? { archiveCreatorName: data.archiveCreatorName } : {}),
+    ...(data.archiveCreationDate !== undefined ? { archiveCreationDate: data.archiveCreationDate } : {}),
+    ...(data.archiveAssociationType !== undefined
+      ? { archiveAssociationType: data.archiveAssociationType }
+      : {}),
+    ...(data.unmatchedArchiveName !== undefined
+      ? { unmatchedArchiveName: data.unmatchedArchiveName }
+      : {}),
     passes,
   };
 }
@@ -557,8 +609,32 @@ export async function getVideoMetadata(
 ): Promise<DocumentData | null> {
   const dbId = normalizeDatabaseId(databaseId || '(default)');
   const db = getTenantFirestore(dbId);
-  const docSnap = await db.collection('videos').doc(videoId).get();
-  return docSnap.exists ? docSnap.data()! : null;
+  let fsData: DocumentData | null = null;
+  try {
+    const docSnap = await db.collection('videos').doc(videoId).get();
+    if (docSnap.exists) {
+      fsData = docSnap.data() || null;
+    }
+  } catch {
+    // ignore read error and fall back to memory store
+  }
+  const memData = getTenantMemoryStore(dbId).get(`videos/${videoId}`) || null;
+  if (fsData && memData) {
+    return {
+      ...memData,
+      ...fsData,
+      ...(fsData.archiveId === undefined && memData.archiveId !== undefined
+        ? {
+            archiveId: memData.archiveId,
+            archiveName: memData.archiveName,
+            archiveCreatorName: memData.archiveCreatorName,
+            archiveCreationDate: memData.archiveCreationDate,
+            archiveAssociationType: memData.archiveAssociationType,
+          }
+        : {}),
+    };
+  }
+  return fsData || memData;
 }
 
 /**
@@ -805,7 +881,9 @@ export function formatArchiveMarkdown(
     | {
         markdownDoc?: string;
         description?: string;
-        reagents?: string[];
+        reagents?: Array<string | ArchiveReagent | Record<string, any>>;
+        labelTranscriptions?: string[];
+        workSteps?: Array<ArchiveWorkStep | Record<string, any>>;
         steps?: string[];
         analysis?: Record<string, any>;
         workflowClassification?: Record<string, any>;
@@ -860,14 +938,30 @@ export function formatArchiveMarkdown(
 
   const descriptionText =
     input.description ||
+    (input as any).archiveName ||
     classification.transcribedAudio ||
     classification.archiveName ||
     'Automated experiment archive generated from SAIL video analysis.';
 
   const reagentLines: string[] = [];
-  if (Array.isArray(input.reagents) && input.reagents.length > 0) {
-    for (const r of input.reagents) {
-      reagentLines.push(r.startsWith('-') ? r : `- ${r}`);
+  const rawReagents = Array.isArray(input.reagents) && input.reagents.length > 0
+    ? input.reagents
+    : Array.isArray(source.reagents) && source.reagents.length > 0
+    ? source.reagents
+    : [];
+
+  if (rawReagents.length > 0) {
+    for (const r of rawReagents) {
+      if (typeof r === 'string') {
+        reagentLines.push(r.startsWith('-') ? r : `- ${r}`);
+      } else if (r && typeof r === 'object') {
+        const name = r.reagentName || 'N/A';
+        const acr = r.reagentAcronym || generateReagentAcronym(name);
+        const mfr = r.manufacturer || 'N/A';
+        const cat = r.catalogNumber || 'N/A';
+        const lot = r.lotNumber || 'N/A';
+        reagentLines.push(`- **${name}** (${acr}) | Manufacturer: ${mfr} | Catalog/Ref #: ${cat} | Lot #: ${lot}`);
+      }
     }
   } else {
     for (const ref of refinements) {
@@ -891,25 +985,72 @@ export function formatArchiveMarkdown(
   }
 
   const stepLines: string[] = [];
+  const rawWorkSteps = Array.isArray(input.workSteps) && input.workSteps.length > 0
+    ? input.workSteps
+    : Array.isArray(source.workSteps) && source.workSteps.length > 0
+    ? source.workSteps
+    : [];
+
   if (Array.isArray(input.steps) && input.steps.length > 0) {
     input.steps.forEach((s, idx) => {
       stepLines.push(/^\d+\./.test(s.trim()) ? s.trim() : `${idx + 1}. ${s.trim()}`);
     });
+  } else if (rawWorkSteps.length > 0) {
+    rawWorkSteps.forEach((ws: any, idx: number) => {
+      const stepNo = ws.stepNumber || idx + 1;
+      if (
+        (ws.actionType === 'MIX_REAGENTS' || ws.actionType === 'REAGENT_MIXING_ACTION') &&
+        ws.mixReagentsData
+      ) {
+        const m = ws.mixReagentsData;
+        stepLines.push(
+          `${stepNo}. **Mix Reagents**: Mixed ${m.firstReagentAmount || 'N/A'} of ${m.firstReagentName || 'N/A'} with ${m.secondReagentAmount || 'N/A'} of ${m.secondReagentName || 'N/A'}.`
+        );
+      } else if (
+        (ws.actionType === 'SEED_REAGENTS' || ws.actionType === 'REAGENT_SEEDING_ACTION') &&
+        ws.seedReagentsData
+      ) {
+        const s = ws.seedReagentsData;
+        const countStatus =
+          s.isSeedingCountCorrect === false
+            ? `Count Mismatch (${s.seedingEventsCount}/${s.expectedSeedingEventsCount || 'N/A'})`
+            : `Verified (${s.seedingEventsCount}/${s.expectedSeedingEventsCount || s.seedingEventsCount} events)`;
+        const plateMap = render96WellPlateMarkdown(s.seededColumns, s.seededWells);
+        stepLines.push(
+          `${stepNo}. **Seed Reagents**: Seeded ${s.cellsSeeded || 'N/A'} (${s.cellsPerWell || 'N/A'}) into ${s.plateType || 'N/A'} using ${s.pipetteType || 'N/A'} — Seeding Events: ${countStatus}.\n\n${plateMap}`
+        );
+      } else {
+        stepLines.push(`${stepNo}. **${ws.actionType || 'Work Step'}**: ${ws.description || 'Executed step.'}`);
+      }
+    });
   } else {
     let stepNum = 1;
     for (const act of actions) {
-      const relatedRefs = refinements.filter((r) =>
-        (act.eventList || []).includes(r.eventId)
-      );
-      const refSummary =
-        relatedRefs.length > 0
-          ? ` — ${relatedRefs.map((r) => r.transcriptionText).join('; ')}`
-          : '';
-      stepLines.push(
-        `${stepNum}. **${act.actionClass}** (${act.actionId}): ${
-          act.cellLineName || 'Protocol execution'
-        } (${(act.eventList || []).length} events)${refSummary}`
-      );
+      if (act.mixReagentsData) {
+        const m = act.mixReagentsData;
+        stepLines.push(
+          `${stepNum}. **Mix Reagents** (${act.actionId}): Mixed ${m.firstReagentAmount} of ${m.firstReagentName} with ${m.secondReagentAmount} of ${m.secondReagentName}`
+        );
+      } else if (act.seedReagentsData) {
+        const s = act.seedReagentsData;
+        const plateMap = render96WellPlateMarkdown(s.seededColumns, s.seededWells);
+        stepLines.push(
+          `${stepNum}. **Seed Reagents** (${act.actionId}): Seeded ${s.cellsSeeded} (${s.cellsPerWell}) into ${s.plateType} with ${s.pipetteType} (${s.seedingEventsCount} seeding events)\n\n${plateMap}`
+        );
+      } else {
+        const relatedRefs = refinements.filter((r) =>
+          (act.eventList || []).includes(r.eventId)
+        );
+        const refSummary =
+          relatedRefs.length > 0
+            ? ` — ${relatedRefs.map((r) => r.transcriptionText).join('; ')}`
+            : '';
+        stepLines.push(
+          `${stepNum}. **${act.actionClass}** (${act.actionId}): ${
+            act.cellLineName || 'Protocol execution'
+          } (${(act.eventList || []).length} events)${refSummary}`
+        );
+      }
       stepNum++;
     }
     if (stepLines.length === 0 && events.length > 0) {
@@ -1441,6 +1582,8 @@ export async function commitInventorySignOff(
       },
       {
         inventoryId,
+        isSignedOff: true,
+        signedOffAt,
         updatedAt: signedOffAt,
       }
     );
@@ -1475,8 +1618,14 @@ export async function commitArchiveSignOff(
         markdownDoc?: string;
         analysis?: Record<string, any>;
         description?: string;
-        reagents?: string[];
+        reagents?: Array<string | ArchiveReagent | Record<string, any>>;
+        labelTranscriptions?: string[];
+        workSteps?: Array<ArchiveWorkStep | Record<string, any>>;
         steps?: string[];
+        archiveName?: string;
+        creatorName?: string | null;
+        creationDate?: string | null;
+        replaceArchiveContent?: boolean;
       })
     | string,
   videoIdArg?: string,
@@ -1488,8 +1637,12 @@ export async function commitArchiveSignOff(
   databaseId: string;
   videoId: string;
   archiveId: string;
+  archiveName?: string;
   documentPath: string;
   markdownDoc: string;
+  reagents: ArchiveReagent[];
+  labelTranscriptions: string[];
+  workSteps: ArchiveWorkStep[];
   signedOffAt: string;
   isSignedOff: boolean;
 }> {
@@ -1499,6 +1652,16 @@ export async function commitArchiveSignOff(
   let markdownDoc: string;
   let signedOffAt: string;
   let operatorInitials: string | undefined;
+  let structuredReagents: ArchiveReagent[] = [];
+  let structuredLabelTranscriptions: string[] = [];
+  let structuredWorkSteps: ArchiveWorkStep[] = [];
+  let archiveName: string | undefined;
+  let creatorName: string | null | undefined;
+  let creationDate: string | null | undefined;
+  let replaceArchiveContent = false;
+  let hasExplicitReagents = false;
+  let hasExplicitTranscriptions = false;
+  let hasExplicitWorkSteps = false;
 
   if (typeof payloadOrDatabaseId === 'string') {
     databaseId = payloadOrDatabaseId;
@@ -1511,6 +1674,74 @@ export async function commitArchiveSignOff(
     databaseId = payloadOrDatabaseId.databaseId;
     videoId = payloadOrDatabaseId.videoId;
     archiveId = payloadOrDatabaseId.archiveId;
+    archiveName = payloadOrDatabaseId.archiveName;
+    creatorName = payloadOrDatabaseId.creatorName;
+    creationDate = payloadOrDatabaseId.creationDate;
+    replaceArchiveContent = Boolean(payloadOrDatabaseId.replaceArchiveContent);
+
+    const rawReagentsInput =
+      payloadOrDatabaseId.reagents ||
+      payloadOrDatabaseId.analysis?.reagents;
+    if (Array.isArray(rawReagentsInput)) {
+      hasExplicitReagents = true;
+      for (let idx = 0; idx < rawReagentsInput.length; idx++) {
+        const item = rawReagentsInput[idx];
+        if (item && typeof item === 'object' && 'reagentName' in item) {
+          const rName = String(item.reagentName || 'Unknown Reagent').trim();
+          structuredReagents.push(
+            ArchiveReagentSchema.parse({
+              id: item.id || `reagent_${idx + 1}`,
+              reagentName: rName,
+              reagentAcronym:
+                item.reagentAcronym && item.reagentAcronym !== 'N/A'
+                  ? String(item.reagentAcronym).trim()
+                  : generateReagentAcronym(rName),
+              manufacturer: item.manufacturer || 'N/A',
+              catalogNumber: item.catalogNumber || 'N/A',
+              lotNumber: item.lotNumber || 'N/A',
+              ...(item.rawLabelText ? { rawLabelText: String(item.rawLabelText) } : {}),
+              ...(item.eventId ? { eventId: String(item.eventId) } : {}),
+              ...(Array.isArray(item.actionIds) ? { actionIds: item.actionIds } : {}),
+            })
+          );
+        }
+      }
+    }
+
+    const rawTranscriptionsInput =
+      payloadOrDatabaseId.labelTranscriptions ||
+      (Array.isArray(payloadOrDatabaseId.analysis?.labelTranscriptions)
+        ? payloadOrDatabaseId.analysis.labelTranscriptions.map((lt: any) =>
+            typeof lt === 'string' ? lt : lt?.fullText || lt?.conflatedText || ''
+          )
+        : undefined);
+    if (Array.isArray(rawTranscriptionsInput)) {
+      hasExplicitTranscriptions = true;
+      structuredLabelTranscriptions = rawTranscriptionsInput
+        .map((t) => String(t || '').trim())
+        .filter(Boolean);
+    }
+
+    const rawWorkStepsInput =
+      payloadOrDatabaseId.workSteps ||
+      payloadOrDatabaseId.analysis?.workSteps;
+    if (Array.isArray(rawWorkStepsInput)) {
+      hasExplicitWorkSteps = true;
+      for (let idx = 0; idx < rawWorkStepsInput.length; idx++) {
+        const ws = rawWorkStepsInput[idx];
+        if (ws && typeof ws === 'object' && ws.actionType) {
+          const parsedWs = ArchiveWorkStepSchema.safeParse({
+            ...ws,
+            stepNumber: ws.stepNumber ?? idx + 1,
+            ...(videoId && videoId !== archiveId && !ws.videoId ? { videoId } : {}),
+          });
+          if (parsedWs.success) {
+            structuredWorkSteps.push(parsedWs.data);
+          }
+        }
+      }
+    }
+
     markdownDoc = formatArchiveMarkdown(
       payloadOrDatabaseId.markdownDoc
         ? payloadOrDatabaseId.markdownDoc
@@ -1525,49 +1756,716 @@ export async function commitArchiveSignOff(
     videoId,
     archiveId,
     markdownDoc,
+    ...(archiveName ? { archiveName } : {}),
+    ...(creatorName !== undefined ? { creatorName } : {}),
+    ...(creationDate !== undefined ? { creationDate } : {}),
+    ...(structuredReagents.length > 0 ? { reagents: structuredReagents } : {}),
+    ...(structuredLabelTranscriptions.length > 0 ? { labelTranscriptions: structuredLabelTranscriptions } : {}),
+    ...(structuredWorkSteps.length > 0 ? { workSteps: structuredWorkSteps } : {}),
+    ...(replaceArchiveContent ? { replaceArchiveContent: true } : {}),
     signedOffAt,
     operatorInitials,
   });
 
   const dbId = normalizeDatabaseId(validatedPayload.databaseId);
-  const db = getTenantFirestore(dbId);
+  const tenantDb = getTenantFirestore(dbId);
+  const isFullArchiveDirectEdit = replaceArchiveContent || videoId === archiveId;
 
-  // Persist compiled Markdown experiment document to archives/{archiveId}
-  await db
-    .collection('archives')
-    .doc(archiveId)
-    .set(
-      {
+  // Read existing archive record from tenantDb (with fallback to default db)
+  const readExistingArchiveData = async (
+    firestoreInstance: Firestore,
+    targetArchiveId: string
+  ): Promise<Record<string, any>> => {
+    try {
+      const archiveRef = firestoreInstance.collection('archives').doc(targetArchiveId);
+      if (typeof archiveRef.get === 'function') {
+        const snap = await archiveRef.get();
+        if (snap && snap.exists) {
+          return snap.data() || {};
+        }
+      }
+    } catch {
+      // ignore read errors on minimal mocks
+    }
+    return {};
+  };
+
+  let existingData = await readExistingArchiveData(tenantDb, archiveId);
+  if (Object.keys(existingData).length === 0 && dbId !== '(default)' && db && db !== tenantDb) {
+    existingData = await readExistingArchiveData(db, archiveId);
+  }
+
+  // If this is a video sign-off and videos/{videoId} is explicitly associated with an archiveId,
+  // prefer that associated archive if it exists in Firestore (or if target archiveId was a derived slug)
+  if (!isFullArchiveDirectEdit && videoId) {
+    const checkExplicitVideoArchive = async (
+      firestoreInstance: Firestore
+    ): Promise<{ id: string; data: Record<string, any> } | null> => {
+      try {
+        let videoData: Record<string, any> | null = null;
+        const videoRef = firestoreInstance.collection('videos').doc(videoId);
+        if (typeof videoRef.get === 'function') {
+          const videoSnap = await videoRef.get();
+          videoData = videoSnap && videoSnap.exists ? videoSnap.data() || null : null;
+        }
+        if (!videoData?.archiveId) {
+          const memVideo = getTenantMemoryStore(dbId).get(`videos/${videoId}`);
+          if (memVideo?.archiveId) {
+            videoData = memVideo;
+          }
+        }
+        if (videoData?.archiveId && String(videoData.archiveId) !== archiveId) {
+          const linkedData = await readExistingArchiveData(
+            firestoreInstance,
+            String(videoData.archiveId)
+          );
+          if (Object.keys(linkedData).length > 0) {
+            return { id: String(videoData.archiveId), data: linkedData };
+          }
+        }
+      } catch {
+        // ignore lookup errors on minimal mocks
+      }
+      return null;
+    };
+
+    let explicitVideoLink = await checkExplicitVideoArchive(tenantDb);
+    if (!explicitVideoLink && dbId !== '(default)' && db && db !== tenantDb) {
+      explicitVideoLink = await checkExplicitVideoArchive(db);
+    }
+    if (explicitVideoLink) {
+      archiveId = explicitVideoLink.id;
+      existingData = explicitVideoLink.data;
+    }
+  }
+
+  // If target archiveId was a derived slug or human-readable name that doesn't exist yet,
+  // check if videos/{videoId} or an existing archive in `archives` already links this video or matches by name
+  if (Object.keys(existingData).length === 0 && !isFullArchiveDirectEdit) {
+    const resolveLinkedArchive = async (
+      firestoreInstance: Firestore
+    ): Promise<{ id: string; data: Record<string, any> } | null> => {
+      try {
+        if (videoId) {
+          const videoRef = firestoreInstance.collection('videos').doc(videoId);
+          if (typeof videoRef.get === 'function') {
+            const videoSnap = await videoRef.get();
+            const videoData = videoSnap && videoSnap.exists ? videoSnap.data() : null;
+            if (videoData?.archiveId && videoData.archiveId !== archiveId) {
+              const linkedData = await readExistingArchiveData(
+                firestoreInstance,
+                String(videoData.archiveId)
+              );
+              if (Object.keys(linkedData).length > 0) {
+                return { id: String(videoData.archiveId), data: linkedData };
+              }
+            }
+          }
+        }
+
+        const archivesCol = firestoreInstance.collection('archives');
+        if (typeof (archivesCol as any).get === 'function') {
+          const allSnap = await (archivesCol as any).get();
+          if (allSnap && Array.isArray(allSnap.docs)) {
+            const targetNameLower = String(archiveName || archiveId || '')
+              .trim()
+              .toLowerCase();
+            const targetNameAlnum = targetNameLower.replace(/[^a-z0-9]/g, '');
+            for (const docSnap of allSnap.docs) {
+              const d = docSnap.data?.() || {};
+              const vIds: string[] = Array.isArray(d.videoIds) ? d.videoIds : [];
+              if (videoId && (vIds.includes(videoId) || d.videoId === videoId)) {
+                return { id: docSnap.id, data: d };
+              }
+              if (targetNameLower && typeof d.name === 'string') {
+                const candidateLower = d.name.trim().toLowerCase();
+                const candidateAlnum = candidateLower.replace(/[^a-z0-9]/g, '');
+                if (
+                  candidateLower === targetNameLower ||
+                  (targetNameAlnum.length >= 3 && candidateAlnum === targetNameAlnum)
+                ) {
+                  return { id: docSnap.id, data: d };
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // ignore lookup errors on minimal mocks
+      }
+      return null;
+    };
+
+    let resolvedLink = await resolveLinkedArchive(tenantDb);
+    if (!resolvedLink && dbId !== '(default)' && db && db !== tenantDb) {
+      resolvedLink = await resolveLinkedArchive(db);
+    }
+    if (resolvedLink) {
+      archiveId = resolvedLink.id;
+      existingData = resolvedLink.data;
+    }
+  }
+
+  // Fallback: if structuredReagents, structuredWorkSteps, or structuredLabelTranscriptions are empty
+  // on a video sign-off, check payload analysis and stored video_analyses/{videoId} / videos/{videoId}
+  if (
+    !isFullArchiveDirectEdit &&
+    (structuredReagents.length === 0 ||
+      structuredWorkSteps.length === 0 ||
+      structuredLabelTranscriptions.length === 0)
+  ) {
+    const collectAnalysisSources = async (): Promise<Record<string, any>[]> => {
+      const sources: Record<string, any>[] = [];
+      if (typeof payloadOrDatabaseId === 'object' && payloadOrDatabaseId) {
+        if (payloadOrDatabaseId.analysis && typeof payloadOrDatabaseId.analysis === 'object') {
+          sources.push(payloadOrDatabaseId.analysis);
+        }
+        sources.push(payloadOrDatabaseId);
+      }
+      const readStoredAnalysis = async (firestoreInstance: Firestore) => {
+        try {
+          const vaRef = firestoreInstance.collection('video_analyses').doc(videoId);
+          if (typeof vaRef.get === 'function') {
+            const vaSnap = await vaRef.get();
+            if (vaSnap && vaSnap.exists) {
+              const vaData = vaSnap.data();
+              if (vaData && typeof vaData === 'object') sources.push(vaData);
+            }
+          }
+        } catch {
+          // ignore
+        }
+        try {
+          const vidRef = firestoreInstance.collection('videos').doc(videoId);
+          if (typeof vidRef.get === 'function') {
+            const vidSnap = await vidRef.get();
+            if (vidSnap && vidSnap.exists) {
+              const vidData = vidSnap.data();
+              if (vidData?.passes?.pass3) {
+                sources.push(vidData.passes.pass3);
+                if (vidData.passes.pass3.data && typeof vidData.passes.pass3.data === 'object') {
+                  sources.push(vidData.passes.pass3.data);
+                }
+              }
+            }
+          }
+        } catch {
+          // ignore
+        }
+      };
+      await readStoredAnalysis(tenantDb);
+      if (dbId !== '(default)' && db && db !== tenantDb) {
+        await readStoredAnalysis(db);
+      }
+      return sources;
+    };
+
+    const sources = await collectAnalysisSources();
+    for (const src of sources) {
+      if (structuredReagents.length === 0 && Array.isArray(src.reagents) && src.reagents.length > 0) {
+        for (let idx = 0; idx < src.reagents.length; idx++) {
+          const item = src.reagents[idx];
+          if (item && typeof item === 'object' && 'reagentName' in item) {
+            const rName = String(item.reagentName || 'Unknown Reagent').trim();
+            structuredReagents.push(
+              ArchiveReagentSchema.parse({
+                id: item.id || `reagent_${idx + 1}`,
+                reagentName: rName,
+                reagentAcronym:
+                  item.reagentAcronym && item.reagentAcronym !== 'N/A'
+                    ? String(item.reagentAcronym).trim()
+                    : generateReagentAcronym(rName),
+                manufacturer: item.manufacturer || 'N/A',
+                catalogNumber: item.catalogNumber || 'N/A',
+                lotNumber: item.lotNumber || 'N/A',
+                ...(item.rawLabelText ? { rawLabelText: String(item.rawLabelText) } : {}),
+                ...(item.eventId ? { eventId: String(item.eventId) } : {}),
+                ...(Array.isArray(item.actionIds) ? { actionIds: item.actionIds } : {}),
+              })
+            );
+          }
+        }
+      }
+
+      if (structuredReagents.length === 0 && Array.isArray(src.refinements)) {
+        for (const ref of src.refinements) {
+          if (ref?.reagentData && typeof ref.reagentData === 'object' && ref.reagentData.reagentName) {
+            const rd = ref.reagentData;
+            const rName = String(rd.reagentName || 'Unknown Reagent').trim();
+            structuredReagents.push(
+              ArchiveReagentSchema.parse({
+                id: rd.id || `reagent_${structuredReagents.length + 1}`,
+                reagentName: rName,
+                reagentAcronym:
+                  rd.reagentAcronym && rd.reagentAcronym !== 'N/A'
+                    ? String(rd.reagentAcronym).trim()
+                    : generateReagentAcronym(rName),
+                manufacturer: rd.manufacturer || 'N/A',
+                catalogNumber: rd.catalogNumber || 'N/A',
+                lotNumber: rd.lotNumber || 'N/A',
+                ...(ref.transcriptionText ? { rawLabelText: String(ref.transcriptionText) } : {}),
+                ...(ref.eventId ? { eventId: String(ref.eventId) } : {}),
+              })
+            );
+          } else if (
+            (ref?.refinementClass === 'REAGENT_OCR_CONFLATION' ||
+              ref?.refinementClass === 'ACRONYM_MAPPING' ||
+              ref?.refinementClass === 'REAGENT_ACRONYM_RESOLUTION') &&
+            typeof ref.transcriptionText === 'string' &&
+            ref.transcriptionText.trim()
+          ) {
+            const rawText = ref.transcriptionText.trim();
+            const parts = rawText.split('|').map((p: string) => p.trim());
+            const namePart = parts[0] || rawText;
+            const acronymMatch = namePart.match(/\(([A-Za-z0-9_-]{2,12})\)\s*$/);
+            const rName = (
+              acronymMatch ? namePart.slice(0, acronymMatch.index).trim() : namePart
+            ).slice(0, 120) || 'Unknown Reagent';
+            const rAcronym = acronymMatch ? acronymMatch[1] : generateReagentAcronym(rName);
+            structuredReagents.push(
+              ArchiveReagentSchema.parse({
+                id: `reagent_${structuredReagents.length + 1}`,
+                reagentName: rName,
+                reagentAcronym: rAcronym || 'N/A',
+                manufacturer: 'N/A',
+                catalogNumber: 'N/A',
+                lotNumber: 'N/A',
+                rawLabelText: rawText,
+                ...(ref.eventId ? { eventId: String(ref.eventId) } : {}),
+              })
+            );
+          }
+        }
+      }
+
+      if (
+        structuredLabelTranscriptions.length === 0 &&
+        Array.isArray(src.labelTranscriptions) &&
+        src.labelTranscriptions.length > 0
+      ) {
+        structuredLabelTranscriptions = src.labelTranscriptions
+          .map((lt: any) =>
+            String(
+              typeof lt === 'string'
+                ? lt
+                : lt?.fullText || lt?.conflatedText || lt?.shot1Text || ''
+            ).trim()
+          )
+          .filter(Boolean);
+      }
+
+      if (structuredWorkSteps.length === 0 && Array.isArray(src.workSteps) && src.workSteps.length > 0) {
+        for (let idx = 0; idx < src.workSteps.length; idx++) {
+          const ws = src.workSteps[idx];
+          if (ws && typeof ws === 'object' && ws.actionType) {
+            const parsedWs = ArchiveWorkStepSchema.safeParse({
+              ...ws,
+              stepNumber: ws.stepNumber ?? idx + 1,
+              ...(videoId && videoId !== archiveId && !ws.videoId ? { videoId } : {}),
+            });
+            if (parsedWs.success) {
+              structuredWorkSteps.push(parsedWs.data);
+            }
+          }
+        }
+      }
+
+      if (structuredWorkSteps.length === 0 && Array.isArray(src.actions) && src.actions.length > 0) {
+        for (let idx = 0; idx < src.actions.length; idx++) {
+          const act = src.actions[idx];
+          const cls = String(act?.actionType || act?.actionClass || '').toUpperCase();
+          if (!cls.includes('MIX') && !cls.includes('SEED')) continue;
+          const isSeed = cls.includes('SEED');
+          const stepNo = structuredWorkSteps.length + 1;
+          const candidateStep = {
+            id: act.actionId || `step_${stepNo}`,
+            stepId: act.actionId || `step_${stepNo}`,
+            stepNumber: stepNo,
+            actionType: isSeed ? 'SEED_REAGENTS' : 'MIX_REAGENTS',
+            startTimeSeconds: Number(act.startTimestampSeconds ?? act.startTime ?? 0),
+            endTimeSeconds: Number(act.endTimestampSeconds ?? act.endTime ?? 0),
+            description:
+              act.description ||
+              (isSeed ? 'Seed reagents into plate' : 'Mix two reagents'),
+            ...(act.mixReagentsData ? { mixReagentsData: act.mixReagentsData } : {}),
+            ...(act.seedReagentsData ? { seedReagentsData: act.seedReagentsData } : {}),
+            ...(videoId && videoId !== archiveId ? { videoId } : {}),
+          };
+          const parsedWs = ArchiveWorkStepSchema.safeParse(candidateStep);
+          if (parsedWs.success) {
+            structuredWorkSteps.push(parsedWs.data);
+          }
+        }
+      }
+    }
+  }
+
+  // 1. Merge videoIds
+  const existingVideoIds: string[] = Array.isArray(existingData.videoIds)
+    ? [...existingData.videoIds]
+    : [];
+  if (
+    existingData.videoId &&
+    existingData.videoId !== archiveId &&
+    !existingVideoIds.includes(existingData.videoId)
+  ) {
+    existingVideoIds.push(existingData.videoId);
+  }
+  const mergedVideoIds =
+    videoId && videoId !== archiveId && !existingVideoIds.includes(videoId)
+      ? [...existingVideoIds, videoId]
+      : existingVideoIds;
+
+  // 2. Merge reagents
+  const existingReagents: ArchiveReagent[] = Array.isArray(existingData.reagents)
+    ? existingData.reagents
+        .filter((r: any) => r && typeof r === 'object' && 'reagentName' in r)
+        .map((r: any, idx: number) =>
+          ArchiveReagentSchema.parse({
+            id: r.id || `reagent_${idx + 1}`,
+            reagentName: String(r.reagentName || 'Unknown Reagent').trim(),
+            reagentAcronym:
+              r.reagentAcronym && r.reagentAcronym !== 'N/A'
+                ? String(r.reagentAcronym).trim()
+                : generateReagentAcronym(String(r.reagentName || '').trim()),
+            manufacturer: r.manufacturer || 'N/A',
+            catalogNumber: r.catalogNumber || 'N/A',
+            lotNumber: r.lotNumber || 'N/A',
+            ...(r.rawLabelText ? { rawLabelText: String(r.rawLabelText) } : {}),
+            ...(r.eventId ? { eventId: String(r.eventId) } : {}),
+            ...(Array.isArray(r.actionIds) ? { actionIds: r.actionIds } : {}),
+          })
+        )
+    : [];
+
+  let mergedReagents: ArchiveReagent[];
+  if (isFullArchiveDirectEdit) {
+    mergedReagents = hasExplicitReagents ? structuredReagents : existingReagents;
+  } else {
+    const combinedReagents: ArchiveReagent[] = [...existingReagents];
+    for (const inc of structuredReagents) {
+      const matchIdx = combinedReagents.findIndex((ex) => areSameReagent(ex, inc));
+      if (matchIdx >= 0) {
+        combinedReagents[matchIdx] = mergeReagentRecords(combinedReagents[matchIdx], inc);
+      } else {
+        combinedReagents.push(inc);
+      }
+    }
+    const usedReagentIds = new Set<string>();
+    mergedReagents = combinedReagents.map((r, idx) => {
+      let rid = r.id || `reagent_${idx + 1}`;
+      if (usedReagentIds.has(rid)) {
+        rid = `reagent_${idx + 1}`;
+      }
+      usedReagentIds.add(rid);
+      return { ...r, id: rid };
+    });
+  }
+
+  // 3. Merge labelTranscriptions
+  const existingTranscriptions: string[] = Array.isArray(existingData.labelTranscriptions)
+    ? existingData.labelTranscriptions
+        .map((t: any) => String(t || '').trim())
+        .filter(Boolean)
+    : [];
+
+  let mergedTranscriptions: string[];
+  if (isFullArchiveDirectEdit) {
+    mergedTranscriptions = hasExplicitTranscriptions
+      ? structuredLabelTranscriptions
+      : existingTranscriptions;
+  } else {
+    const seenLower = new Set<string>();
+    mergedTranscriptions = [];
+    for (const t of [...existingTranscriptions, ...structuredLabelTranscriptions]) {
+      const trimmed = String(t || '').trim();
+      if (!trimmed) continue;
+      const lower = trimmed.toLowerCase();
+      if (!seenLower.has(lower)) {
+        seenLower.add(lower);
+        mergedTranscriptions.push(trimmed);
+      }
+    }
+  }
+
+  // 4. Merge workSteps
+  const fallbackExistingStepVideoId =
+    existingData.videoId && existingData.videoId !== archiveId
+      ? String(existingData.videoId)
+      : existingVideoIds.find((id) => id !== videoId) || existingVideoIds[0] || '__initial__';
+
+  const existingWorkSteps: ArchiveWorkStep[] = [];
+  if (Array.isArray(existingData.workSteps)) {
+    for (let idx = 0; idx < existingData.workSteps.length; idx++) {
+      const ws = existingData.workSteps[idx];
+      if (ws && typeof ws === 'object' && ws.actionType) {
+        const parsedWs = ArchiveWorkStepSchema.safeParse({
+          ...ws,
+          stepNumber: ws.stepNumber ?? idx + 1,
+          videoId: ws.videoId || fallbackExistingStepVideoId,
+        });
+        if (parsedWs.success) {
+          existingWorkSteps.push(parsedWs.data);
+        }
+      }
+    }
+  }
+
+  let mergedWorkSteps: ArchiveWorkStep[];
+  if (isFullArchiveDirectEdit) {
+    const targetSteps = hasExplicitWorkSteps ? structuredWorkSteps : existingWorkSteps;
+    mergedWorkSteps = targetSteps.map((ws, idx) => ({
+      ...ws,
+      stepNumber: idx + 1,
+    }));
+  } else if (structuredWorkSteps.length === 0) {
+    mergedWorkSteps = existingWorkSteps;
+  } else {
+    const incomingOtherVideoSteps = structuredWorkSteps.filter(
+      (ws) => ws.videoId && ws.videoId !== videoId
+    );
+    const incomingCurrentVideoSteps = structuredWorkSteps
+      .filter((ws) => !ws.videoId || ws.videoId === videoId)
+      .map((ws) => ({ ...ws, videoId }));
+
+    const baseSteps =
+      existingWorkSteps.filter((ws) => ws.videoId !== videoId).length > 0
+        ? existingWorkSteps
+        : incomingOtherVideoSteps.length > 0
+        ? incomingOtherVideoSteps
+        : existingWorkSteps;
+
+    const firstExistingForVideoIdx = baseSteps.findIndex((ws) => ws.videoId === videoId);
+    let combinedSteps: ArchiveWorkStep[];
+    if (firstExistingForVideoIdx >= 0) {
+      const before = baseSteps
+        .slice(0, firstExistingForVideoIdx)
+        .filter((ws) => ws.videoId !== videoId);
+      const after = baseSteps
+        .slice(firstExistingForVideoIdx)
+        .filter((ws) => ws.videoId !== videoId);
+      combinedSteps = [...before, ...incomingCurrentVideoSteps, ...after];
+    } else {
+      const otherVideoSteps = baseSteps.filter((ws) => ws.videoId !== videoId);
+      combinedSteps = [...otherVideoSteps, ...incomingCurrentVideoSteps];
+    }
+
+    const usedStepIds = new Set<string>();
+    mergedWorkSteps = combinedSteps.map((ws, idx) => {
+      const stepNumber = idx + 1;
+      const stepVideoTag = ws.videoId || videoId;
+      let candidateId = ws.id || ws.stepId || `step_${stepNumber}`;
+      if (usedStepIds.has(candidateId)) {
+        candidateId = `step_${stepVideoTag}_${stepNumber}`;
+      }
+      usedStepIds.add(candidateId);
+      return {
+        ...ws,
+        id: candidateId,
+        stepId: ws.stepId && !usedStepIds.has(ws.stepId) ? ws.stepId : candidateId,
+        stepNumber,
+        videoId: stepVideoTag,
+      };
+    });
+  }
+
+  // 5. Resolve Archive Metadata (preserve existing non-placeholder metadata when appending a video)
+  const isPlaceholderMeta = (val?: string | null): boolean => {
+    if (!val) return true;
+    const lower = String(val).trim().toLowerCase();
+    return (
+      !lower ||
+      lower === 'n/a' ||
+      lower === 'unknown' ||
+      lower === 'lab operator' ||
+      lower === 'lab technician' ||
+      lower === 'experiment archive' ||
+      lower === archiveId.toLowerCase()
+    );
+  };
+
+  let resolvedArchiveName: string | undefined;
+  let resolvedCreatorName: string | null | undefined;
+  let resolvedCreationDate: string | null | undefined;
+
+  if (isFullArchiveDirectEdit) {
+    resolvedArchiveName = archiveName || existingData.name;
+    resolvedCreatorName = creatorName !== undefined ? creatorName : existingData.creatorName;
+    resolvedCreationDate = creationDate !== undefined ? creationDate : existingData.creationDate;
+  } else {
+    resolvedArchiveName =
+      existingData.name && !isPlaceholderMeta(existingData.name)
+        ? existingData.name
+        : archiveName || existingData.name;
+    resolvedCreatorName =
+      existingData.creatorName && !isPlaceholderMeta(existingData.creatorName)
+        ? existingData.creatorName
+        : !isPlaceholderMeta(creatorName)
+        ? creatorName
+        : existingData.creatorName ?? creatorName;
+    resolvedCreationDate =
+      existingData.creationDate && !isPlaceholderMeta(existingData.creationDate)
+        ? existingData.creationDate
+        : !isPlaceholderMeta(creationDate)
+        ? creationDate
+        : existingData.creationDate ?? creationDate;
+  }
+
+  // 6. Recompile markdownDoc when merging existing and incoming archive content
+  const extractMarkdownDescription = (md?: string): string => {
+    if (!md || typeof md !== 'string') return '';
+    const match = md.match(/##\s*Description\s*\r?\n([\s\S]*?)(?=\r?\n##\s+|$)/i);
+    return match ? match[1].trim() : '';
+  };
+
+  const isGenericDescription = (desc: string): boolean => {
+    const lower = desc.trim().toLowerCase();
+    return (
+      !lower ||
+      lower === 'automated experiment archive generated from sail video analysis.' ||
+      lower === 'experiment notebook entry recorded via sail video pipeline.' ||
+      lower.startsWith('experiment archive:')
+    );
+  };
+
+  let finalMarkdownDoc = validatedPayload.markdownDoc;
+  const hadPriorStructuredContent =
+    !isFullArchiveDirectEdit &&
+    (existingReagents.length > 0 || existingWorkSteps.length > 0);
+  const hasPlaceholderMarkdown =
+    finalMarkdownDoc.includes('- Verified protocol reagents') ||
+    finalMarkdownDoc.includes('1. Executed experiment steps.');
+
+  if (
+    (hadPriorStructuredContent || hasPlaceholderMarkdown) &&
+    (mergedReagents.length > 0 || mergedWorkSteps.length > 0)
+  ) {
+    const existingDesc = extractMarkdownDescription(existingData.markdownDoc);
+    const incomingDesc = extractMarkdownDescription(validatedPayload.markdownDoc);
+    let combinedDesc = incomingDesc || existingDesc;
+    if (
+      existingDesc &&
+      incomingDesc &&
+      existingDesc.toLowerCase() !== incomingDesc.toLowerCase() &&
+      !isGenericDescription(existingDesc) &&
+      !isGenericDescription(incomingDesc)
+    ) {
+      combinedDesc = existingDesc.includes(incomingDesc)
+        ? existingDesc
+        : `${existingDesc}\n${incomingDesc}`;
+    } else if (!isGenericDescription(existingDesc)) {
+      combinedDesc = existingDesc;
+    } else if (!isGenericDescription(incomingDesc)) {
+      combinedDesc = incomingDesc;
+    }
+    finalMarkdownDoc = formatArchiveMarkdown({
+      description:
+        combinedDesc ||
+        resolvedArchiveName ||
+        'Automated experiment archive generated from SAIL video analysis.',
+      reagents: mergedReagents,
+      workSteps: mergedWorkSteps,
+    });
+  }
+
+  const persistArchiveDoc = async (firestoreInstance: Firestore) => {
+    const archiveRef = firestoreInstance.collection('archives').doc(archiveId);
+    await archiveRef.set(
+      stripUndefinedFields({
+        id: archiveId,
         archiveId,
-        videoId,
-        markdownDoc: validatedPayload.markdownDoc,
+        ...(videoId !== archiveId ? { videoId } : existingData.videoId ? { videoId: existingData.videoId } : {}),
+        ...(resolvedArchiveName ? { name: resolvedArchiveName } : {}),
+        ...(resolvedCreatorName !== undefined ? { creatorName: resolvedCreatorName } : {}),
+        ...(resolvedCreationDate !== undefined ? { creationDate: resolvedCreationDate } : {}),
+        videoIds: mergedVideoIds,
+        reagents: mergedReagents,
+        labelTranscriptions: mergedTranscriptions,
+        workSteps: mergedWorkSteps,
+        markdownDoc: finalMarkdownDoc,
         operatorInitials: validatedPayload.operatorInitials,
+        contentErased: false,
         isSignedOff: true,
         signedOffAt,
+        createdAt: existingData.createdAt || signedOffAt,
         updatedAt: signedOffAt,
-      },
+      }),
       { merge: true }
     );
+  };
 
-  // Mark video_analyses/{videoId}.isSignedOff = true
-  await db
-    .collection('video_analyses')
-    .doc(videoId)
-    .set(
-      {
-        videoId,
-        isSignedOff: true,
-        signedOffAt,
-        updatedAt: signedOffAt,
-      },
-      { merge: true }
-    );
+  await persistArchiveDoc(tenantDb);
+  if (dbId !== '(default)' && db && db !== tenantDb) {
+    try {
+      await persistArchiveDoc(db);
+    } catch {
+      // ignore fallback write error
+    }
+  }
 
-  if (process.env.NODE_ENV !== 'test') {
-    await updateVideoPass(dbId, videoId, 'hitl', {
+  // Mark video_analyses/{videoId}.isSignedOff = true and persist structured notebook data
+  const persistVideoAnalysisDoc = async (firestoreInstance: Firestore) => {
+    await firestoreInstance
+      .collection('video_analyses')
+      .doc(videoId)
+      .set(
+        stripUndefinedFields({
+          videoId,
+          archiveId,
+          ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
+          ...(resolvedCreatorName !== undefined ? { creatorName: resolvedCreatorName } : {}),
+          ...(resolvedCreationDate !== undefined ? { creationDate: resolvedCreationDate } : {}),
+          ...(structuredReagents.length > 0 ? { reagents: structuredReagents } : {}),
+          ...(structuredWorkSteps.length > 0 ? { workSteps: structuredWorkSteps } : {}),
+          isSignedOff: true,
+          signedOffAt,
+          updatedAt: signedOffAt,
+        }),
+        { merge: true }
+      );
+  };
+
+  if (!isFullArchiveDirectEdit) {
+    await persistVideoAnalysisDoc(tenantDb);
+    if (dbId !== '(default)' && db && db !== tenantDb) {
+      try {
+        await persistVideoAnalysisDoc(db);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  if (!isFullArchiveDirectEdit) {
+    const hitlPassPayload: PassStepState = {
       status: 'COMPLETED',
       completedAt: signedOffAt,
+      data: {
+        archiveId,
+        operatorInitials,
+        signedOffAt,
+        reagents: structuredReagents,
+        labelTranscriptions: structuredLabelTranscriptions,
+        workSteps: structuredWorkSteps,
+        markdownDoc: finalMarkdownDoc,
+      },
+    };
+    await updateVideoPass(dbId, videoId, 'hitl', hitlPassPayload, {
+      archiveId,
+      ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
+      isSignedOff: true,
+      signedOffAt,
+      updatedAt: signedOffAt,
     });
+    if (dbId !== '(default)') {
+      await updateVideoPass('(default)', videoId, 'hitl', hitlPassPayload, {
+        archiveId,
+        ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
+        isSignedOff: true,
+        signedOffAt,
+        updatedAt: signedOffAt,
+      });
+    }
   }
 
   return {
@@ -1575,11 +2473,84 @@ export async function commitArchiveSignOff(
     databaseId: dbId,
     videoId,
     archiveId,
+    ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
     documentPath: `/databases/${dbId}/documents/archives/${archiveId}`,
-    markdownDoc: validatedPayload.markdownDoc,
+    markdownDoc: finalMarkdownDoc,
+    reagents: mergedReagents,
+    labelTranscriptions: mergedTranscriptions,
+    workSteps: mergedWorkSteps,
     signedOffAt,
     isSignedOff: true,
   };
+}
+
+/**
+ * Resets the HITL sign-off / commit state for a given video, reverting passes.hitl to PENDING
+ * and clearing isSignedOff flags on both videos/{videoId} and video_analyses/{videoId}.
+ */
+export async function resetVideoHitlCommit(
+  databaseId: string | undefined,
+  videoId: string
+): Promise<void> {
+  const dbId = normalizeDatabaseId(databaseId || '(default)');
+  const tenantDb = getTenantFirestore(dbId);
+  const nowIso = new Date().toISOString();
+
+  const hitlPendingPass: PassStepState = {
+    status: 'PENDING',
+    completedAt: null as any,
+    data: null as any,
+  };
+
+  const extraVideoUpdates = {
+    isSignedOff: false,
+    signedOffAt: null,
+    updatedAt: nowIso,
+  };
+
+  // 1. Reset video pass in memory and Firestore for dbId & (default)
+  await updateVideoPass(dbId, videoId, 'hitl', hitlPendingPass, extraVideoUpdates);
+  if (dbId !== '(default)') {
+    await updateVideoPass('(default)', videoId, 'hitl', hitlPendingPass, extraVideoUpdates);
+  }
+
+  // 2. Clear isSignedOff and signedOffAt in video_analyses/{videoId}
+  const clearAnalysis = async (firestoreInstance: Firestore, memStoreTargetId: string) => {
+    try {
+      const memStore = getTenantMemoryStore(memStoreTargetId);
+      const analysisKey = `video_analyses/${videoId}`;
+      const memAnalysis = memStore.get(analysisKey);
+      if (memAnalysis) {
+        memStore.set(analysisKey, {
+          ...memAnalysis,
+          isSignedOff: false,
+          signedOffAt: null,
+          updatedAt: nowIso,
+        });
+      }
+      const analysisRef = firestoreInstance.collection('video_analyses').doc(videoId);
+      if (analysisRef && typeof analysisRef.set === 'function') {
+        await analysisRef.set(
+          {
+            isSignedOff: false,
+            signedOffAt: null,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+      }
+    } catch (err) {
+      console.warn(`[FirestoreService] Could not reset video_analyses/${videoId}:`, err);
+    }
+  };
+
+  await clearAnalysis(tenantDb, dbId);
+  if (dbId !== '(default)') {
+    const defDb = getTenantFirestore('(default)');
+    if (defDb && defDb !== tenantDb) {
+      await clearAnalysis(defDb, '(default)');
+    }
+  }
 }
 
 /**

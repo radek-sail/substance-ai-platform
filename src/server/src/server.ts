@@ -5,11 +5,13 @@ import dotenv from 'dotenv';
 import videoRoutes from './routes/video.routes';
 import pipelineRoutes from './routes/pipeline.routes';
 import inventoryRoutes from './routes/inventory.routes';
+import archiveRoutes from './routes/archive.routes';
 import {
   uploadMiddleware,
   uploadVideoHandler,
   listVideosHandler,
   associateInventoryHandler,
+  associateArchiveHandler,
   getVideoFrameHandler,
   deleteVideoHandler,
 } from './controllers/video.controller';
@@ -27,6 +29,11 @@ import {
   getInventoryHandler,
   emptyInventoryHandler,
 } from './controllers/inventory.controller';
+import {
+  listArchivesHandler,
+  createArchiveHandler,
+  getArchiveHandler,
+} from './controllers/archive.controller';
 
 // Load environment variables
 dotenv.config();
@@ -63,6 +70,7 @@ app.get('/api/videos', listVideosHandler);
 app.post('/api/videos/upload', uploadMiddleware, uploadVideoHandler);
 app.delete('/api/videos/:videoId', deleteVideoHandler);
 app.post('/api/videos/:videoId/associate-inventory', associateInventoryHandler);
+app.post('/api/videos/:videoId/associate-archive', associateArchiveHandler);
 app.get('/api/videos/:videoId/frames/:filename', getVideoFrameHandler);
 
 // Pipeline analysis routes
@@ -84,6 +92,12 @@ app.get('/api/inventories', listInventoriesHandler);
 app.post('/api/inventories', createInventoryHandler);
 app.get('/api/inventories/:id', getInventoryHandler);
 app.post('/api/inventories/:id/empty', emptyInventoryHandler);
+
+// Experiment archive management routes
+app.use('/api/archives', archiveRoutes);
+app.get('/api/archives', listArchivesHandler);
+app.post('/api/archives', createArchiveHandler);
+app.get('/api/archives/:id', getArchiveHandler);
 
 // ----------------------------------------------------
 // Serve Vite frontend static assets

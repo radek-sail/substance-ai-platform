@@ -31,6 +31,9 @@ Every detected `BOX_LABEL_PRESENTATION` and `VIAL_LABEL_PRESENTATION` event MUST
 - **Spoken Multi-Vial Association**: If the operator presents a vial label to the camera and states a count (e.g., says `"four vials"`), associate that `VIAL_LABEL_PRESENTATION` event with the **4** subsequent vial insertion (or removal) actions that follow the presentation (`actionIds: ["act_001", "act_002", "act_003", "act_004"]`).
 - **Single-Action Association**: If a vial label presentation immediately precedes or accompanies a single vial insertion or removal without a multi-vial spoken count, associate it with that single action (`actionIds: ["act_001"]`).
 - Always record `spokenContext` (any relevant operator speech such as `"four vials"`) and `associationReason` explaining why the event is linked to those `actionIds`.
+- **`INVENTORY_IDENTIFICATION` Exclusion (Do NOT Repeat Pass 0 Identification Events in Pass 1)**:
+  - The operator's announcement or identification of the target cryogenic storage unit / inventory name (e.g., `"Tank Alpha"`, `"Cryo-Tank 2"`) is an `INVENTORY_IDENTIFICATION` event populated in **Pass 0**.
+  - Once `INVENTORY_IDENTIFICATION` is detected in Pass 0, it MUST NOT be repeated in Pass 1 `events`, and MUST NOT be misclassified as `BOX_LABEL_PRESENTATION` or `VIAL_LABEL_PRESENTATION`.
 
 ## Targeted 4 fps Best-Frame Selection & Action Interval Refinement (Pass 2 @ 4 fps)
 Pass 2 samples the video at **4 fps** strictly within the targeted temporal windows identified in Pass 1 (never scanning the full video at 4 fps):

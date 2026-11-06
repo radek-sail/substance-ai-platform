@@ -22,7 +22,10 @@ import {
   parseFfmpegStderrMetadata,
 } from '../services/ffmpeg.service';
 import { runPass0WorkflowClassification } from '../services/gemini.service';
-import { reconcileVideoInventoryAssociation } from './pipeline.controller';
+import {
+  reconcileVideoInventoryAssociation,
+  reconcileVideoArchiveAssociation,
+} from './pipeline.controller';
 import * as firestoreService from '../services/firestore.service';
 import {
   db,
@@ -118,6 +121,25 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
   const scratchDir = getScratchDir();
   let tempUploadedFile: string | null = null;
   let inputLocalPath = req.file?.path || req.body?.filePath || req.body?.localFilePath;
+
+  // Clean up any stale leftover intermediate frames or artifacts for this videoId
+  try {
+    const safeVideoId = String(videoId).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const staleDirs = [
+      path.join(os.tmpdir(), 'sail_persistent_frames', videoId),
+      path.join(process.cwd(), 'frames', videoId),
+      path.join(os.tmpdir(), `sail_frames_${videoId}`),
+      path.join(scratchDir, `sail_frames_${videoId}`),
+      path.join(os.tmpdir(), 'sail_pass_artifacts', safeVideoId),
+    ];
+    for (const dir of staleDirs) {
+      if (fs.existsSync(dir)) {
+        await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
 
   // Handle optional base64 encoded video payloads
   if (!inputLocalPath && req.body?.videoBase64) {
@@ -935,6 +957,9 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
           databaseId: '(default)',
         });
 
+        await reconcileVideoInventoryAssociation('(default)', videoId, classification);
+        await reconcileVideoArchiveAssociation('(default)', videoId, classification);
+
         const pass0CompletedAt = new Date().toISOString();
         const pass0Audit = (classification as any)?.executionAudit;
         await firestoreService.updateVideoPass('(default)', videoId, 'pass0', {
@@ -945,8 +970,6 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
           startedAt: pass0StartedAt,
           completedAt: pass0CompletedAt,
         });
-
-        await reconcileVideoInventoryAssociation('(default)', videoId, classification);
         console.log(`[Transcode] Automatic Pass 0 completed for ${videoId}: ${classification.workflowType}`);
       } catch (pass0Err: any) {
         console.warn(`[Transcode] Automatic Pass 0 failed for ${videoId}:`, pass0Err);
@@ -1088,6 +1111,188 @@ export const associateInventoryHandler = async (req: Request, res: Response): Pr
  * refined action boundary frames (FIRST_FRAME / LAST_FRAME) from local cache, GCS,
  * or on-demand FFmpeg extraction from the normalized video.
  */
+/**
+ * POST /api/videos/:videoId/associate-archive
+ * Manually associates a video record with an existing experiment archive.
+ * Body: { archiveId: string }
+ */
+export const associateArchiveHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const videoId = req.params.videoId || req.body?.videoId;
+  if (!videoId) {
+    return res.status(400).json({ error: 'Missing required parameter: videoId' });
+  }
+
+  const { archiveId } = req.body || {};
+  if (!archiveId || typeof archiveId !== 'string') {
+    return res.status(400).json({ error: 'Missing required field: archiveId' });
+  }
+
+  const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId) as string | undefined;
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
+
+  try {
+    const dbTarget = firestoreService.getTenantFirestore(databaseId);
+    let archiveDoc: any = null;
+    try {
+      const snap = await dbTarget.collection('archives').doc(archiveId).get();
+      if (snap && snap.exists) {
+        archiveDoc = snap.data();
+      } else if (db && db !== dbTarget) {
+        const fallbackSnap = await db.collection('archives').doc(archiveId).get();
+        if (fallbackSnap && fallbackSnap.exists) {
+          archiveDoc = fallbackSnap.data();
+        }
+      }
+    } catch {
+      if (db) {
+        const fallbackSnap = await db.collection('archives').doc(archiveId).get();
+        if (fallbackSnap && fallbackSnap.exists) {
+          archiveDoc = fallbackSnap.data();
+        }
+      }
+    }
+
+    if (!archiveDoc) {
+      return res.status(404).json({ error: `Archive with ID '${archiveId}' not found` });
+    }
+
+    const archiveName = archiveDoc.name || archiveId;
+    const nowIso = new Date().toISOString();
+
+    const updatePayload = {
+      archiveId,
+      archiveName,
+      archiveCreatorName: archiveDoc.creatorName ?? null,
+      archiveCreationDate: archiveDoc.creationDate ?? null,
+      unmatchedArchiveName: null,
+      archiveAssociationType: 'MANUAL' as const,
+      associatedAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    await firestoreService.updateVideoRecord(databaseId, videoId, updatePayload);
+    if (databaseId !== '(default)') {
+      await firestoreService.updateVideoRecord('(default)', videoId, updatePayload);
+    }
+
+    // Best-effort: update passes.pass0.data.archiveName on videos/{videoId} so subsequent passes
+    // and UI refreshes use the canonical associated archive name instead of Pass 0's raw transcription
+    try {
+      const existingVid =
+        (await firestoreService.getVideoMetadata(databaseId, videoId)) ||
+        (databaseId !== '(default)' ? await firestoreService.getVideoMetadata('(default)', videoId) : null);
+      if (existingVid?.passes?.pass0) {
+        const prevPass0Data = existingVid.passes.pass0.data || {};
+        const updatedPass0State = {
+          ...existingVid.passes.pass0,
+          data: {
+            ...prevPass0Data,
+            archiveName,
+            creatorName: archiveDoc.creatorName ?? prevPass0Data.creatorName ?? null,
+            creationDate: archiveDoc.creationDate ?? prevPass0Data.creationDate ?? null,
+            archiveIntent: 'APPEND',
+            isAppending: true,
+          },
+        };
+        await firestoreService.updateVideoPass(databaseId, videoId, 'pass0', updatedPass0State);
+        if (databaseId !== '(default)') {
+          await firestoreService.updateVideoPass('(default)', videoId, 'pass0', updatedPass0State);
+        }
+      }
+    } catch {
+      // ignore pass0 update error
+    }
+
+    // Best-effort: propagate archiveId and canonical archiveName to video_analyses/{videoId} if it already exists
+    try {
+      const existingAnalysis =
+        (await firestoreService.getVideoAnalysis(databaseId, videoId)) ||
+        (databaseId !== '(default)' ? await firestoreService.getVideoAnalysis('(default)', videoId) : null);
+      if (existingAnalysis) {
+        const analysisUpdate = {
+          ...existingAnalysis,
+          archiveId,
+          archiveName,
+          creatorName: archiveDoc.creatorName ?? null,
+          creationDate: archiveDoc.creationDate ?? null,
+          ...(existingAnalysis.workflowClassification
+            ? {
+                workflowClassification: {
+                  ...existingAnalysis.workflowClassification,
+                  archiveName,
+                  creatorName:
+                    archiveDoc.creatorName ??
+                    existingAnalysis.workflowClassification.creatorName ??
+                    null,
+                  creationDate:
+                    archiveDoc.creationDate ??
+                    existingAnalysis.workflowClassification.creationDate ??
+                    null,
+                },
+              }
+            : {}),
+          ...(existingAnalysis.workloadClassification
+            ? {
+                workloadClassification: {
+                  ...existingAnalysis.workloadClassification,
+                  archiveName,
+                  creatorName:
+                    archiveDoc.creatorName ??
+                    existingAnalysis.workloadClassification.creatorName ??
+                    null,
+                  creationDate:
+                    archiveDoc.creationDate ??
+                    existingAnalysis.workloadClassification.creationDate ??
+                    null,
+                },
+              }
+            : {}),
+          updatedAt: nowIso,
+        };
+        await firestoreService.saveVideoAnalysis(databaseId, videoId, analysisUpdate);
+        if (databaseId !== '(default)') {
+          await firestoreService.saveVideoAnalysis('(default)', videoId, analysisUpdate);
+        }
+      }
+    } catch {
+      // ignore video_analyses sync error
+    }
+
+    // Best-effort: append videoId to archive's videoIds list
+    try {
+      const existingVideoIds = Array.isArray(archiveDoc.videoIds) ? archiveDoc.videoIds : [];
+      if (!existingVideoIds.includes(videoId)) {
+        await dbTarget
+          .collection('archives')
+          .doc(archiveId)
+          .set(
+            {
+              videoIds: [...existingVideoIds, videoId],
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          );
+      }
+    } catch {
+      // ignore archive videoIds update error
+    }
+
+    const updatedVideo =
+      (await firestoreService.getVideoMetadata(databaseId, videoId)) ||
+      (await firestoreService.getVideoMetadata('(default)', videoId));
+
+    return res.status(200).json({
+      success: true,
+      message: `Video ${videoId} successfully associated with archive '${archiveName}' (${archiveId}).`,
+      video: updatedVideo,
+      ...updatePayload,
+    });
+  } catch (error: any) {
+    console.error(`[VideoController] Error associating archive with video ${videoId}:`, error);
+    return res.status(500).json({ error: error?.message || 'Failed to associate archive' });
+  }
+};
+
 export const getVideoFrameHandler = async (req: Request, res: Response): Promise<Response | void> => {
   const { videoId, filename } = req.params;
   if (!videoId || !filename) {
@@ -1367,19 +1572,50 @@ export const deleteVideoHandler = async (req: Request, res: Response): Promise<R
       // Ignore direct delete errors if already handled by deleteVideoRecord
     }
 
-    // Clean up local cache files if present
+    // Clean up local cache files, extracted frames, and pass artifacts if present
     try {
       const scratchDir = getScratchDir();
-      const rawCached = path.join(scratchDir, 'sail_raw_cache', `raw_${videoId}.mp4`);
-      const normCached = path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}.mp4`);
-      if (fs.existsSync(rawCached)) {
-        await fs.promises.unlink(rawCached).catch(() => {});
+      const safeVideoId = String(videoId).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const filesToUnlink = [
+        path.join(scratchDir, 'sail_raw_cache', `raw_${videoId}.mp4`),
+        path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}.mp4`),
+        path.join(scratchDir, `upload_${videoId}.mp4`),
+        path.join(scratchDir, `norm_${videoId}.mp4`),
+      ];
+      for (const filePath of filesToUnlink) {
+        if (fs.existsSync(filePath)) {
+          await fs.promises.unlink(filePath).catch(() => {});
+        }
       }
-      if (fs.existsSync(normCached)) {
-        await fs.promises.unlink(normCached).catch(() => {});
+
+      const dirsToClean = [
+        path.join(os.tmpdir(), 'sail_persistent_frames', videoId),
+        path.join(process.cwd(), 'frames', videoId),
+        path.join(os.tmpdir(), `sail_frames_${videoId}`),
+        path.join(scratchDir, `sail_frames_${videoId}`),
+        path.join(os.tmpdir(), 'sail_pass_artifacts', safeVideoId),
+        path.join(os.tmpdir(), 'sail_pass_artifacts', videoId),
+      ];
+      for (const dir of dirsToClean) {
+        if (fs.existsSync(dir)) {
+          await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+        }
       }
     } catch {
       // Ignore local cache cleanup errors
+    }
+
+    // Attempt GCS cleanup for video uploads, normalized copies, and frames
+    try {
+      const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
+      const bucket = storage.bucket(bucketName);
+      await Promise.allSettled([
+        bucket.file(`uploads/${videoId}.mp4`).delete().catch(() => {}),
+        bucket.file(`normalized/norm_${videoId}.mp4`).delete().catch(() => {}),
+        bucket.deleteFiles({ prefix: `frames/${videoId}/` }).catch(() => {}),
+      ]);
+    } catch {
+      // Ignore GCS cleanup errors
     }
 
     return res.status(200).json({
@@ -1390,5 +1626,43 @@ export const deleteVideoHandler = async (req: Request, res: Response): Promise<R
   } catch (err: any) {
     console.error(`[VideoController] Error deleting video ${videoId}:`, err);
     return res.status(500).json({ error: err?.message || 'Failed to delete video' });
+  }
+};
+
+/**
+ * POST /api/videos/:videoId/undo-commit
+ * Undoes HITL sign-off and resets commit state for a video (reverts passes.hitl to PENDING, isSignedOff to false).
+ */
+export const undoVideoCommitHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const videoId = req.params.videoId as string;
+  if (!videoId) {
+    return res.status(400).json({ error: 'Missing required parameter: videoId' });
+  }
+
+  const rawDatabaseId = (req.headers['x-database-id'] || req.body?.databaseId || req.query?.databaseId) as
+    | string
+    | undefined;
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
+
+  try {
+    await firestoreService.resetVideoHitlCommit(databaseId, videoId);
+    if (databaseId !== '(default)') {
+      await firestoreService.resetVideoHitlCommit('(default)', videoId);
+    }
+
+    const updated = await firestoreService.getVideoPasses(databaseId, videoId);
+
+    return res.status(200).json({
+      success: true,
+      videoId,
+      passes: updated?.passes || { hitl: { status: 'PENDING' } },
+      isSignedOff: false,
+    });
+  } catch (error: any) {
+    console.error(`[VideoController] Error undoing commit for video ${videoId}:`, error);
+    return res.status(500).json({
+      error: 'Failed to undo video commit',
+      message: error?.message || String(error),
+    });
   }
 };
