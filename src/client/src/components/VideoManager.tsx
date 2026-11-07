@@ -30,6 +30,7 @@ import {
   Terminal,
   Trash2,
   RotateCcw,
+  Pause,
 } from 'lucide-react';
 import {
   type VideoAnalysisDoc,
@@ -100,27 +101,71 @@ function formatDuration(seconds?: number): string {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
-function formatTimestamp(ts: any): string {
-  if (!ts) return 'Just now';
-  if (typeof ts === 'string') {
+function parseTimestampToDate(ts: any): Date | null {
+  if (!ts) return null;
+  if (ts instanceof Date) {
+    return Number.isNaN(ts.getTime()) ? null : ts;
+  }
+  if (typeof ts === 'string' || typeof ts === 'number') {
     const parsed = new Date(ts);
-    if (!Number.isNaN(parsed.getTime())) {
-      return parsed.toLocaleString();
-    }
-    return ts;
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
   if (typeof ts === 'object') {
     if (typeof ts.toDate === 'function') {
-      return ts.toDate().toLocaleString();
+      const d = ts.toDate();
+      return d instanceof Date && !Number.isNaN(d.getTime()) ? d : null;
     }
     if (typeof ts._seconds === 'number') {
-      return new Date(ts._seconds * 1000).toLocaleString();
+      return new Date(ts._seconds * 1000);
     }
     if (typeof ts.seconds === 'number') {
-      return new Date(ts.seconds * 1000).toLocaleString();
+      return new Date(ts.seconds * 1000);
     }
   }
+  return null;
+}
+
+function formatTimestamp(ts: any): string {
+  const d = parseTimestampToDate(ts);
+  if (d) return d.toLocaleString();
+  if (!ts) return 'Just now';
+  if (typeof ts === 'string') return ts;
   return 'Recorded';
+}
+
+function formatTimeOfDay(ts: any): string {
+  const d = parseTimestampToDate(ts);
+  if (d) {
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+  return 'Recorded';
+}
+
+function extractCaptureDay(ts: any): { dayKey: string; dayLabel: string } {
+  const d = parseTimestampToDate(ts);
+  if (d) {
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return {
+      dayKey: `${yyyy}-${mm}-${dd}`,
+      dayLabel: d.toLocaleDateString(undefined, {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+      }),
+    };
+  }
+  if (typeof ts === 'string' && ts.trim()) {
+    return {
+      dayKey: ts.trim().slice(0, 10),
+      dayLabel: ts.trim().slice(0, 10),
+    };
+  }
+  return {
+    dayKey: 'unknown-date',
+    dayLabel: 'Unspecified Date',
+  };
 }
 
 function ensurePasses(passes?: VideoPasses): VideoPasses {
@@ -151,6 +196,169 @@ function formatWorkflowClassificationLabel(workflowType?: string, pass0Status?: 
   }
   return 'Pending Pass 0 classification';
 }
+
+interface ActiveStreamThumbnailPreviewProps {
+  videoId: string;
+  originalName: string;
+  status: string;
+}
+
+const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> = ({
+  videoId,
+  originalName,
+  status,
+}) => {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [hasError, setHasError] = useState<boolean>(false);
+
+  const isIngesting = status === 'UPLOADING' || status === 'TRANSCODING';
+  const thumbnailUrl = `/api/videos/${encodeURIComponent(videoId)}/thumbnail`;
+
+  useEffect(() => {
+    setIsPlaying(false);
+    setHasError(false);
+    setIsLoading(!isIngesting);
+  }, [videoId, status, isIngesting]);
+
+  const handleLoadedData = () => {
+    setIsLoading(false);
+    setHasError(false);
+    const el = videoRef.current;
+    if (!el) return;
+    el.currentTime = 0;
+    const playPromise = el.play();
+    if (playPromise && typeof playPromise.then === 'function') {
+      playPromise
+        .then(() => {
+          setIsPlaying(true);
+        })
+        .catch(() => {
+          setIsPlaying(false);
+        });
+    }
+  };
+
+  const handleEnded = () => {
+    const el = videoRef.current;
+    if (el) {
+      el.pause();
+      el.currentTime = 0;
+    }
+    setIsPlaying(false);
+  };
+
+  const handleTogglePlay = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const el = videoRef.current;
+    if (!el || hasError || isIngesting) return;
+    if (el.paused) {
+      if (el.ended || (el.duration && el.currentTime >= el.duration - 0.05)) {
+        el.currentTime = 0;
+      }
+      el.play()
+        .then(() => setIsPlaying(true))
+        .catch(() => setIsPlaying(false));
+    } else {
+      el.pause();
+      setIsPlaying(false);
+    }
+  };
+
+  const handleRewindStop = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const el = videoRef.current;
+    if (!el) return;
+    el.pause();
+    el.currentTime = 0;
+    setIsPlaying(false);
+  };
+
+  return (
+    <div
+      data-testid={`active-stream-thumbnail-preview-${videoId}`}
+      onClick={handleTogglePlay}
+      title={`${originalName} — Plays once, then rewinds to 00:00 and stops (click to replay/pause)`}
+      className="relative w-24 h-40 sm:w-28 sm:h-48 rounded-xl overflow-hidden bg-slate-950 border border-cyan-500/50 shadow-md shadow-cyan-950/40 shrink-0 group select-none cursor-pointer"
+    >
+      {isIngesting ? (
+        <div className="w-full h-full flex flex-col items-center justify-center gap-1.5 text-amber-300 bg-slate-950 p-2 text-center">
+          <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
+          <span className="text-[10px] font-mono leading-tight">Generating thumbnail...</span>
+        </div>
+      ) : (
+        <>
+          <video
+            ref={videoRef}
+            key={`${videoId}-${status}`}
+            src={thumbnailUrl}
+            muted
+            playsInline
+            preload="auto"
+            onLoadedData={handleLoadedData}
+            onPlay={() => setIsPlaying(true)}
+            onPause={() => setIsPlaying(false)}
+            onEnded={handleEnded}
+            onError={() => {
+              setIsLoading(false);
+              setHasError(true);
+            }}
+            className="w-full h-full object-contain bg-black"
+          />
+
+          {isLoading && !hasError && (
+            <div className="absolute inset-0 bg-slate-950/85 flex flex-col items-center justify-center gap-1 text-cyan-300 p-2 text-center">
+              <Loader2 className="w-4 h-4 animate-spin text-cyan-400" />
+              <span className="text-[9px] font-mono leading-tight">Loading preview...</span>
+            </div>
+          )}
+
+          {hasError && (
+            <div className="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center gap-1 text-slate-400 p-2 text-center">
+              <FileVideo className="w-5 h-5 text-cyan-400/70" />
+              <span className="text-[9px] font-mono leading-tight">Preview Ready on Demand</span>
+            </div>
+          )}
+
+          {/* Top-left LIVE PREVIEW badge */}
+          <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black/75 backdrop-blur-sm border border-cyan-500/40 flex items-center gap-1 pointer-events-none">
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                isPlaying ? 'bg-emerald-400 animate-pulse' : 'bg-cyan-400'
+              }`}
+            />
+            <span className="text-[9px] font-mono font-semibold text-cyan-200 tracking-tight">
+              {isPlaying ? 'PLAYING 1X' : 'PREVIEW'}
+            </span>
+          </div>
+
+          {/* Bottom-right Play/Pause & Rewind controls */}
+          {!hasError && !isLoading && (
+            <div className="absolute bottom-1.5 right-1.5 flex items-center gap-1 opacity-90 group-hover:opacity-100 transition-opacity">
+              <button
+                type="button"
+                onClick={handleTogglePlay}
+                className="p-1 rounded bg-black/75 hover:bg-cyan-600/80 text-white border border-slate-700/70 transition-colors"
+                title={isPlaying ? 'Pause preview' : 'Play preview once'}
+              >
+                {isPlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+              </button>
+              <button
+                type="button"
+                onClick={handleRewindStop}
+                className="p-1 rounded bg-black/75 hover:bg-slate-800 text-slate-200 border border-slate-700/70 transition-colors"
+                title="Rewind to beginning and stop"
+              >
+                <RotateCcw className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
 
 export const VideoManager: React.FC<VideoManagerViewProps> = ({
   tenant,
@@ -199,6 +407,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       : null
   );
   const [selectedVideoId, setSelectedVideoId] = useState<string | null>(activeStream);
+  const [isSelectedGroupCollapsed, setIsSelectedGroupCollapsed] = useState<boolean>(false);
 
   // Decoupled Upload & Transcoding State
   const [uploading, setUploading] = useState<boolean>(false);
@@ -944,6 +1153,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   }, [selectedVideoId, tenant.customerId, tenant.databaseId]);
 
   const handleSelectVideo = (video: VideoRecord) => {
+    setIsSelectedGroupCollapsed(false);
     setActiveStream(video.videoId, video);
     if (video.status === 'TRANSCODING') {
       setPollingStoppedForActive(false);
@@ -1540,6 +1750,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     if (forceHitlTab) {
       if (isArchiveWorkflow && resolvedArchiveId) {
         onNavigateToArchive?.(resolvedArchiveId, video.videoId);
+      } else if (!isArchiveWorkflow && video.inventoryId) {
+        onNavigateToInventory?.(video.inventoryId, video.videoId);
       }
       onSelectVideoForReview(video.videoId, 'hitl', cachedAnalysis);
       return;
@@ -1549,6 +1761,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
     if (targetTab === 'archive' && resolvedArchiveId) {
       onNavigateToArchive?.(resolvedArchiveId, video.videoId);
+    } else if (targetTab === 'inventory' && video.inventoryId) {
+      onNavigateToInventory?.(video.inventoryId, video.videoId);
     }
     onSelectVideoForReview(video.videoId, targetTab, cachedAnalysis);
   };
@@ -1621,50 +1835,114 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
   const renderAnalysisBadge = (video: VideoRecord) => {
     const vPasses = ensurePasses(passesByVideo[video.videoId] || video.passes);
+    const runningMap = runningPassMap[video.videoId] || {};
     const anyPassRunning =
       Boolean(analyzingIds[video.videoId]) ||
-      Object.values(runningPassMap[video.videoId] || {}).some(Boolean) ||
+      Object.values(runningMap).some(Boolean) ||
+      vPasses.pass0.status === 'RUNNING' ||
+      vPasses.pass1.status === 'RUNNING' ||
+      vPasses.pass2.status === 'RUNNING' ||
+      vPasses.pass3.status === 'RUNNING' ||
       video.status === 'ANALYZING';
 
     if (anyPassRunning) {
+      let runningPassNum = 1;
+      if (runningMap.pass0 || vPasses.pass0.status === 'RUNNING') {
+        runningPassNum = 0;
+      } else if (runningMap.pass1 || vPasses.pass1.status === 'RUNNING') {
+        runningPassNum = 1;
+      } else if (runningMap.pass2 || vPasses.pass2.status === 'RUNNING') {
+        runningPassNum = 2;
+      } else if (runningMap.pass3 || vPasses.pass3.status === 'RUNNING') {
+        runningPassNum = 3;
+      } else if (vPasses.pass0.status !== 'COMPLETED') {
+        runningPassNum = 0;
+      } else if (vPasses.pass1.status !== 'COMPLETED') {
+        runningPassNum = 1;
+      } else if (vPasses.pass2.status !== 'COMPLETED') {
+        runningPassNum = 2;
+      } else {
+        runningPassNum = 3;
+      }
+
       return (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-blue-950/80 text-blue-300 border border-blue-600/60">
+        <span
+          data-testid={`pipeline-status-badge-${video.videoId}`}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-blue-950/80 text-blue-300 border border-blue-600/60"
+        >
           <Loader2 className="w-3 h-3 text-blue-400 animate-spin" />
-          <span>Running Pass...</span>
+          <span>Running Pass {runningPassNum}</span>
         </span>
       );
     }
+
     if (video.status === 'ANALYSIS_COMPLETE' || vPasses.pass3.status === 'COMPLETED') {
       return (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-950/80 text-emerald-300 border border-emerald-600/60">
+        <span
+          data-testid={`pipeline-status-badge-${video.videoId}`}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-950/80 text-emerald-300 border border-emerald-600/60"
+        >
           <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-          <span>Analysis Complete</span>
+          <span>Pass 3 Finished</span>
         </span>
       );
     }
+
+    if (vPasses.pass2.status === 'COMPLETED') {
+      return (
+        <span
+          data-testid={`pipeline-status-badge-${video.videoId}`}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-cyan-950/80 text-cyan-300 border border-cyan-700/60"
+        >
+          <CheckCircle2 className="w-3 h-3 text-cyan-400" />
+          <span>Pass 2 Finished</span>
+        </span>
+      );
+    }
+
+    if (vPasses.pass1.status === 'COMPLETED') {
+      return (
+        <span
+          data-testid={`pipeline-status-badge-${video.videoId}`}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-cyan-950/80 text-cyan-300 border border-cyan-700/60"
+        >
+          <CheckCircle2 className="w-3 h-3 text-cyan-400" />
+          <span>Pass 1 Finished</span>
+        </span>
+      );
+    }
+
+    if (vPasses.pass0.status === 'COMPLETED') {
+      return (
+        <span
+          data-testid={`pipeline-status-badge-${video.videoId}`}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-cyan-950/80 text-cyan-300 border border-cyan-700/60"
+        >
+          <CheckCircle2 className="w-3 h-3 text-cyan-400" />
+          <span>Pass 0 Finished</span>
+        </span>
+      );
+    }
+
     if (video.status === 'FAILED') {
       return (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-rose-950/80 text-rose-300 border border-rose-600/60">
+        <span
+          data-testid={`pipeline-status-badge-${video.videoId}`}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-rose-950/80 text-rose-300 border border-rose-600/60"
+        >
           <AlertCircle className="w-3 h-3 text-rose-400" />
           <span>Error</span>
         </span>
       );
     }
 
-    const completedCount = [vPasses.pass0, vPasses.pass1, vPasses.pass2, vPasses.pass3].filter(
-      (p) => p.status === 'COMPLETED'
-    ).length;
-    if (completedCount > 0) {
-      return (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-cyan-950/80 text-cyan-300 border border-cyan-700/60">
-          <span>{completedCount}/4 Passes Complete</span>
-        </span>
-      );
-    }
-
     return (
-      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-slate-800/90 text-slate-400 border border-slate-700">
-        <span>READY_FOR_ANALYSIS</span>
+      <span
+        data-testid={`pipeline-status-badge-${video.videoId}`}
+        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-slate-800/90 text-slate-400 border border-slate-700"
+      >
+        <Clock className="w-3 h-3 text-slate-500" />
+        <span>No Pass Finished</span>
       </span>
     );
   };
@@ -1690,17 +1968,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
               Linked to: {video.inventoryName || video.inventoryId} ({matchTypeLabel})
             </span>
           </span>
-          {onNavigateToInventory && (
-            <button
-              type="button"
-              onClick={() => onNavigateToInventory(video.inventoryId ?? undefined, video.videoId)}
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-cyan-950 hover:bg-cyan-900 text-cyan-300 border border-cyan-800 transition-colors"
-              title="View in Cryo-Inventory"
-            >
-              <span>View in Cryo-Inventory</span>
-              <ExternalLink className="w-2.5 h-2.5" />
-            </button>
-          )}
         </div>
       );
     }
@@ -1803,31 +2070,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
               Date: {dateLabel}
             </span>
           )}
-          <button
-            type="button"
-            onClick={() => {
-              const rawCached = analysisCache[video.videoId];
-              const enrichedCached = rawCached
-                ? ({
-                    ...rawCached,
-                    ...(video.archiveId ? { archiveId: video.archiveId } : {}),
-                    ...(video.archiveName ? { archiveName: video.archiveName } : {}),
-                    ...(video.archiveCreatorName ? { creatorName: video.archiveCreatorName } : {}),
-                    ...(video.archiveCreationDate ? { creationDate: video.archiveCreationDate } : {}),
-                  } as VideoAnalysisDoc)
-                : undefined;
-              onSelectActiveStream?.(video, enrichedCached);
-              if (video.archiveId) {
-                onNavigateToArchive?.(video.archiveId, video.videoId);
-              }
-              onSelectVideoForReview(video.videoId, 'archive', enrichedCached);
-            }}
-            className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-indigo-950 hover:bg-indigo-900 text-indigo-300 border border-indigo-800 transition-colors"
-            title="Open in Experiment Archive"
-          >
-            <span>Open in Experiment Archive</span>
-            <ExternalLink className="w-2.5 h-2.5" />
-          </button>
         </div>
       );
     }
@@ -2335,168 +2577,458 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
             </p>
           </div>
         ) : (
-          <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/60">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="border-b border-slate-800 text-[11px] font-mono uppercase text-slate-400 bg-slate-900/80">
-                  <th className="py-3 px-4">Video Filename & Stream ID</th>
-                  <th className="py-3 px-4">Capture Timestamp & Duration</th>
-                  <th className="py-3 px-4">Transcoding / Ingestion</th>
-                  <th className="py-3 px-4">Pipeline Status</th>
-                  <th className="py-3 px-4 text-right">Action Controls</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/70 text-xs">
-                {videos.map((video) => {
-                  const isActive =
-                    activeStreamId === video.videoId || selectedVideo?.videoId === video.videoId;
-                  const isVideoAnalyzing =
-                    Boolean(analyzingIds[video.videoId]) ||
-                    Object.values(runningPassMap[video.videoId] || {}).some(Boolean) ||
-                    video.status === 'ANALYZING';
-                  const vPasses = ensurePasses(passesByVideo[video.videoId] || video.passes);
-                  const isAnalysisComplete =
-                    video.status === 'ANALYSIS_COMPLETE' || vPasses.pass3.status === 'COMPLETED';
-                  const pass0WorkflowType =
-                    vPasses.pass0.data?.workflowType ||
-                    analysisCache[video.videoId]?.workflowClassification?.workflowType ||
-                    analysisCache[video.videoId]?.workloadClassification?.workflowType;
-                  const classificationResultText = formatWorkflowClassificationLabel(
-                    pass0WorkflowType,
-                    vPasses.pass0.status
-                  );
-                  const isDeleting = Boolean(deletingIds[video.videoId]);
+          <div className="space-y-3">
+            {(() => {
+              interface VideoGroup {
+                groupKey: string;
+                entityType: 'archive' | 'inventory' | 'unassociated';
+                entityId: string | null;
+                entityName: string;
+                creatorName: string | null;
+                creationDate: string | null;
+                captureDayKey: string;
+                captureDayLabel: string;
+                classificationLabel: string;
+                associationLabel: string;
+                isMatched: boolean;
+                videos: VideoRecord[];
+              }
 
-                  return (
-                    <tr
-                      key={video.videoId}
-                      onClick={() => handleSelectVideo(video)}
-                      className={`cursor-pointer transition-colors ${
-                        isActive ? 'bg-cyan-950/25' : 'hover:bg-slate-900/60'
+              const groupsMap = new Map<string, VideoGroup>();
+
+              for (const video of videos) {
+                const vPasses = ensurePasses(passesByVideo[video.videoId] || video.passes);
+                const pass0Data = vPasses.pass0.data;
+                const pass0WorkflowType =
+                  pass0Data?.workflowType ||
+                  analysisCache[video.videoId]?.workflowClassification?.workflowType ||
+                  analysisCache[video.videoId]?.workloadClassification?.workflowType;
+                const classificationLabel = formatWorkflowClassificationLabel(
+                  pass0WorkflowType,
+                  vPasses.pass0.status
+                );
+                const { dayKey: captureDayKey, dayLabel: captureDayLabel } = extractCaptureDay(
+                  (video as any).capturedAt || video.uploadedAt
+                );
+
+                const isArchive =
+                  pass0WorkflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                  Boolean(video.archiveId) ||
+                  Boolean(video.archiveAssociationType) ||
+                  Boolean(video.archiveName) ||
+                  Boolean(video.unmatchedArchiveName);
+
+                const isInventory =
+                  !isArchive &&
+                  (pass0WorkflowType === 'INVENTORY_UPDATE_WORKFLOW' ||
+                    Boolean(video.inventoryId) ||
+                    Boolean(video.inventoryAssociationType) ||
+                    Boolean(video.inventoryName) ||
+                    Boolean(video.unmatchedInventoryName));
+
+                let entityType: 'archive' | 'inventory' | 'unassociated' = 'unassociated';
+                let entityId: string | null = null;
+                let entityName = 'Unassociated Videos';
+                let creatorName: string | null = (video as any).uploadedBy || null;
+                let creationDate: string | null = null;
+                let associationLabel = classificationLabel;
+                let isMatched = false;
+                let entityKey = 'unassociated';
+
+                if (isArchive) {
+                  entityType = 'archive';
+                  const candidateName =
+                    video.archiveName ||
+                    video.unmatchedArchiveName ||
+                    pass0Data?.archiveName ||
+                    '';
+                  const matchedArchive = archives.find(
+                    (a) =>
+                      (video.archiveId && a.id === video.archiveId) ||
+                      (Array.isArray(a.videoIds) && a.videoIds.includes(video.videoId)) ||
+                      (candidateName &&
+                        a.name &&
+                        a.name.trim().toLowerCase() === String(candidateName).trim().toLowerCase())
+                  );
+                  entityId = video.archiveId || matchedArchive?.id || null;
+                  entityName =
+                    matchedArchive?.name ||
+                    video.archiveName ||
+                    video.unmatchedArchiveName ||
+                    pass0Data?.archiveName ||
+                    'Unspecified Experiment Archive';
+                  creatorName =
+                    matchedArchive?.creatorName ||
+                    video.archiveCreatorName ||
+                    pass0Data?.creatorName ||
+                    null;
+                  creationDate =
+                    matchedArchive?.creationDate ||
+                    video.archiveCreationDate ||
+                    pass0Data?.creationDate ||
+                    null;
+                  isMatched = Boolean(video.archiveId || matchedArchive?.id);
+                  associationLabel = video.archiveId
+                    ? video.archiveAssociationType === 'AUTOMATIC'
+                      ? 'High-Confidence Auto-Match'
+                      : 'Confirmed'
+                    : video.archiveAssociationType === 'UNMATCHED'
+                    ? 'Unmatched Archive'
+                    : 'Pending Archive Confirmation';
+                  entityKey = entityId
+                    ? `archive:${entityId}`
+                    : `archive_name:${entityName.trim().toLowerCase()}`;
+                } else if (isInventory) {
+                  entityType = 'inventory';
+                  const candidateInvName =
+                    video.inventoryName ||
+                    video.unmatchedInventoryName ||
+                    pass0Data?.inventoryName ||
+                    '';
+                  const matchedInventory = inventories.find(
+                    (inv) =>
+                      (video.inventoryId && inv.id === video.inventoryId) ||
+                      (candidateInvName &&
+                        inv.name &&
+                        inv.name.trim().toLowerCase() ===
+                          String(candidateInvName).trim().toLowerCase())
+                  );
+                  entityId = video.inventoryId || matchedInventory?.id || null;
+                  entityName =
+                    matchedInventory?.name ||
+                    video.inventoryName ||
+                    video.unmatchedInventoryName ||
+                    pass0Data?.inventoryName ||
+                    'Unspecified Cryo-Inventory';
+                  creatorName =
+                    (matchedInventory as any)?.creatorName ||
+                    (video as any).uploadedBy ||
+                    null;
+                  creationDate = matchedInventory?.createdAt
+                    ? extractCaptureDay(matchedInventory.createdAt).dayLabel
+                    : null;
+                  isMatched = Boolean(video.inventoryId || matchedInventory?.id);
+                  associationLabel = video.inventoryId
+                    ? video.inventoryAssociationType === 'MANUAL'
+                      ? 'Manual'
+                      : 'Auto-Matched'
+                    : 'Unmatched Inventory';
+                  entityKey = entityId
+                    ? `inventory:${entityId}`
+                    : `inventory_name:${entityName.trim().toLowerCase()}`;
+                }
+
+                const groupKey = `${entityKey}__${captureDayKey}`;
+                const existing = groupsMap.get(groupKey);
+                if (existing) {
+                  existing.videos.push(video);
+                  if (!existing.creatorName && creatorName) existing.creatorName = creatorName;
+                  if (!existing.creationDate && creationDate) existing.creationDate = creationDate;
+                  if (!existing.entityId && entityId) existing.entityId = entityId;
+                  if (!existing.isMatched && isMatched) {
+                    existing.isMatched = true;
+                    existing.associationLabel = associationLabel;
+                  }
+                } else {
+                  groupsMap.set(groupKey, {
+                    groupKey,
+                    entityType,
+                    entityId,
+                    entityName,
+                    creatorName,
+                    creationDate,
+                    captureDayKey,
+                    captureDayLabel,
+                    classificationLabel,
+                    associationLabel,
+                    isMatched,
+                    videos: [video],
+                  });
+                }
+              }
+
+              const videoGroups = Array.from(groupsMap.values());
+
+              return videoGroups.map((group) => {
+                const isSelectedGroup = Boolean(
+                  selectedVideo &&
+                    group.videos.some((v) => v.videoId === selectedVideo.videoId)
+                );
+                // Only the panel for the selected video should be not collapsed. All other panels should be collapsed.
+                const isExpanded = isSelectedGroup && !isSelectedGroupCollapsed;
+
+                const unlinkedVideosInGroup = group.videos.filter(
+                  (v) =>
+                    (group.entityType === 'archive' && !v.archiveId) ||
+                    (group.entityType === 'inventory' && !v.inventoryId)
+                );
+
+                return (
+                  <div
+                    key={group.groupKey}
+                    data-testid={`video-group-panel-${group.groupKey}`}
+                    className={`rounded-xl border transition-all overflow-hidden ${
+                      isSelectedGroup
+                        ? 'border-cyan-500/50 bg-slate-950/90 shadow-lg shadow-cyan-950/20'
+                        : 'border-slate-800 bg-slate-950/50 hover:border-slate-700'
+                    }`}
+                  >
+                    {/* Collapsible Group Panel Header: Archive/Inventory & Capture Day Info */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (isSelectedGroup) {
+                          setIsSelectedGroupCollapsed((prev) => !prev);
+                        } else if (group.videos.length > 0) {
+                          handleSelectVideo(group.videos[0]);
+                        }
+                      }}
+                      className={`w-full text-left px-4 py-3.5 flex flex-wrap items-center justify-between gap-3 transition-colors ${
+                        isSelectedGroup
+                          ? 'bg-slate-900/90 hover:bg-slate-900'
+                          : 'bg-slate-900/40 hover:bg-slate-900/70'
                       }`}
                     >
-                      <td className="py-3.5 px-4">
-                        <div className="flex items-start gap-2.5">
-                          <FileVideo className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
-                          <div className="w-full max-w-sm">
-                            <div className="font-semibold text-slate-100 flex items-center gap-2">
-                              <span>{video.originalName}</span>
-                              {activeStreamId === video.videoId && (
-                                <span className="text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 px-1.5 py-0.5 rounded">
-                                  ACTIVE STREAM
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-[11px] font-mono text-slate-400 mt-0.5">
-                              ID: <span className="text-slate-300">{video.videoId}</span>
-                            </div>
-                            <div
-                              className="mt-2 flex items-center gap-2"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 shrink-0">
-                                Classification:
-                              </span>
-                              <input
-                                type="text"
-                                readOnly
-                                aria-label={`Video classification for ${video.originalName}`}
-                                value={classificationResultText}
-                                className="w-full bg-slate-950 border border-slate-700 rounded-md px-2.5 py-1 text-[11px] font-mono text-cyan-300 focus:outline-none"
-                              />
-                            </div>
-                            {renderInventoryBadge(video)}
-                            {renderArchiveBadge(video)}
-                          </div>
-                        </div>
-                      </td>
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        {isExpanded ? (
+                          <ChevronDown className="w-4 h-4 text-cyan-400 shrink-0" />
+                        ) : (
+                          <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" />
+                        )}
 
-                      <td className="py-3.5 px-4 font-mono">
-                        <div className="text-slate-200">
-                          {formatTimestamp((video as any).capturedAt || video.uploadedAt)}
-                        </div>
-                        <div className="text-[11px] text-slate-400 flex items-center gap-1.5 mt-0.5">
-                          <Clock className="w-3 h-3 text-slate-500" />
-                          <span>
-                            {video.durationSeconds !== undefined && video.durationSeconds > 0
-                              ? formatDuration(video.durationSeconds)
-                              : '--:--'}
+                        {group.entityType === 'archive' ? (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-mono font-semibold bg-indigo-950/90 text-indigo-300 border border-indigo-700/60">
+                            <Sparkles className="w-3 h-3 text-indigo-400 shrink-0" />
+                            <span>Experiment Archive</span>
                           </span>
-                          {video.fileSizeBytes ? (
-                            <span>• {(video.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB</span>
-                          ) : null}
-                        </div>
-                      </td>
+                        ) : group.entityType === 'inventory' ? (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-mono font-semibold bg-cyan-950/90 text-cyan-300 border border-cyan-700/60">
+                            <Package className="w-3 h-3 text-cyan-400 shrink-0" />
+                            <span>Cryo-Inventory</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-mono font-semibold bg-slate-800 text-slate-300 border border-slate-700">
+                            <FileVideo className="w-3 h-3 text-slate-400 shrink-0" />
+                            <span>Unassociated</span>
+                          </span>
+                        )}
 
-                      <td className="py-3.5 px-4">{renderIngestionBadge(video)}</td>
+                        <span className="text-sm font-bold text-slate-100">
+                          {group.entityName}
+                        </span>
 
-                      <td className="py-3.5 px-4">{renderAnalysisBadge(video)}</td>
+                        <span
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border ${
+                            group.isMatched
+                              ? 'bg-emerald-950/80 text-emerald-300 border-emerald-600/60'
+                              : 'bg-amber-950/80 text-amber-300 border-amber-600/60'
+                          }`}
+                        >
+                          {group.isMatched ? (
+                            <CheckCircle2 className="w-2.5 h-2.5 text-emerald-400 shrink-0" />
+                          ) : (
+                            <AlertCircle className="w-2.5 h-2.5 text-amber-400 shrink-0" />
+                          )}
+                          <span>{group.associationLabel}</span>
+                        </span>
 
-                      <td className="py-3.5 px-4 text-right" onClick={(e) => e.stopPropagation()}>
-                        <div className="flex items-center justify-end gap-2 flex-wrap">
-                          <button
-                            type="button"
-                            disabled={
-                              isVideoAnalyzing ||
-                              video.status === 'UPLOADING' ||
-                              video.status === 'TRANSCODING'
-                            }
-                            onClick={() => handleRunAllPasses(video)}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                          >
-                            {isVideoAnalyzing ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            ) : (
-                              <Play className="w-3.5 h-3.5" />
-                            )}
-                            <span>Run All Passes</span>
-                          </button>
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-slate-950 text-cyan-300 border border-slate-800">
+                          {group.classificationLabel}
+                        </span>
+                      </div>
 
-                          <button
-                            type="button"
-                            onClick={() => handleSelectVideo(video)}
-                            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
-                              activeStreamId === video.videoId
-                                ? 'bg-cyan-600/30 text-cyan-200 border-cyan-400/60'
-                                : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
-                            }`}
-                          >
-                            <Radio className="w-3.5 h-3.5 text-cyan-400" />
-                            <span>Select as Active Stream</span>
-                          </button>
+                      <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                        {group.creatorName && (
+                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-md bg-slate-950 text-slate-300 border border-slate-800">
+                            Creator: <strong className="ml-1 text-slate-100">{group.creatorName}</strong>
+                          </span>
+                        )}
 
-                          <button
-                            type="button"
-                            disabled={!isAnalysisComplete && vPasses.pass2.status !== 'COMPLETED'}
-                            onClick={() => handleInspectResults(video)}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                          >
-                            <Eye className="w-3.5 h-3.5" />
-                            <span>Inspect Results</span>
-                            <ArrowRight className="w-3.5 h-3.5" />
-                          </button>
+                        {group.creationDate && (
+                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-md bg-slate-950 text-slate-300 border border-slate-800">
+                            Created: <strong className="ml-1 text-slate-100">{group.creationDate}</strong>
+                          </span>
+                        )}
 
-                          <button
-                            type="button"
-                            disabled={isDeleting}
-                            onClick={() => handleDeleteVideo(video)}
-                            title="Delete video from database"
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                          >
-                            {isDeleting ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            ) : (
-                              <Trash2 className="w-3.5 h-3.5" />
-                            )}
-                            <span>Delete</span>
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-slate-950 text-cyan-300 border border-slate-800">
+                          <Clock className="w-3 h-3 text-cyan-400" />
+                          <span>Captured: {group.captureDayLabel}</span>
+                        </span>
+
+                        <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 border border-slate-700 text-[11px]">
+                          {group.videos.length} {group.videos.length === 1 ? 'Video' : 'Videos'}
+                        </span>
+                      </div>
+                    </button>
+
+                    {/* Collapsible Group Panel Body */}
+                    {isExpanded && (
+                      <div className="p-3.5 border-t border-slate-800/80 space-y-2.5 bg-slate-950/60">
+                        {/* If any video in this group is awaiting archive/inventory confirmation or association, show the prompt once at the top of the panel */}
+                        {unlinkedVideosInGroup.length > 0 && (
+                          <div className="pb-1">
+                            {group.entityType === 'inventory'
+                              ? renderInventoryBadge(unlinkedVideosInGroup[0])
+                              : renderArchiveBadge(unlinkedVideosInGroup[0])}
+                          </div>
+                        )}
+
+                        {group.videos.map((video) => {
+                          const isActive =
+                            activeStreamId === video.videoId ||
+                            selectedVideo?.videoId === video.videoId;
+                          const isVideoAnalyzing =
+                            Boolean(analyzingIds[video.videoId]) ||
+                            Object.values(runningPassMap[video.videoId] || {}).some(Boolean) ||
+                            video.status === 'ANALYZING';
+                          const vPasses = ensurePasses(
+                            passesByVideo[video.videoId] || video.passes
+                          );
+                          const isAnalysisComplete =
+                            video.status === 'ANALYSIS_COMPLETE' ||
+                            vPasses.pass3.status === 'COMPLETED';
+                          const canInspectResults =
+                            isAnalysisComplete ||
+                            vPasses.pass2.status === 'COMPLETED' ||
+                            Boolean(video.archiveId) ||
+                            Boolean(video.inventoryId);
+                          const isDeleting = Boolean(deletingIds[video.videoId]);
+
+                          return (
+                            <div
+                              key={video.videoId}
+                              data-testid={`video-card-${video.videoId}`}
+                              onClick={() => handleSelectVideo(video)}
+                              className={`rounded-xl p-4 border cursor-pointer transition-all flex items-center gap-4 ${
+                                isActive
+                                  ? 'bg-cyan-950/25 border-cyan-500/60 shadow-md shadow-cyan-950/30'
+                                  : 'bg-slate-900/70 border-slate-800 hover:bg-slate-900 hover:border-slate-700'
+                              }`}
+                            >
+                              {/* Left: Portrait Thumbnail Preview (when active) or FileVideo Icon */}
+                              {isActive ? (
+                                <ActiveStreamThumbnailPreview
+                                  videoId={video.videoId}
+                                  originalName={video.originalName}
+                                  status={video.status}
+                                />
+                              ) : (
+                                <div className="w-9 h-9 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-center shrink-0">
+                                  <FileVideo className="w-4 h-4 text-cyan-400" />
+                                </div>
+                              )}
+
+                              {/* Right of Preview: Video Info, Status Badges & Action Controls */}
+                              <div className="flex-1 min-w-0 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                                {/* Video Identity & Capture Time/Duration + Status Badges */}
+                                <div className="space-y-2 min-w-0">
+                                  <div>
+                                    <div className="font-semibold text-slate-100 text-xs sm:text-sm flex items-center gap-2 flex-wrap">
+                                      <span className="truncate">{video.originalName}</span>
+                                      {isActive && (
+                                        <span className="text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 px-1.5 py-0.5 rounded shrink-0">
+                                          ACTIVE STREAM
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="text-[11px] font-mono text-slate-400 mt-1 flex flex-wrap items-center gap-2">
+                                      <span>
+                                        ID: <span className="text-slate-300">{video.videoId}</span>
+                                      </span>
+                                      <span>•</span>
+                                      <span className="inline-flex items-center gap-1 text-slate-300">
+                                        <Clock className="w-3 h-3 text-slate-500" />
+                                        <span>
+                                          {formatTimeOfDay(
+                                            (video as any).capturedAt || video.uploadedAt
+                                          )}
+                                        </span>
+                                      </span>
+                                      <span>•</span>
+                                      <span>
+                                        Duration:{' '}
+                                        {video.durationSeconds !== undefined &&
+                                        video.durationSeconds > 0
+                                          ? formatDuration(video.durationSeconds)
+                                          : '--:--'}
+                                      </span>
+                                      {video.fileSizeBytes ? (
+                                        <>
+                                          <span>•</span>
+                                          <span>
+                                            {(video.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB
+                                          </span>
+                                        </>
+                                      ) : null}
+                                    </div>
+                                  </div>
+
+                                  {/* Ingestion & Pipeline Status Badges */}
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    {renderIngestionBadge(video)}
+                                    {renderAnalysisBadge(video)}
+                                  </div>
+                                </div>
+
+                                {/* Action Controls — aligned on the right side */}
+                                <div
+                                  className="flex items-center justify-end gap-2 flex-wrap shrink-0 lg:self-center"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      isVideoAnalyzing ||
+                                      video.status === 'UPLOADING' ||
+                                      video.status === 'TRANSCODING'
+                                    }
+                                    onClick={() => handleRunAllPasses(video)}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                                  >
+                                    {isVideoAnalyzing ? (
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                    ) : (
+                                      <Play className="w-3.5 h-3.5" />
+                                    )}
+                                    <span>Run All Passes</span>
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    disabled={!canInspectResults}
+                                    onClick={() => handleInspectResults(video)}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                                  >
+                                    <Eye className="w-3.5 h-3.5" />
+                                    <span>Inspect Results</span>
+                                    <ArrowRight className="w-3.5 h-3.5" />
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    disabled={isDeleting}
+                                    onClick={() => handleDeleteVideo(video)}
+                                    title="Delete video from database"
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                                  >
+                                    {isDeleting ? (
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                    ) : (
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    )}
+                                    <span>Delete</span>
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              });
+            })()}
           </div>
         )}
       </div>
@@ -2504,10 +3036,10 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       {/* Hierarchical AI Pipeline Pass Stepper & Execution Inspector */}
       {selectedVideo && (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-5">
-          <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-800">
-            <div>
-              <div className="flex items-center gap-2.5">
-                <Sparkles className="w-5 h-5 text-indigo-400" />
+          <div className="flex items-center justify-between gap-4 pb-4 border-b border-slate-800 flex-wrap">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <Sparkles className="w-5 h-5 text-indigo-400 shrink-0" />
                 <h3 className="text-base font-bold text-slate-100">
                   Hierarchical Pipeline Pass Stepper & Artifact Inspector
                 </h3>
@@ -2520,7 +3052,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
               </p>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 shrink-0">
               <button
                 type="button"
                 disabled={

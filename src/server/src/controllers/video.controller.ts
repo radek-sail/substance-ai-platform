@@ -17,6 +17,7 @@ import {
 } from '../services/storage.service';
 import {
   normalizeVideo,
+  generateThumbnailVideo,
   extractCandidateFrame,
   probeVideoMetadata,
   parseFfmpegStderrMetadata,
@@ -264,6 +265,30 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
       }
     }
 
+    // Generate and cache/upload thumbnail-size preview video during transcoding stage (non-test or best-effort)
+    let thumbnailGcsUri: string | undefined;
+    if (process.env.NODE_ENV !== 'test') {
+      try {
+        const thumbCacheDir = path.join(scratchDir, 'sail_thumbnail_cache');
+        if (!fs.existsSync(thumbCacheDir)) {
+          fs.mkdirSync(thumbCacheDir, { recursive: true });
+        }
+        const thumbLocalPath = path.join(thumbCacheDir, `thumb_${videoId}.mp4`);
+        await generateThumbnailVideo(normalizedLocalPath, thumbLocalPath);
+        if (fs.existsSync(thumbLocalPath) && fs.statSync(thumbLocalPath).size > 0) {
+          const thumbDest = `thumbnails/thumb_${videoId}.mp4`;
+          await bucket.upload(thumbLocalPath, {
+            destination: thumbDest,
+            metadata: { contentType: 'video/mp4' },
+            resumable: false,
+          });
+          thumbnailGcsUri = `gs://${bucketName}/${thumbDest}`;
+        }
+      } catch (thumbErr) {
+        console.warn(`[VideoIngestion] Non-fatal thumbnail preview generation warning for ${videoId}:`, thumbErr);
+      }
+    }
+
     const nowIso = new Date().toISOString();
     const defaultPasses: VideoPasses = {
       pass0: { status: 'PENDING' },
@@ -305,6 +330,7 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
       rawGcsUri,
       originalGcsUri: rawGcsUri,
       normalizedGcsUri,
+      ...(thumbnailGcsUri ? { thumbnailGcsUri } : {}),
       durationSeconds: durationSeconds || 0,
       fileSizeBytes: stats.size,
       fileSize: stats.size,
@@ -906,6 +932,34 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         chunks[0]?.gcsUri || `gs://${bucketName}/normalized/${videoId}/chunk_000.mp4`;
       const transcodedAt = new Date().toISOString();
 
+      // Generate and upload thumbnail-size preview video during transcoding stage
+      let thumbnailGcsUri: string | undefined;
+      try {
+        const thumbCacheDir = path.join(scratchDir, 'sail_thumbnail_cache');
+        if (!fs.existsSync(thumbCacheDir)) {
+          fs.mkdirSync(thumbCacheDir, { recursive: true });
+        }
+        const thumbLocalPath = path.join(thumbCacheDir, `thumb_${videoId}.mp4`);
+        const sourceForThumb = fs.existsSync(rawFilePath)
+          ? rawFilePath
+          : path.join(chunksDir, chunkFiles[0]);
+        await generateThumbnailVideo(sourceForThumb, thumbLocalPath);
+        if (fs.existsSync(thumbLocalPath) && fs.statSync(thumbLocalPath).size > 0) {
+          const thumbDest = `thumbnails/thumb_${videoId}.mp4`;
+          console.log(`[Transcode] Uploading thumbnail preview to gs://${bucketName}/${thumbDest}...`);
+          await bucket.upload(thumbLocalPath, {
+            destination: thumbDest,
+            metadata: {
+              contentType: 'video/mp4',
+            },
+            resumable: false,
+          });
+          thumbnailGcsUri = `gs://${bucketName}/${thumbDest}`;
+        }
+      } catch (thumbErr) {
+        console.warn(`[Transcode] Non-fatal thumbnail preview generation warning for ${videoId}:`, thumbErr);
+      }
+
       // Update Firestore
       await db.collection('videos').doc(videoId).update({
         status: 'READY_FOR_ANALYSIS',
@@ -913,6 +967,7 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         chunks: chunks,
         transcodedAt,
         normalizedGcsUri,
+        ...(thumbnailGcsUri ? { thumbnailGcsUri } : {}),
       });
       firestoreService.mirrorVideoToMemory('(default)', videoId, {
         status: 'READY_FOR_ANALYSIS',
@@ -920,6 +975,7 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         chunks: chunks,
         transcodedAt,
         normalizedGcsUri,
+        ...(thumbnailGcsUri ? { thumbnailGcsUri } : {}),
       });
       if (probedMeta.capturedAt || probedMeta.durationSeconds !== undefined) {
         const metaUpdates: Record<string, any> = {};
@@ -1579,6 +1635,8 @@ export const deleteVideoHandler = async (req: Request, res: Response): Promise<R
       const filesToUnlink = [
         path.join(scratchDir, 'sail_raw_cache', `raw_${videoId}.mp4`),
         path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}.mp4`),
+        path.join(scratchDir, 'sail_thumbnail_cache', `thumb_${videoId}.mp4`),
+        path.join(os.tmpdir(), 'sail_thumbnail_cache', `thumb_${videoId}.mp4`),
         path.join(scratchDir, `upload_${videoId}.mp4`),
         path.join(scratchDir, `norm_${videoId}.mp4`),
       ];
@@ -1612,6 +1670,7 @@ export const deleteVideoHandler = async (req: Request, res: Response): Promise<R
       await Promise.allSettled([
         bucket.file(`uploads/${videoId}.mp4`).delete().catch(() => {}),
         bucket.file(`normalized/norm_${videoId}.mp4`).delete().catch(() => {}),
+        bucket.file(`thumbnails/thumb_${videoId}.mp4`).delete().catch(() => {}),
         bucket.deleteFiles({ prefix: `frames/${videoId}/` }).catch(() => {}),
       ]);
     } catch {
@@ -1626,6 +1685,286 @@ export const deleteVideoHandler = async (req: Request, res: Response): Promise<R
   } catch (err: any) {
     console.error(`[VideoController] Error deleting video ${videoId}:`, err);
     return res.status(500).json({ error: err?.message || 'Failed to delete video' });
+  }
+};
+
+const thumbnailGenerationInFlight = new Map<string, Promise<string | null>>();
+
+function sendVideoBufferWithRange(req: Request, res: Response, buf: Buffer): Response {
+  const total = buf.length;
+  const range = req.headers.range;
+
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+    if (!Number.isNaN(start) && !Number.isNaN(end) && start >= 0 && start <= end && end < total) {
+      const chunksize = end - start + 1;
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', chunksize);
+      return res.status(206).send(buf.subarray(start, end + 1));
+    }
+  }
+
+  res.setHeader('Content-Length', total);
+  return res.status(200).send(buf);
+}
+
+/**
+ * Controller for GET /api/videos/:videoId/thumbnail
+ * Serves the small, thumbnail-size MP4 preview video for the given videoId:
+ * 1. Checks local thumbnail cache (`sail_thumbnail_cache/thumb_${videoId}.mp4`).
+ * 2. Checks Google Cloud Storage (`thumbnails/thumb_${videoId}.mp4` or `thumbnailGcsUri`).
+ * 3. Retroactively generates the thumbnail video on-demand via FFmpeg from local raw/normalized cache
+ *    or from the existing raw/normalized video in Cloud Storage, caches it locally, uploads it to
+ *    `gs://<bucket>/thumbnails/thumb_${videoId}.mp4`, and updates the Firestore record's `thumbnailGcsUri`.
+ */
+export const getVideoThumbnailHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const videoId = req.params.videoId as string;
+  if (!videoId) {
+    return res.status(400).json({ error: 'Missing required parameter: videoId' });
+  }
+
+  const scratchDir = getScratchDir();
+  const thumbFilename = `thumb_${videoId}.mp4`;
+  const candidateThumbDirs = Array.from(
+    new Set([
+      path.join(scratchDir, 'sail_thumbnail_cache'),
+      path.join(os.tmpdir(), 'sail_thumbnail_cache'),
+    ])
+  );
+
+  try {
+    // 1. Check local thumbnail cache first
+    for (const dir of candidateThumbDirs) {
+      const candidatePath = path.join(dir, thumbFilename);
+      if (fs.existsSync(candidatePath)) {
+        const st = fs.statSync(candidatePath);
+        if (st.size > 0) {
+          const buf = await fs.promises.readFile(candidatePath);
+          return sendVideoBufferWithRange(req, res, buf);
+        }
+      }
+    }
+
+    const defaultBucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
+    const videoDoc = await firestoreService.getVideoMetadata('(default)', videoId).catch(() => null);
+
+    // 2. Check GCS if thumbnail was already generated and uploaded
+    const thumbGcsCandidates: { bucket: string; objectPath: string }[] = [
+      { bucket: defaultBucketName, objectPath: `thumbnails/${thumbFilename}` },
+    ];
+    if (videoDoc && typeof (videoDoc as any).thumbnailGcsUri === 'string') {
+      const uri = String((videoDoc as any).thumbnailGcsUri);
+      if (uri.startsWith('gs://')) {
+        const withoutScheme = uri.slice('gs://'.length);
+        const slashIdx = withoutScheme.indexOf('/');
+        if (slashIdx > 0) {
+          thumbGcsCandidates.unshift({
+            bucket: withoutScheme.slice(0, slashIdx),
+            objectPath: withoutScheme.slice(slashIdx + 1),
+          });
+        }
+      }
+    }
+
+    for (const cand of thumbGcsCandidates) {
+      try {
+        const file = storage.bucket(cand.bucket).file(cand.objectPath);
+        const [exists] = await file.exists();
+        if (exists) {
+          const [contents] = await file.download();
+          if (contents && contents.length > 0) {
+            for (const dir of candidateThumbDirs) {
+              try {
+                if (!fs.existsSync(dir)) {
+                  fs.mkdirSync(dir, { recursive: true });
+                }
+                fs.writeFileSync(path.join(dir, thumbFilename), contents);
+              } catch {
+                // ignore local cache write error
+              }
+            }
+            return sendVideoBufferWithRange(req, res, contents);
+          }
+        }
+      } catch {
+        // fall through to retroactive generation
+      }
+    }
+
+    // 3. Retroactively generate thumbnail video on-demand for previously uploaded videos
+    let genPromise = thumbnailGenerationInFlight.get(videoId);
+    if (!genPromise) {
+      genPromise = (async (): Promise<string | null> => {
+        try {
+          const primaryThumbDir = candidateThumbDirs[0];
+          if (!fs.existsSync(primaryThumbDir)) {
+            fs.mkdirSync(primaryThumbDir, { recursive: true });
+          }
+          const targetThumbPath = path.join(primaryThumbDir, thumbFilename);
+
+          // 3a. Check local normalized or raw video cache first
+          const localVideoCandidates = [
+            path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}.mp4`),
+            path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${videoId}.mp4`),
+            path.join(scratchDir, 'sail_raw_cache', `raw_${videoId}.mp4`),
+            path.join(os.tmpdir(), 'sail_raw_cache', `raw_${videoId}.mp4`),
+            path.join(scratchDir, `norm_${videoId}.mp4`),
+          ];
+
+          let sourceInput: string | undefined;
+          for (const localCand of localVideoCandidates) {
+            if (fs.existsSync(localCand) && fs.statSync(localCand).size > 0) {
+              sourceInput = localCand;
+              break;
+            }
+          }
+
+          // 3b. If not cached locally, resolve from GCS (normalized or raw video)
+          let downloadedTempSource: string | undefined;
+          if (!sourceInput) {
+            const gcsUris: string[] = [
+              videoDoc?.normalizedGcsUri,
+              videoDoc?.chunks?.[0]?.gcsUri,
+              `gs://${defaultBucketName}/normalized/${videoId}/chunk_000.mp4`,
+              `gs://${defaultBucketName}/normalized/norm_${videoId}.mp4`,
+              videoDoc?.rawGcsUri,
+              (videoDoc as any)?.originalGcsUri,
+              videoDoc?.originalName
+                ? `gs://${defaultBucketName}/raw/${videoId}/${videoDoc.originalName}`
+                : '',
+              `gs://${defaultBucketName}/uploads/${videoId}.mp4`,
+            ].filter((u): u is string => typeof u === 'string' && u.startsWith('gs://'));
+
+            const seen = new Set<string>();
+            for (const uri of gcsUris) {
+              if (seen.has(uri)) continue;
+              seen.add(uri);
+
+              const withoutScheme = uri.slice('gs://'.length);
+              const slashIdx = withoutScheme.indexOf('/');
+              if (slashIdx <= 0) continue;
+              const bName = withoutScheme.slice(0, slashIdx);
+              const objPath = withoutScheme.slice(slashIdx + 1);
+
+              try {
+                const gcsFile = storage.bucket(bName).file(objPath);
+                const [exists] = await gcsFile.exists();
+                if (!exists) continue;
+
+                // Try V4 signed read URL first so FFmpeg can stream directly without full local download
+                try {
+                  const [signedReadUrl] = await gcsFile.getSignedUrl({
+                    version: 'v4',
+                    action: 'read',
+                    expires: Date.now() + 15 * 60 * 1000,
+                  });
+                  if (signedReadUrl) {
+                    await generateThumbnailVideo(signedReadUrl, targetThumbPath);
+                    if (fs.existsSync(targetThumbPath) && fs.statSync(targetThumbPath).size > 0) {
+                      sourceInput = signedReadUrl;
+                      break;
+                    }
+                  }
+                } catch {
+                  // Fallback to downloading the source video locally
+                }
+
+                const normCacheDir = path.join(scratchDir, 'sail_normalized_cache');
+                if (!fs.existsSync(normCacheDir)) {
+                  fs.mkdirSync(normCacheDir, { recursive: true });
+                }
+                const dlDest = path.join(normCacheDir, `norm_${videoId}.mp4`);
+                if (!fs.existsSync(dlDest)) {
+                  await gcsFile.download({ destination: dlDest });
+                }
+                if (fs.existsSync(dlDest) && fs.statSync(dlDest).size > 0) {
+                  sourceInput = dlDest;
+                  downloadedTempSource = dlDest;
+                  break;
+                }
+              } catch {
+                // try next GCS URI
+              }
+            }
+          }
+
+          if (!fs.existsSync(targetThumbPath) || fs.statSync(targetThumbPath).size === 0) {
+            if (!sourceInput) {
+              return null;
+            }
+            await generateThumbnailVideo(sourceInput, targetThumbPath);
+          }
+
+          if (fs.existsSync(targetThumbPath) && fs.statSync(targetThumbPath).size > 0) {
+            // Mirror to secondary local cache directory if distinct
+            const buf = await fs.promises.readFile(targetThumbPath);
+            for (const dir of candidateThumbDirs.slice(1)) {
+              try {
+                if (!fs.existsSync(dir)) {
+                  fs.mkdirSync(dir, { recursive: true });
+                }
+                await fs.promises.writeFile(path.join(dir, thumbFilename), buf);
+              } catch {
+                // ignore
+              }
+            }
+
+            // Persist retroactively generated thumbnail to GCS and update Firestore record in background
+            const thumbGcsDest = `thumbnails/${thumbFilename}`;
+            const thumbnailGcsUri = `gs://${defaultBucketName}/${thumbGcsDest}`;
+            storage
+              .bucket(defaultBucketName)
+              .upload(targetThumbPath, {
+                destination: thumbGcsDest,
+                metadata: { contentType: 'video/mp4' },
+                resumable: false,
+              })
+              .then(async () => {
+                await db
+                  .collection('videos')
+                  .doc(videoId)
+                  .update({ thumbnailGcsUri })
+                  .catch(() => {});
+                firestoreService.mirrorVideoToMemory('(default)', videoId, { thumbnailGcsUri });
+                console.log(
+                  `[Thumbnail] Retroactively generated & uploaded thumbnail for ${videoId}: ${thumbnailGcsUri}`
+                );
+              })
+              .catch((upErr) => {
+                console.warn(`[Thumbnail] Background GCS upload skipped for ${videoId}:`, upErr?.message || upErr);
+              });
+
+            return targetThumbPath;
+          }
+
+          void downloadedTempSource;
+          return null;
+        } catch (genErr) {
+          console.warn(`[Thumbnail] Retroactive thumbnail generation failed for ${videoId}:`, genErr);
+          return null;
+        } finally {
+          thumbnailGenerationInFlight.delete(videoId);
+        }
+      })();
+      thumbnailGenerationInFlight.set(videoId, genPromise);
+    }
+
+    const generatedPath = await genPromise;
+    if (generatedPath && fs.existsSync(generatedPath) && fs.statSync(generatedPath).size > 0) {
+      const buf = await fs.promises.readFile(generatedPath);
+      return sendVideoBufferWithRange(req, res, buf);
+    }
+
+    return res.status(404).json({ error: `Thumbnail preview not available for video ${videoId}` });
+  } catch (err: any) {
+    console.error(`[VideoController] Error serving thumbnail for ${videoId}:`, err);
+    return res.status(500).json({ error: err?.message || 'Failed to serve video thumbnail' });
   }
 };
 

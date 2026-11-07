@@ -26,7 +26,9 @@ const {
 
 const {
   NORMALIZATION_FFMPEG_OPTIONS,
+  THUMBNAIL_PREVIEW_FFMPEG_OPTIONS,
   normalizeVideo,
+  generateThumbnailVideo,
   extractCandidateFrame,
 } = require('../dist/services/ffmpeg.service');
 
@@ -217,9 +219,15 @@ describe('Phase 2: Multi-Tenant Data & Media Engine', () => {
       );
     });
 
-    it('should have callable normalizeVideo and extractCandidateFrame functions', () => {
+    it('should have callable normalizeVideo, generateThumbnailVideo, and extractCandidateFrame functions', () => {
       assert.strictEqual(typeof normalizeVideo, 'function');
+      assert.strictEqual(typeof generateThumbnailVideo, 'function');
       assert.strictEqual(typeof extractCandidateFrame, 'function');
+      assert.ok(Array.isArray(THUMBNAIL_PREVIEW_FFMPEG_OPTIONS));
+      assert.ok(
+        THUMBNAIL_PREVIEW_FFMPEG_OPTIONS.some((opt) => opt.includes('scale=320:-2')),
+        'Thumbnail options must scale to 320px width'
+      );
     });
   });
 
@@ -487,6 +495,56 @@ describe('Phase 2: Multi-Tenant Data & Media Engine', () => {
         assert.strictEqual(found.passes.pass0.status, 'PENDING');
       } finally {
         server.close();
+      }
+    });
+
+    it('should retroactively generate and serve a thumbnail video via GET /api/videos/:videoId/thumbnail when missing', async () => {
+      const ffmpegService = require('../dist/services/ffmpeg.service');
+      const firestoreService = require('../dist/services/firestore.service');
+      const scratchDir = getScratchDir();
+      const testVidId = `vid_retro_thumb_${Date.now()}`;
+      const normDir = path.join(scratchDir, 'sail_normalized_cache');
+      const thumbDir = path.join(scratchDir, 'sail_thumbnail_cache');
+      if (!fs.existsSync(normDir)) fs.mkdirSync(normDir, { recursive: true });
+      if (!fs.existsSync(thumbDir)) fs.mkdirSync(thumbDir, { recursive: true });
+
+      const normFile = path.join(normDir, `norm_${testVidId}.mp4`);
+      const thumbFile = path.join(thumbDir, `thumb_${testVidId}.mp4`);
+      fs.writeFileSync(normFile, 'existing-normalized-video-bytes');
+      if (fs.existsSync(thumbFile)) fs.unlinkSync(thumbFile);
+
+      await firestoreService.saveVideoMetadata('(default)', testVidId, {
+        videoId: testVidId,
+        originalName: 'retroactive_video.mp4',
+        rawGcsUri: `gs://sail-platform-videos-prod/uploads/${testVidId}.mp4`,
+        normalizedGcsUri: `gs://sail-platform-videos-prod/normalized/norm_${testVidId}.mp4`,
+        status: 'READY_FOR_ANALYSIS',
+        uploadedAt: new Date().toISOString(),
+      });
+
+      let thumbGeneratorCalled = false;
+      const origGenThumb = ffmpegService.generateThumbnailVideo;
+      ffmpegService.generateThumbnailVideo = async (input, output) => {
+        thumbGeneratorCalled = true;
+        fs.writeFileSync(output, 'retroactively-generated-mp4-thumbnail');
+        return output;
+      };
+
+      const server = app.listen(0);
+      const port = server.address().port;
+
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/videos/${testVidId}/thumbnail`);
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(res.headers.get('content-type'), 'video/mp4');
+        assert.strictEqual(thumbGeneratorCalled, true, 'Must invoke generateThumbnailVideo retroactively');
+        const buf = Buffer.from(await res.arrayBuffer());
+        assert.strictEqual(buf.toString(), 'retroactively-generated-mp4-thumbnail');
+      } finally {
+        ffmpegService.generateThumbnailVideo = origGenThumb;
+        server.close();
+        if (fs.existsSync(normFile)) fs.unlinkSync(normFile);
+        if (fs.existsSync(thumbFile)) fs.unlinkSync(thumbFile);
       }
     });
   });

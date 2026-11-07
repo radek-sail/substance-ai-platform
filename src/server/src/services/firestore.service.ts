@@ -31,6 +31,7 @@ export interface VideoRecord {
   normalizedPath?: string;
   rawGcsUri: string;
   normalizedGcsUri?: string;
+  thumbnailGcsUri?: string;
   totalChunks?: number;
   chunks?: Array<{ index: number; gcsUri: string }>;
   geminiFileUri?: string;

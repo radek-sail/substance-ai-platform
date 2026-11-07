@@ -54,6 +54,45 @@ export function normalizeVideo(inputPath: string, outputPath: string): Promise<s
 }
 
 /**
+ * FFmpeg options for generating a small, thumbnail-size MP4 preview video:
+ * -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -vf "scale=320:-2:flags=bicubic" -an -movflags +faststart
+ */
+export const THUMBNAIL_PREVIEW_FFMPEG_OPTIONS = [
+  '-c:v libx264',
+  '-preset ultrafast',
+  '-crf 28',
+  '-pix_fmt yuv420p',
+  '-vf scale=320:-2:flags=bicubic',
+  '-an',
+  '-movflags +faststart',
+];
+
+/**
+ * Generates a small, thumbnail-sized MP4 preview video (320px width, muted, faststart)
+ * suitable for inline playback in the Video Manager tab.
+ *
+ * @param inputPath - Local file path or signed HTTP URL of source video
+ * @param outputPath - Destination local file path for the thumbnail MP4
+ * @returns Promise resolving to the output path on completion
+ */
+export function generateThumbnailVideo(inputPath: string, outputPath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const outputDirectory = path.dirname(outputPath);
+    if (!fs.existsSync(outputDirectory)) {
+      fs.mkdirSync(outputDirectory, { recursive: true });
+    }
+
+    ffmpeg(inputPath)
+      .inputOptions(['-nostdin'])
+      .outputOptions(['-y', ...THUMBNAIL_PREVIEW_FFMPEG_OPTIONS])
+      .output(outputPath)
+      .on('end', () => resolve(outputPath))
+      .on('error', (err) => reject(err))
+      .run();
+  });
+}
+
+/**
  * Extracts a candidate best-shot JPEG frame from video at the specified timestamp.
  *
  * @param videoPath - Path to the video file

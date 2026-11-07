@@ -8,6 +8,7 @@ import {
   associateInventoryHandler,
   associateArchiveHandler,
   getVideoFrameHandler,
+  getVideoThumbnailHandler,
   deleteVideoHandler,
   undoVideoCommitHandler,
 } from '../controllers/video.controller';
@@ -34,6 +35,9 @@ router.post('/:videoId/associate-archive', associateArchiveHandler);
 
 // Serve extracted Pass 2 best-shot frame: GET /api/videos/:videoId/frames/:filename
 router.get('/:videoId/frames/:filename', getVideoFrameHandler);
+
+// Serve or retroactively generate thumbnail-size preview video: GET /api/videos/:videoId/thumbnail
+router.get('/:videoId/thumbnail', getVideoThumbnailHandler);
 
 // Delete video record and analysis from database: DELETE /api/videos/:videoId
 router.delete('/:videoId', deleteVideoHandler);
