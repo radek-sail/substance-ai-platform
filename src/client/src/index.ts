@@ -2,6 +2,7 @@ export * from './firebase';
 export * from './components/Login';
 export * from './services/api.service';
 export * from './utils/coordinates';
+export * from './utils/theme';
 export * from './components/layout/RibbonNav';
 export * from './components/timeline/VideoPlayer';
 export * from './components/timeline/TimelineViewer';

@@ -408,6 +408,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   );
   const [selectedVideoId, setSelectedVideoId] = useState<string | null>(activeStream);
   const [isSelectedGroupCollapsed, setIsSelectedGroupCollapsed] = useState<boolean>(false);
+  const [isReviewAnalysisModalOpen, setIsReviewAnalysisModalOpen] = useState<boolean>(false);
 
   // Decoupled Upload & Transcoding State
   const [uploading, setUploading] = useState<boolean>(false);
@@ -2373,26 +2374,18 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Decoupled Video Ingestion & FFmpeg Transcoding Box */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-        <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-6">
-          <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-xl bg-indigo-950 border border-indigo-800 text-indigo-400">
-              <UploadCloud className="w-6 h-6" />
+      {/* Top Panel: Compact Video Ingestion Box */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl">
+        <div className="flex items-center justify-between pb-2.5 border-b border-slate-800 mb-3">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1.5 rounded-lg bg-indigo-950 border border-indigo-800 text-indigo-400">
+              <UploadCloud className="w-4 h-4" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-slate-100">
-                Egocentric Video Ingestion & FFmpeg Normalization
+              <h2 className="text-sm font-bold text-slate-100">
+                Video Ingestion
               </h2>
-              <p className="text-xs text-slate-400 font-mono">
-                Decoupled Upload & Containerized FFmpeg Transcoding (H.264 CRF 17, 1080p, +faststart)
-              </p>
             </div>
-          </div>
-
-          <div className="flex items-center gap-2 text-xs font-mono text-cyan-300 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
-            <Building className="w-3.5 h-3.5 text-cyan-400" />
-            <span>gs://{tenant.bucketName || DEFAULT_GCS_BUCKET}/</span>
           </div>
         </div>
 
@@ -2400,7 +2393,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         <label
           onDragOver={handleDragOver}
           onDrop={handleDrop}
-          className="border-2 border-dashed border-slate-700 hover:border-cyan-500 rounded-2xl p-8 flex flex-col items-center justify-center cursor-pointer transition-colors bg-slate-950/60 hover:bg-slate-950 group"
+          className="border-2 border-dashed border-slate-700 hover:border-cyan-500 rounded-xl px-4 py-3 flex items-center justify-center gap-3 cursor-pointer transition-colors bg-slate-950/60 hover:bg-slate-950 group"
         >
           <input
             type="file"
@@ -2412,31 +2405,27 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
             }}
             disabled={isUploadingOrTranscoding}
           />
-          <div className="w-14 h-14 rounded-full bg-slate-800 group-hover:bg-cyan-950 text-slate-400 group-hover:text-cyan-400 flex items-center justify-center transition-colors mb-3">
-            <FileVideo className="w-7 h-7" />
+          <div className="w-9 h-9 rounded-full bg-slate-800 group-hover:bg-cyan-950 text-slate-400 group-hover:text-cyan-400 flex items-center justify-center transition-colors shrink-0">
+            <FileVideo className="w-4 h-4" />
           </div>
-          <span className="text-sm font-semibold text-slate-200">
-            {selectedFile ? selectedFile.name : 'Choose raw wet-lab video (.mp4, .mov, .mkv)'}
-          </span>
-          <span className="text-xs text-slate-500 mt-1">
-            {selectedFile
-              ? `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB${
+          <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2.5">
+            <span className="text-xs font-semibold text-slate-200">
+              {selectedFile ? selectedFile.name : 'Choose video to upload'}
+            </span>
+            {selectedFile && (
+              <span className="text-xs text-slate-500">
+                {`${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB${
                   probedDuration ? ` • Duration: ${formatDuration(probedDuration)}` : ''
-                }`
-              : 'Egocentric video recorded with head-mounted or benchtop camera (click or drag & drop)'}
-          </span>
+                }`}
+              </span>
+            )}
+          </div>
         </label>
 
-        {/* Action Button for Upload & Transcoding */}
-        {selectedFile && (
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-            <span className="text-xs text-slate-400 font-mono">
-              Target Bucket:{' '}
-              <strong className="text-cyan-300">
-                gs://{tenant.bucketName || DEFAULT_GCS_BUCKET}/
-              </strong>
-            </span>
-            <button
+            {/* Action Button for Upload & Transcoding */}
+            {selectedFile && (
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-3">
+                <button
               type="button"
               disabled={isUploadingOrTranscoding}
               onClick={uploadVideoHandler}
@@ -2537,16 +2526,20 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         )}
       </div>
 
-      {/* Persistent Video Streams Registry */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+      {/* Aligned Bottom Row: Video Registry (Left) & Video Analysis and Verification (Right) */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+        {/* Left Column: Video Registry */}
+        <div className="space-y-6 min-w-0">
+          {/* Video Registry */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
         <div className="flex items-center justify-between">
           <div>
-            <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
-              <Layers className="w-4 h-4 text-cyan-400" />
-              <span>Persistent Video Registry (Firestore `(default)` / `videos`)</span>
+            <h3 className="text-base font-bold text-slate-100 flex items-center gap-2">
+              <Layers className="w-5 h-5 text-cyan-400" />
+              <span>Video Registry</span>
             </h3>
             <p className="text-xs text-slate-400 font-mono mt-0.5">
-              Select a video below to set the global activeStream context and control individual AI pipeline passes
+              Select a video below to set the global activeStream context
             </p>
           </div>
 
@@ -2816,25 +2809,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                         <span className="text-sm font-bold text-slate-100">
                           {group.entityName}
                         </span>
-
-                        <span
-                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border ${
-                            group.isMatched
-                              ? 'bg-emerald-950/80 text-emerald-300 border-emerald-600/60'
-                              : 'bg-amber-950/80 text-amber-300 border-amber-600/60'
-                          }`}
-                        >
-                          {group.isMatched ? (
-                            <CheckCircle2 className="w-2.5 h-2.5 text-emerald-400 shrink-0" />
-                          ) : (
-                            <AlertCircle className="w-2.5 h-2.5 text-amber-400 shrink-0" />
-                          )}
-                          <span>{group.associationLabel}</span>
-                        </span>
-
-                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-slate-950 text-cyan-300 border border-slate-800">
-                          {group.classificationLabel}
-                        </span>
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
@@ -2875,8 +2849,9 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
                         {group.videos.map((video) => {
                           const isActive =
-                            activeStreamId === video.videoId ||
-                            selectedVideo?.videoId === video.videoId;
+                            selectedVideo
+                              ? selectedVideo.videoId === video.videoId
+                              : activeStreamId === video.videoId;
                           const isVideoAnalyzing =
                             Boolean(analyzingIds[video.videoId]) ||
                             Object.values(runningPassMap[video.videoId] || {}).some(Boolean) ||
@@ -2919,106 +2894,108 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                               )}
 
                               {/* Right of Preview: Video Info, Status Badges & Action Controls */}
-                              <div className="flex-1 min-w-0 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-                                {/* Video Identity & Capture Time/Duration + Status Badges */}
-                                <div className="space-y-2 min-w-0">
-                                  <div>
-                                    <div className="font-semibold text-slate-100 text-xs sm:text-sm flex items-center gap-2 flex-wrap">
-                                      <span className="truncate">{video.originalName}</span>
-                                      {isActive && (
-                                        <span className="text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 px-1.5 py-0.5 rounded shrink-0">
-                                          ACTIVE STREAM
-                                        </span>
-                                      )}
-                                    </div>
-                                    <div className="text-[11px] font-mono text-slate-400 mt-1 flex flex-wrap items-center gap-2">
-                                      <span>
-                                        ID: <span className="text-slate-300">{video.videoId}</span>
+                              <div className="flex-1 min-w-0 space-y-2.5">
+                                {/* Video Identity & Capture Time/Duration */}
+                                <div>
+                                  <div className="font-semibold text-slate-100 text-xs sm:text-sm flex items-center gap-2 flex-wrap">
+                                    <span className="truncate">{video.originalName}</span>
+                                    {isActive && (
+                                      <span className="text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 px-1.5 py-0.5 rounded shrink-0">
+                                        ACTIVE STREAM
                                       </span>
-                                      <span>•</span>
-                                      <span className="inline-flex items-center gap-1 text-slate-300">
-                                        <Clock className="w-3 h-3 text-slate-500" />
+                                    )}
+                                  </div>
+                                  <div className="text-[11px] font-mono text-slate-400 mt-1 flex flex-wrap items-center gap-2">
+                                    <span>
+                                      ID: <span className="text-slate-300">{video.videoId}</span>
+                                    </span>
+                                    <span>•</span>
+                                    <span className="inline-flex items-center gap-1 text-slate-300">
+                                      <Clock className="w-3 h-3 text-slate-500" />
+                                      <span>
+                                        {formatTimestamp(
+                                          (video as any).capturedAt || video.uploadedAt
+                                        )}
+                                      </span>
+                                    </span>
+                                    <span>•</span>
+                                    <span>
+                                      Duration:{' '}
+                                      {video.durationSeconds !== undefined &&
+                                      video.durationSeconds > 0
+                                        ? formatDuration(video.durationSeconds)
+                                        : '--:--'}
+                                    </span>
+                                    {isActive && video.fileSizeBytes ? (
+                                      <>
+                                        <span>•</span>
                                         <span>
-                                          {formatTimeOfDay(
-                                            (video as any).capturedAt || video.uploadedAt
-                                          )}
+                                          {(video.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB
                                         </span>
-                                      </span>
-                                      <span>•</span>
-                                      <span>
-                                        Duration:{' '}
-                                        {video.durationSeconds !== undefined &&
-                                        video.durationSeconds > 0
-                                          ? formatDuration(video.durationSeconds)
-                                          : '--:--'}
-                                      </span>
-                                      {video.fileSizeBytes ? (
-                                        <>
-                                          <span>•</span>
-                                          <span>
-                                            {(video.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB
-                                          </span>
-                                        </>
-                                      ) : null}
+                                      </>
+                                    ) : null}
+                                  </div>
+                                </div>
+
+                                {isActive && (
+                                  <>
+                                    {/* Ingestion & Pipeline Status Badges */}
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      {renderIngestionBadge(video)}
+                                      {renderAnalysisBadge(video)}
                                     </div>
-                                  </div>
 
-                                  {/* Ingestion & Pipeline Status Badges */}
-                                  <div className="flex flex-wrap items-center gap-2">
-                                    {renderIngestionBadge(video)}
-                                    {renderAnalysisBadge(video)}
-                                  </div>
-                                </div>
+                                    {/* Action Controls — below status badges */}
+                                    <div
+                                      className="flex items-center gap-2 flex-wrap pt-0.5"
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      <button
+                                        type="button"
+                                        disabled={
+                                          isVideoAnalyzing ||
+                                          video.status === 'UPLOADING' ||
+                                          video.status === 'TRANSCODING'
+                                        }
+                                        onClick={() => handleRunAllPasses(video)}
+                                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                                      >
+                                        {isVideoAnalyzing ? (
+                                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                        ) : (
+                                          <Play className="w-3.5 h-3.5" />
+                                        )}
+                                        <span>Run All Passes</span>
+                                      </button>
 
-                                {/* Action Controls — aligned on the right side */}
-                                <div
-                                  className="flex items-center justify-end gap-2 flex-wrap shrink-0 lg:self-center"
-                                  onClick={(e) => e.stopPropagation()}
-                                >
-                                  <button
-                                    type="button"
-                                    disabled={
-                                      isVideoAnalyzing ||
-                                      video.status === 'UPLOADING' ||
-                                      video.status === 'TRANSCODING'
-                                    }
-                                    onClick={() => handleRunAllPasses(video)}
-                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                                  >
-                                    {isVideoAnalyzing ? (
-                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                    ) : (
-                                      <Play className="w-3.5 h-3.5" />
-                                    )}
-                                    <span>Run All Passes</span>
-                                  </button>
+                                      <button
+                                        type="button"
+                                        disabled={!canInspectResults}
+                                        onClick={() => handleInspectResults(video)}
+                                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                                      >
+                                        <Eye className="w-3.5 h-3.5" />
+                                        <span>Inspect Results</span>
+                                        <ArrowRight className="w-3.5 h-3.5" />
+                                      </button>
 
-                                  <button
-                                    type="button"
-                                    disabled={!canInspectResults}
-                                    onClick={() => handleInspectResults(video)}
-                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                                  >
-                                    <Eye className="w-3.5 h-3.5" />
-                                    <span>Inspect Results</span>
-                                    <ArrowRight className="w-3.5 h-3.5" />
-                                  </button>
-
-                                  <button
-                                    type="button"
-                                    disabled={isDeleting}
-                                    onClick={() => handleDeleteVideo(video)}
-                                    title="Delete video from database"
-                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                                  >
-                                    {isDeleting ? (
-                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                    ) : (
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    )}
-                                    <span>Delete</span>
-                                  </button>
-                                </div>
+                                      <button
+                                        type="button"
+                                        disabled={isDeleting}
+                                        onClick={() => handleDeleteVideo(video)}
+                                        title="Delete video from database"
+                                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                                      >
+                                        {isDeleting ? (
+                                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                        ) : (
+                                          <Trash2 className="w-3.5 h-3.5" />
+                                        )}
+                                        <span>Delete</span>
+                                      </button>
+                                    </div>
+                                  </>
+                                )}
                               </div>
                             </div>
                           );
@@ -3032,23 +3009,28 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
           </div>
         )}
       </div>
+        </div>
 
-      {/* Hierarchical AI Pipeline Pass Stepper & Execution Inspector */}
+        {/* Right Column: Video Analysis and Verification */}
+        <div className="space-y-6 min-w-0">
+      {/* Video Analysis and Verification */}
       {selectedVideo && (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-5">
           <div className="flex items-center justify-between gap-4 pb-4 border-b border-slate-800 flex-wrap">
-            <div className="min-w-0">
+            <div className="min-w-0 space-y-1">
               <div className="flex items-center gap-2.5 flex-wrap">
                 <Sparkles className="w-5 h-5 text-indigo-400 shrink-0" />
                 <h3 className="text-base font-bold text-slate-100">
-                  Hierarchical Pipeline Pass Stepper & Artifact Inspector
+                  Video Analysis and Verification
                 </h3>
-                <span className="text-xs font-mono px-2.5 py-0.5 rounded-md bg-slate-950 text-cyan-300 border border-slate-800">
+              </div>
+              <div>
+                <span className="inline-block text-xs font-mono px-2.5 py-0.5 rounded-md bg-slate-950 text-cyan-300 border border-slate-800">
                   {selectedVideo.originalName} ({selectedVideo.videoId})
                 </span>
               </div>
-              <p className="text-xs text-slate-400 font-mono mt-1">
-                Execute individual passes (Pass 0 → Pass 3) or all passes sequentially and inspect each JSON artifact
+              <p className="text-xs text-slate-400 font-mono">
+                Execute individual passes (Pass 0 → Pass 3) or all passes sequentially
               </p>
             </div>
 
@@ -3077,8 +3059,186 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
             </div>
           </div>
 
-          {/* 4 AI Pass Cards + HITL Verification Card */}
+          {/* Video Analysis Passes Summary Card (Opens Wide Pop-up Modal) + HITL Verification Card */}
           <div className="space-y-3">
+            <div
+              data-testid="passes-0-3-panel"
+              className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 space-y-3 transition-all"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="text-sm font-bold text-slate-100 flex items-center gap-2.5">
+                    <Cpu className="w-4 h-4 text-indigo-400 shrink-0" />
+                    <span>Video Analysis Passes (Pass 0 – Pass 3)</span>
+                  </div>
+                  <p className="text-xs text-slate-400 font-mono">
+                    Open the wide analysis review window to inspect and execute Pass 0 through Pass 3
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="review-analysis-button"
+                    onClick={() => setIsReviewAnalysisModalOpen(true)}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-indigo-600/25 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-500/40 transition-colors"
+                  >
+                    <Eye className="w-3.5 h-3.5 text-indigo-300" />
+                    <span>Review Analysis</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="pt-2.5 border-t border-slate-800/80 flex flex-wrap items-center gap-2.5 text-xs font-mono">
+                {passStepsConfig.map((step) => {
+                  const pState = selectedPasses[step.passKey] || { status: 'PENDING' };
+                  const pRunning =
+                    Boolean(runningPassMap[selectedVideo.videoId]?.[step.passKey]) ||
+                    pState.status === 'RUNNING';
+                  return (
+                    <span key={step.passKey} className="inline-flex items-center gap-1.5">
+                      <span className="text-[11px] text-slate-400">Pass {step.passNumber}:</span>
+                      {renderPassStatusBadge(pState.status, pRunning)}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Step 5: Human-in-the-Loop (HITL) Verification Card */}
+            {(() => {
+              const isHitlCommitted =
+                selectedPasses.hitl?.status === 'COMPLETED' ||
+                selectedVideo.passes?.hitl?.status === 'COMPLETED' ||
+                Boolean((selectedPasses.hitl as any)?.data?.signedOffAt) ||
+                Boolean((selectedVideo.passes?.hitl as any)?.data?.signedOffAt) ||
+                Boolean((selectedVideo as any)?.isSignedOff) ||
+                Boolean(analysisCache[selectedVideo.videoId]?.isSignedOff) ||
+                Boolean(hitlCommitSuccess);
+
+              return (
+                <div
+                  className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 space-y-4"
+                  data-testid="hitl-verification-card"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="space-y-0.5">
+                      <div className="text-sm font-bold text-slate-100 flex items-center gap-2.5">
+                        <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                        <span>Human-in-the-Loop (HITL) Verification</span>
+                        {renderPassStatusBadge(
+                          isHitlCommitted ? 'COMPLETED' : selectedPasses.hitl?.status || 'PENDING',
+                          isCommittingHitl
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-400 font-mono">
+                        Inspect and edit information generated by video analysis pipeline, then commit to the database
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleInspectResults(selectedVideo, true)}
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 transition-colors"
+                      >
+                        <Eye className="w-3.5 h-3.5 text-emerald-300" />
+                        <span>Review in Sign-Off Tab</span>
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+        </div>
+      </div>
+
+      {/* Wide Video Analysis Passes Pop-up Window Modal */}
+      {isReviewAnalysisModalOpen && selectedVideo && (
+        <div
+          data-testid="review-analysis-modal"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto"
+          onClick={() => setIsReviewAnalysisModalOpen(false)}
+        >
+          <div
+            className="bg-slate-950 border border-slate-800 rounded-2xl w-[96vw] max-w-7xl max-h-[92vh] flex flex-col shadow-2xl overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="flex flex-wrap items-center justify-between gap-4 px-6 py-4 border-b border-slate-800 bg-slate-900/70">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="p-2 rounded-xl bg-indigo-950 border border-indigo-800 text-indigo-400 shrink-0">
+                  <Cpu className="w-5 h-5" />
+                </div>
+                <div className="min-w-0 space-y-1">
+                  <div className="flex items-center gap-2.5 flex-wrap">
+                    <h3 className="text-base font-bold text-slate-100">
+                      Video Analysis Passes (Pass 0 – Pass 3)
+                    </h3>
+                    <span className="inline-block text-xs font-mono px-2.5 py-0.5 rounded-md bg-slate-950 text-cyan-300 border border-slate-800">
+                      {selectedVideo.originalName} ({selectedVideo.videoId})
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                    {passStepsConfig.map((step) => {
+                      const pState = selectedPasses[step.passKey] || { status: 'PENDING' };
+                      const pRunning =
+                        Boolean(runningPassMap[selectedVideo.videoId]?.[step.passKey]) ||
+                        pState.status === 'RUNNING';
+                      return (
+                        <span key={step.passKey} className="inline-flex items-center gap-1.5">
+                          <span className="text-[11px] text-slate-400">Pass {step.passNumber}:</span>
+                          {renderPassStatusBadge(pState.status, pRunning)}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3 shrink-0">
+                <button
+                  type="button"
+                  disabled={
+                    Boolean(analyzingIds[selectedVideo.videoId]) ||
+                    Object.values(runningPassMap[selectedVideo.videoId] || {}).some(Boolean)
+                  }
+                  onClick={() => handleRunAllPasses(selectedVideo)}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 text-white shadow-lg shadow-indigo-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                >
+                  {analyzingIds[selectedVideo.videoId] ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Running All Passes...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4" />
+                      <span>Run All Passes</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="close-review-analysis-modal"
+                  onClick={() => setIsReviewAnalysisModalOpen(false)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800 transition-colors"
+                  title="Close Review Analysis Window"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Body: Wide 4 AI Pass Cards */}
+            <div className="p-6 space-y-4 overflow-y-auto bg-slate-950/60">
+
             {passStepsConfig.map((step) => {
               const passState = selectedPasses[step.passKey] || { status: 'PENDING' };
               const isPassRunning =
@@ -3610,13 +3770,13 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                           <div className="grid grid-cols-2 gap-1 text-slate-300">
                                             <span>
                                               Cell Line:{' '}
-                                              <strong className="text-white">
+                                              <strong className="text-slate-100">
                                                 {actionItem.vialLabelData?.cellLineName || actionItem.cellLineName || 'N/A'}
                                               </strong>
                                             </span>
                                             <span>
                                               Initials:{' '}
-                                              <strong className="text-white">
+                                              <strong className="text-slate-100">
                                                 {actionItem.vialLabelData?.userInitials ||
                                                   actionItem.cellLineInfo?.userInitials ||
                                                   '—'}
@@ -3624,7 +3784,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                             </span>
                                             <span>
                                               Date Frozen:{' '}
-                                              <strong className="text-white">
+                                              <strong className="text-slate-100">
                                                 {actionItem.vialLabelData?.dateFrozen ||
                                                   actionItem.cellLineInfo?.dateFrozen ||
                                                   '—'}
@@ -3650,7 +3810,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                           <div className="grid grid-cols-2 gap-1 text-slate-300">
                                             <span>
                                               First Reagent:{' '}
-                                              <strong className="text-white">
+                                              <strong className="text-slate-100">
                                                 {actionItem.mixReagentsData.firstReagentName || 'N/A'}
                                               </strong>
                                             </span>
@@ -3662,7 +3822,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                             </span>
                                             <span>
                                               Second Reagent:{' '}
-                                              <strong className="text-white">
+                                              <strong className="text-slate-100">
                                                 {actionItem.mixReagentsData.secondReagentName || 'N/A'}
                                               </strong>
                                             </span>
@@ -3696,19 +3856,19 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                           <div className="grid grid-cols-2 gap-1 text-slate-300">
                                             <span>
                                               Plate:{' '}
-                                              <strong className="text-white">
+                                              <strong className="text-slate-100">
                                                 {actionItem.seedReagentsData.plateType || 'N/A'}
                                               </strong>
                                             </span>
                                             <span>
                                               Pipette:{' '}
-                                              <strong className="text-white">
+                                              <strong className="text-slate-100">
                                                 {actionItem.seedReagentsData.pipetteType || 'N/A'}
                                               </strong>
                                             </span>
                                             <span>
                                               Cells:{' '}
-                                              <strong className="text-white">
+                                              <strong className="text-slate-100">
                                                 {actionItem.seedReagentsData.cellsSeeded || 'N/A'}
                                               </strong>
                                             </span>
@@ -4514,7 +4674,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 <span className="text-slate-400 block text-[10px]">
                                                   Reagent Name
                                                 </span>
-                                                <span className="font-bold text-white">
+                                                <span className="font-bold text-slate-100">
                                                   {resolvedReagentName}
                                                 </span>
                                               </div>
@@ -4530,7 +4690,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 <span className="text-slate-400 block text-[10px]">
                                                   Manufacturer
                                                 </span>
-                                                <span className="font-bold text-white">
+                                                <span className="font-bold text-slate-100">
                                                   {resolvedManufacturer}
                                                 </span>
                                               </div>
@@ -4538,7 +4698,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 <span className="text-slate-400 block text-[10px]">
                                                   Catalog / Ref #
                                                 </span>
-                                                <span className="font-bold text-white">
+                                                <span className="font-bold text-slate-100">
                                                   {resolvedCatalogNumber}
                                                 </span>
                                               </div>
@@ -4546,7 +4706,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 <span className="text-slate-400 block text-[10px]">
                                                   Lot #
                                                 </span>
-                                                <span className="font-bold text-white">
+                                                <span className="font-bold text-slate-100">
                                                   {resolvedLotNumber}
                                                 </span>
                                               </div>
@@ -4565,7 +4725,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 <span className="text-slate-400 block text-[10px]">
                                                   Cell Line Name (Required)
                                                 </span>
-                                                <span className="font-bold text-white">
+                                                <span className="font-bold text-slate-100">
                                                   {resolvedCellLine || '(none)'}
                                                 </span>
                                               </div>
@@ -4573,7 +4733,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 <span className="text-slate-400 block text-[10px]">
                                                   User Initials (Optional)
                                                 </span>
-                                                <span className="font-bold text-white">
+                                                <span className="font-bold text-slate-100">
                                                   {resolvedInitials || '—'}
                                                 </span>
                                               </div>
@@ -4581,7 +4741,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 <span className="text-slate-400 block text-[10px]">
                                                   Date Frozen (Optional)
                                                 </span>
-                                                <span className="font-bold text-white">
+                                                <span className="font-bold text-slate-100">
                                                   {resolvedDate || '—'}
                                                 </span>
                                               </div>
@@ -4636,8 +4796,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               </span>
                                             </div>
                                             <div className="text-[11px] text-slate-400">
-                                              Row <strong className="text-white">{wl.row}</strong> • Col{' '}
-                                              <strong className="text-white">{wl.col}</strong> • Origin:{' '}
+                                              Row <strong className="text-slate-100">{wl.row}</strong> • Col{' '}
+                                              <strong className="text-slate-100">{wl.col}</strong> • Origin:{' '}
                                               <span className="text-amber-300">
                                                 {wl.originCorner || 'TOP_LEFT_BLACK'}
                                               </span>
@@ -4691,7 +4851,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               </span>
                                               <span className="text-slate-300">
                                                 Cell Line:{' '}
-                                                <strong className="text-white">
+                                                <strong className="text-slate-100">
                                                   {act.vialLabelData?.cellLineName ||
                                                     act.cellLineName ||
                                                     act.cellLineInfo?.name ||
@@ -4700,7 +4860,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               </span>
                                               <span className="text-slate-300">
                                                 Initials:{' '}
-                                                <strong className="text-white">
+                                                <strong className="text-slate-100">
                                                   {act.vialLabelData?.userInitials ||
                                                     act.cellLineInfo?.userInitials ||
                                                     '—'}
@@ -4708,7 +4868,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               </span>
                                               <span className="text-slate-300">
                                                 Date Frozen:{' '}
-                                                <strong className="text-white">
+                                                <strong className="text-slate-100">
                                                   {act.vialLabelData?.dateFrozen ||
                                                     act.cellLineInfo?.dateFrozen ||
                                                     '—'}
@@ -4804,13 +4964,13 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                           </div>
                                           {ws.mixReagentsData && (
                                             <div className="text-slate-300">
-                                              First: <strong className="text-white">{ws.mixReagentsData.firstReagentName}</strong> ({ws.mixReagentsData.firstReagentAmount}) • Second: <strong className="text-white">{ws.mixReagentsData.secondReagentName}</strong> ({ws.mixReagentsData.secondReagentAmount})
+                                              First: <strong className="text-slate-100">{ws.mixReagentsData.firstReagentName}</strong> ({ws.mixReagentsData.firstReagentAmount}) • Second: <strong className="text-slate-100">{ws.mixReagentsData.secondReagentName}</strong> ({ws.mixReagentsData.secondReagentAmount})
                                             </div>
                                           )}
                                           {ws.seedReagentsData && (
                                             <div className="text-slate-300 space-y-1 pt-1">
                                               <div>
-                                                Plate: <strong className="text-white">{ws.seedReagentsData.plateType || 'N/A'}</strong> • Pipette: <strong className="text-white">{ws.seedReagentsData.pipetteType || 'N/A'}</strong> • Cells: <strong className="text-white">{ws.seedReagentsData.cellsSeeded || 'N/A'}</strong> ({ws.seedReagentsData.cellsPerWell ? (String(ws.seedReagentsData.cellsPerWell).toLowerCase().includes('well') || ws.seedReagentsData.cellsPerWell === 'N/A' ? ws.seedReagentsData.cellsPerWell : `${ws.seedReagentsData.cellsPerWell}/well`) : 'N/A'}) • Seeding Events: <strong className="text-emerald-300">{ws.seedReagentsData.seedingEventsCount ?? 0}</strong> / {ws.seedReagentsData.expectedSeedingEventsCount ?? 12}
+                                                Plate: <strong className="text-slate-100">{ws.seedReagentsData.plateType || 'N/A'}</strong> • Pipette: <strong className="text-slate-100">{ws.seedReagentsData.pipetteType || 'N/A'}</strong> • Cells: <strong className="text-slate-100">{ws.seedReagentsData.cellsSeeded || 'N/A'}</strong> ({ws.seedReagentsData.cellsPerWell ? (String(ws.seedReagentsData.cellsPerWell).toLowerCase().includes('well') || ws.seedReagentsData.cellsPerWell === 'N/A' ? ws.seedReagentsData.cellsPerWell : `${ws.seedReagentsData.cellsPerWell}/well`) : 'N/A'}) • Seeding Events: <strong className="text-emerald-300">{ws.seedReagentsData.seedingEventsCount ?? 0}</strong> / {ws.seedReagentsData.expectedSeedingEventsCount ?? 12}
                                               </div>
                                               {Array.isArray(ws.seedReagentsData.seededColumns) && ws.seedReagentsData.seededColumns.length > 0 && (
                                                 <div className="text-cyan-300 text-[10px]">
@@ -4843,1309 +5003,29 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 </div>
               );
             })}
-
-            {/* Step 5: Human-in-the-Loop (HITL) Verification Card */}
-            {(() => {
-              const isHitlCommitted =
-                selectedPasses.hitl?.status === 'COMPLETED' ||
-                selectedVideo.passes?.hitl?.status === 'COMPLETED' ||
-                Boolean((selectedPasses.hitl as any)?.data?.signedOffAt) ||
-                Boolean((selectedVideo.passes?.hitl as any)?.data?.signedOffAt) ||
-                Boolean((selectedVideo as any)?.isSignedOff) ||
-                Boolean(analysisCache[selectedVideo.videoId]?.isSignedOff) ||
-                Boolean(hitlCommitSuccess);
-
-              return (
-                <div
-                  className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 space-y-4"
-                  data-testid="hitl-verification-card"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="space-y-0.5">
-                      <div className="text-sm font-bold text-slate-100 flex items-center gap-2.5">
-                        <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                        <span>Human-in-the-Loop (HITL) Verification</span>
-                        {renderPassStatusBadge(
-                          isHitlCommitted ? 'COMPLETED' : selectedPasses.hitl?.status || 'PENDING',
-                          isCommittingHitl
-                        )}
-                      </div>
-                      <p className="text-xs text-slate-400 font-mono">
-                        Inspect & edit refined Pass 3 label fields (cellLineName, userInitials, dateFrozen, fullText) and box well coordinates (Origin A1 = Top-Left Black Corner), then commit to the Cryo-Inventory database
-                      </p>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => handleInspectResults(selectedVideo, true)}
-                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 transition-colors"
-                      >
-                        <Eye className="w-3.5 h-3.5 text-emerald-300" />
-                        <span>Review in Sign-Off Tab</span>
-                        <ArrowRight className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-
-              {/* Inline Editable HITL Inventory / Experiment Archive Actions Table */}
-              {(() => {
-                const rawPass1 = selectedPasses.pass1?.data as any;
-                const pass1Actions: any[] = Array.isArray(rawPass1)
-                  ? rawPass1
-                  : Array.isArray(rawPass1?.actions)
-                  ? rawPass1.actions
-                  : analysisCache[selectedVideo.videoId]?.actions || [];
-
-                const isArchiveWorkflow =
-                  selectedPasses.pass0?.data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
-                  selectedVideo.passes?.pass0?.data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
-                  pass1Actions.some((a) => {
-                    const cls = String(a?.actionType || a?.actionClass || '').toUpperCase();
-                    return cls.includes('MIX') || cls.includes('SEED');
-                  });
-
-                if (isArchiveWorkflow) {
-                  const pass3Step = (selectedPasses.pass3 ||
-                    selectedVideo.passes?.pass3 ||
-                    {}) as any;
-                  const rawPass3 = (pass3Step.data || {}) as any;
-                  const pass3ReagentList = Array.isArray(pass3Step.reagents)
-                    ? pass3Step.reagents
-                    : Array.isArray(rawPass3.reagents)
-                    ? rawPass3.reagents
-                    : undefined;
-                  const pass3WorkStepList = Array.isArray(pass3Step.workSteps)
-                    ? pass3Step.workSteps
-                    : Array.isArray(rawPass3.workSteps)
-                    ? rawPass3.workSteps
-                    : undefined;
-                  const pass3TranscriptionList = Array.isArray(pass3Step.labelTranscriptions)
-                    ? pass3Step.labelTranscriptions
-                    : Array.isArray(rawPass3.labelTranscriptions)
-                    ? rawPass3.labelTranscriptions
-                    : undefined;
-                  const currentArchiveEdits = hitlArchiveEdits[selectedVideo.videoId] || {};
-                  const archiveReagents: ArchiveReagent[] = currentArchiveEdits.reagents ?? (
-                    pass3ReagentList && pass3ReagentList.length > 0
-                      ? pass3ReagentList
-                      : analysisCache[selectedVideo.videoId]?.reagents || []
-                  );
-                  const archiveWorkSteps: ArchiveWorkStep[] = currentArchiveEdits.workSteps ?? (
-                    pass3WorkStepList && pass3WorkStepList.length > 0
-                      ? pass3WorkStepList
-                      : Array.isArray(analysisCache[selectedVideo.videoId]?.workSteps) &&
-                        analysisCache[selectedVideo.videoId]!.workSteps!.length > 0
-                      ? analysisCache[selectedVideo.videoId]!.workSteps!
-                      : pass1Actions.map((act: any, idx: number) => {
-                          const cls = String(act.actionType || act.actionClass || '').toUpperCase();
-                          const isSeed = cls.includes('SEED');
-                          return {
-                            stepId: act.actionId || `step_${idx + 1}`,
-                            actionType: isSeed ? 'SEED_REAGENTS' : 'MIX_REAGENTS',
-                            startTimeSeconds: Number(act.startTimestampSeconds ?? act.startTime ?? 0),
-                            endTimeSeconds: Number(act.endTimestampSeconds ?? act.endTime ?? 0),
-                            description:
-                              act.description ||
-                              (isSeed ? 'Seed reagents into plate' : 'Mix two reagents'),
-                            mixReagentsData: act.mixReagentsData,
-                            seedReagentsData: act.seedReagentsData,
-                          };
-                        })
-                  );
-                  const rawLabelTranscriptions: string[] = currentArchiveEdits.labelTranscriptions ?? (
-                    pass3TranscriptionList && pass3TranscriptionList.length > 0
-                      ? pass3TranscriptionList.map((lt: any) =>
-                          typeof lt === 'string'
-                            ? lt
-                            : lt.fullText || lt.conflatedText || lt.shot1Text || ''
-                        ).filter(Boolean)
-                      : Array.isArray((analysisCache[selectedVideo.videoId] as any)?.labelTranscriptions)
-                      ? (analysisCache[selectedVideo.videoId] as any).labelTranscriptions
-                          .map((lt: any) =>
-                            typeof lt === 'string'
-                              ? lt
-                              : lt?.fullText || lt?.conflatedText || lt?.shot1Text || ''
-                          )
-                          .filter(Boolean)
-                      : []
-                  );
-
-                  const updateArchiveReagent = (idx: number, patch: Partial<ArchiveReagent>) => {
-                    const updated = archiveReagents.map((r, i) => (i === idx ? { ...r, ...patch } : r));
-                    setHitlArchiveEdits((prev) => ({
-                      ...prev,
-                      [selectedVideo.videoId]: {
-                        ...prev[selectedVideo.videoId],
-                        reagents: updated,
-                      },
-                    }));
-                  };
-
-                  const updateArchiveWorkStep = (idx: number, patch: Partial<ArchiveWorkStep>) => {
-                    const updated = archiveWorkSteps.map((ws, i) => (i === idx ? { ...ws, ...patch } : ws));
-                    setHitlArchiveEdits((prev) => ({
-                      ...prev,
-                      [selectedVideo.videoId]: {
-                        ...prev[selectedVideo.videoId],
-                        workSteps: updated,
-                      },
-                    }));
-                  };
-
-                  const handleCommitArchiveHitl = async () => {
-                    setIsCommittingHitl(true);
-                    setHitlCommitError(null);
-                    setHitlCommitSuccess(null);
-                    try {
-                      const targetArchiveId =
-                        selectedVideo.archiveId ||
-                        pass1Actions[0]?.archiveId ||
-                        archives[0]?.id ||
-                        'archive_exp_402';
-                      const matchedArchive = archives.find((a) => a.id === targetArchiveId);
-                      const archiveName =
-                        matchedArchive?.name ||
-                        selectedVideo.archiveName ||
-                        selectedPasses.pass0?.data?.archiveName ||
-                        targetArchiveId;
-                      const creatorName =
-                        matchedArchive?.creatorName ||
-                        selectedVideo.archiveCreatorName ||
-                        selectedPasses.pass0?.data?.creatorName ||
-                        'N/A';
-                      const creationDate =
-                        matchedArchive?.creationDate ||
-                        selectedVideo.archiveCreationDate ||
-                        selectedPasses.pass0?.data?.creationDate ||
-                        new Date().toISOString().split('T')[0];
-
-                      const markdownDoc = compileArchiveMarkdownFromAnalysis({
-                        videoId: selectedVideo.videoId,
-                        workflow: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
-                        status: 'COMPLETED',
-                        reagents: archiveReagents,
-                        workSteps: archiveWorkSteps,
-                        labelTranscriptions: rawLabelTranscriptions,
-                        actions: pass1Actions,
-                        events: [],
-                        refinements: [],
-                        updatedAt: new Date().toISOString(),
-                        archiveName,
-                        creatorName,
-                        creationDate,
-                      });
-
-                      const res = await apiService.commitArchiveSignOff(
-                        tenant.databaseId,
-                        selectedVideo.videoId,
-                        targetArchiveId,
-                        markdownDoc,
-                        {
-                          archiveName,
-                          creatorName,
-                          creationDate,
-                          reagents: archiveReagents,
-                          labelTranscriptions: rawLabelTranscriptions,
-                          workSteps: archiveWorkSteps.map((ws) => ({
-                            ...ws,
-                            videoId: ws.videoId || selectedVideo.videoId,
-                          })),
-                        }
-                      );
-
-                      const committedArchiveName =
-                        typeof (res as any).archiveName === 'string' && (res as any).archiveName
-                          ? (res as any).archiveName
-                          : matchedArchive?.name || archiveName;
-                      const committedReagents = Array.isArray((res as any).reagents)
-                        ? (res as any).reagents
-                        : archiveReagents;
-                      const committedWorkSteps = Array.isArray((res as any).workSteps)
-                        ? (res as any).workSteps
-                        : archiveWorkSteps;
-                      const committedTranscriptions = Array.isArray((res as any).labelTranscriptions)
-                        ? (res as any).labelTranscriptions
-                        : rawLabelTranscriptions;
-                      const committedMarkdown =
-                        typeof (res as any).markdownDoc === 'string'
-                          ? (res as any).markdownDoc
-                          : markdownDoc;
-
-                      setArchives((prev) =>
-                        prev.map((a) =>
-                          a.id === targetArchiveId
-                            ? {
-                                ...a,
-                                name: a.name || committedArchiveName,
-                                reagents: committedReagents,
-                                labelTranscriptions: committedTranscriptions,
-                                workSteps: committedWorkSteps,
-                                markdownDoc: committedMarkdown,
-                                videoIds: Array.from(
-                                  new Set([...(a.videoIds || []), selectedVideo.videoId])
-                                ),
-                                updatedAt: res.signedOffAt,
-                              }
-                            : a
-                        )
-                      );
-
-                      const updatedAnalysisDoc: VideoAnalysisDoc = {
-                        ...(analysisCache[selectedVideo.videoId] || {
-                          videoId: selectedVideo.videoId,
-                          actions: pass1Actions,
-                          events: [],
-                          refinements: [],
-                        }),
-                        videoId: selectedVideo.videoId,
-                        archiveId: targetArchiveId,
-                        archiveName: committedArchiveName,
-                        creatorName,
-                        creationDate,
-                        reagents: archiveReagents,
-                        workSteps: archiveWorkSteps.map((ws) => ({
-                          ...ws,
-                          videoId: ws.videoId || selectedVideo.videoId,
-                        })),
-                        isSignedOff: true,
-                        signedOffAt: res.signedOffAt,
-                        updatedAt: res.signedOffAt,
-                      };
-                      setAnalysisCache((prev) => ({
-                        ...prev,
-                        [selectedVideo.videoId]: updatedAnalysisDoc,
-                      }));
-                      onSelectActiveStream?.(
-                        {
-                          ...selectedVideo,
-                          archiveId: targetArchiveId,
-                          archiveName: committedArchiveName,
-                        },
-                        updatedAnalysisDoc
-                      );
-
-                      const successMsg = `Committed Experiment Archive Notebook (${archiveReagents.length} reagent(s), ${archiveWorkSteps.length} work step(s)) to Archive Database (${targetArchiveId}).`;
-                      setHitlCommitSuccess(successMsg);
-                      setStatusBanner(successMsg);
-                      setPassesByVideo((prev) => {
-                        const cur = ensurePasses(
-                          prev[selectedVideo.videoId] || selectedVideo.passes
-                        );
-                        return {
-                          ...prev,
-                          [selectedVideo.videoId]: {
-                            ...cur,
-                            hitl: {
-                              status: 'COMPLETED',
-                              completedAt: res.signedOffAt,
-                              data: {
-                                archiveId: targetArchiveId,
-                                signedOffAt: res.signedOffAt,
-                                reagents: archiveReagents,
-                                workSteps: archiveWorkSteps,
-                              },
-                            } as any,
-                          },
-                        };
-                      });
-                      onNavigateToArchive?.(targetArchiveId, selectedVideo.videoId);
-                    } catch (err: any) {
-                      const errMsg = `Failed to commit HITL archive notebook: ${err?.message || 'Unknown error'}`;
-                      setHitlCommitError(errMsg);
-                      setStatusBanner(errMsg);
-                    } finally {
-                      setIsCommittingHitl(false);
-                    }
-                  };
-
-                  return (
-                    <div className="space-y-3 pt-2 border-t border-slate-800/80">
-                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
-                        <span className="text-indigo-300 font-semibold">
-                          Experiment Archive HITL Review: {archiveReagents.length} Reagent(s) &amp;{' '}
-                          {archiveWorkSteps.length} Work Step(s)
-                        </span>
-                      </div>
-
-                      {/* Section A: Editable Reagents Table */}
-                      <div className="space-y-2 bg-slate-900/80 border border-slate-800/80 rounded-lg p-3">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[11px] font-mono font-bold text-slate-300 uppercase tracking-wider">
-                            Reagents Table ({archiveReagents.length})
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const newReagent: ArchiveReagent = {
-                                id: `reagent_${Date.now()}`,
-                                reagentName: 'New Reagent',
-                                reagentAcronym: 'NR',
-                                manufacturer: '',
-                                catalogNumber: '',
-                                lotNumber: '',
-                              };
-                              setHitlArchiveEdits((prev) => ({
-                                ...prev,
-                                [selectedVideo.videoId]: {
-                                  ...prev[selectedVideo.videoId],
-                                  reagents: [...archiveReagents, newReagent],
-                                },
-                              }));
-                            }}
-                            className="text-[10px] font-mono text-indigo-400 hover:text-indigo-300 underline"
-                          >
-                            + Add Reagent
-                          </button>
-                        </div>
-                        {archiveReagents.length === 0 ? (
-                          <p className="text-xs text-slate-500 font-mono italic">No reagents detected yet.</p>
-                        ) : (
-                          <div className="overflow-x-auto">
-                            <table className="w-full text-left text-xs font-mono">
-                              <thead>
-                                <tr className="border-b border-slate-800 text-[10px] uppercase text-slate-400">
-                                  <th className="pb-1">Reagent Name</th>
-                                  <th className="pb-1">Acronym</th>
-                                  <th className="pb-1">Manufacturer</th>
-                                  <th className="pb-1">Catalog #</th>
-                                  <th className="pb-1">Lot #</th>
-                                  <th className="pb-1 w-8"></th>
-                                </tr>
-                              </thead>
-                              <tbody className="divide-y divide-slate-800/60">
-                                {archiveReagents.map((reagent, rIdx) => (
-                                  <tr key={reagent.id || `r_${rIdx}`}>
-                                    <td className="py-1.5 pr-2">
-                                      <input
-                                        type="text"
-                                        value={reagent.reagentName}
-                                        onChange={(e) =>
-                                          updateArchiveReagent(rIdx, { reagentName: e.target.value })
-                                        }
-                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
-                                      />
-                                    </td>
-                                    <td className="py-1.5 pr-2 w-24">
-                                      <input
-                                        type="text"
-                                        value={reagent.reagentAcronym || ''}
-                                        onChange={(e) =>
-                                          updateArchiveReagent(rIdx, { reagentAcronym: e.target.value })
-                                        }
-                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none font-bold text-cyan-300"
-                                      />
-                                    </td>
-                                    <td className="py-1.5 pr-2">
-                                      <input
-                                        type="text"
-                                        value={reagent.manufacturer || ''}
-                                        onChange={(e) =>
-                                          updateArchiveReagent(rIdx, { manufacturer: e.target.value })
-                                        }
-                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
-                                      />
-                                    </td>
-                                    <td className="py-1.5 pr-2 w-28">
-                                      <input
-                                        type="text"
-                                        value={reagent.catalogNumber || ''}
-                                        onChange={(e) =>
-                                          updateArchiveReagent(rIdx, { catalogNumber: e.target.value })
-                                        }
-                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
-                                      />
-                                    </td>
-                                    <td className="py-1.5 pr-2 w-28">
-                                      <input
-                                        type="text"
-                                        value={reagent.lotNumber || ''}
-                                        onChange={(e) =>
-                                          updateArchiveReagent(rIdx, { lotNumber: e.target.value })
-                                        }
-                                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
-                                      />
-                                    </td>
-                                    <td className="py-1.5 text-center">
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          const updated = archiveReagents.filter((_, i) => i !== rIdx);
-                                          setHitlArchiveEdits((prev) => ({
-                                            ...prev,
-                                            [selectedVideo.videoId]: {
-                                              ...prev[selectedVideo.videoId],
-                                              reagents: updated,
-                                            },
-                                          }));
-                                        }}
-                                        className="text-red-400 hover:text-red-300"
-                                        title="Remove Reagent"
-                                      >
-                                        &times;
-                                      </button>
-                                    </td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Section B: Editable Work Steps with 96-Well Plate Map */}
-                      <div className="space-y-3 bg-slate-900/80 border border-slate-800/80 rounded-lg p-3">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[11px] font-mono font-bold text-slate-300 uppercase tracking-wider">
-                            Work Steps ({archiveWorkSteps.length})
-                          </span>
-                        </div>
-                        {archiveWorkSteps.length === 0 ? (
-                          <p className="text-xs text-slate-500 font-mono italic">No work steps detected yet.</p>
-                        ) : (
-                          <div className="space-y-3">
-                            {archiveWorkSteps.map((step, wsIdx) => {
-                              const isSeed = step.actionType === 'SEED_REAGENTS';
-                              const isMix = step.actionType === 'MIX_REAGENTS';
-                              const curMix = step.mixReagentsData || {
-                                firstReagentName: '',
-                                firstReagentAmount: '',
-                                secondReagentName: '',
-                                secondReagentAmount: '',
-                              };
-                              const curSeed = step.seedReagentsData || {
-                                plateType: 'N/A',
-                                pipetteType: 'N/A',
-                                cellsSeeded: 'N/A',
-                                cellsPerWell: 'N/A',
-                                seedingEventsCount: 0,
-                              };
-                              const currentCols = curSeed.seededColumns || [];
-                              const currentColsText = currentCols.join(', ');
-
-                              return (
-                                <div
-                                  key={step.stepId || `ws_${wsIdx}`}
-                                  className="p-3 rounded-lg bg-slate-950/70 border border-slate-800 space-y-2 text-xs font-mono"
-                                >
-                                  <div className="flex flex-wrap items-center justify-between gap-2">
-                                    <div className="flex items-center gap-2">
-                                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-950 border border-indigo-700/60 text-indigo-300">
-                                        Step #{wsIdx + 1}
-                                      </span>
-                                      <span className="font-semibold text-slate-200">
-                                        {isSeed ? '🌱 SEED_REAGENTS' : isMix ? '🧪 MIX_REAGENTS' : step.actionType}
-                                      </span>
-                                      <span className="text-slate-400 text-[11px]">
-                                        ({step.startTimeSeconds ?? 0}s – {step.endTimeSeconds ?? 0}s)
-                                      </span>
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                      <select
-                                        value={step.actionType}
-                                        onChange={(e) =>
-                                          updateArchiveWorkStep(wsIdx, {
-                                            actionType: e.target.value as 'SEED_REAGENTS' | 'MIX_REAGENTS',
-                                          })
-                                        }
-                                        className="bg-slate-900 border border-slate-700 text-slate-300 text-[11px] rounded px-2 py-0.5 focus:outline-none"
-                                      >
-                                        <option value="SEED_REAGENTS">SEED_REAGENTS</option>
-                                        <option value="MIX_REAGENTS">MIX_REAGENTS</option>
-                                      </select>
-                                    </div>
-                                  </div>
-
-                                  <div>
-                                    <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
-                                      Description
-                                    </label>
-                                    <input
-                                      type="text"
-                                      value={step.description}
-                                      onChange={(e) =>
-                                        updateArchiveWorkStep(wsIdx, { description: e.target.value })
-                                      }
-                                      className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 focus:border-indigo-500 focus:outline-none"
-                                    />
-                                  </div>
-
-                                  {isMix && (
-                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1 border-t border-slate-800/60">
-                                      <div>
-                                        <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
-                                          First Reagent (Name / Amount)
-                                        </label>
-                                        <div className="flex gap-2">
-                                          <input
-                                            type="text"
-                                            placeholder="e.g. Media"
-                                            value={curMix.firstReagentName || ''}
-                                            onChange={(e) =>
-                                              updateArchiveWorkStep(wsIdx, {
-                                                mixReagentsData: {
-                                                  ...curMix,
-                                                  firstReagentName: e.target.value,
-                                                },
-                                              })
-                                            }
-                                            className="w-2/3 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
-                                          />
-                                          <input
-                                            type="text"
-                                            placeholder="e.g. 50 µL"
-                                            value={curMix.firstReagentAmount || ''}
-                                            onChange={(e) =>
-                                              updateArchiveWorkStep(wsIdx, {
-                                                mixReagentsData: {
-                                                  ...curMix,
-                                                  firstReagentAmount: e.target.value,
-                                                },
-                                              })
-                                            }
-                                            className="w-1/3 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
-                                          />
-                                        </div>
-                                      </div>
-                                      <div>
-                                        <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
-                                          Second Reagent (Name / Amount)
-                                        </label>
-                                        <div className="flex gap-2">
-                                          <input
-                                            type="text"
-                                            placeholder="e.g. Buffer"
-                                            value={curMix.secondReagentName || ''}
-                                            onChange={(e) =>
-                                              updateArchiveWorkStep(wsIdx, {
-                                                mixReagentsData: {
-                                                  ...curMix,
-                                                  secondReagentName: e.target.value,
-                                                },
-                                              })
-                                            }
-                                            className="w-2/3 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
-                                          />
-                                          <input
-                                            type="text"
-                                            placeholder="e.g. 10 µL"
-                                            value={curMix.secondReagentAmount || ''}
-                                            onChange={(e) =>
-                                              updateArchiveWorkStep(wsIdx, {
-                                                mixReagentsData: {
-                                                  ...curMix,
-                                                  secondReagentAmount: e.target.value,
-                                                },
-                                              })
-                                            }
-                                            className="w-1/3 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
-                                          />
-                                        </div>
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  {isSeed && (
-                                    <div className="space-y-2 pt-1 border-t border-slate-800/60">
-                                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                                        <div>
-                                          <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
-                                            Plate Type
-                                          </label>
-                                          <input
-                                            type="text"
-                                            placeholder="e.g. 96-well plate"
-                                            value={curSeed.plateType || ''}
-                                            onChange={(e) =>
-                                              updateArchiveWorkStep(wsIdx, {
-                                                seedReagentsData: {
-                                                  ...curSeed,
-                                                  plateType: e.target.value,
-                                                },
-                                              })
-                                            }
-                                            className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
-                                          />
-                                        </div>
-                                        <div>
-                                          <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
-                                            Pipette Type
-                                          </label>
-                                          <input
-                                            type="text"
-                                            placeholder="e.g. 8-channel pipette"
-                                            value={curSeed.pipetteType || ''}
-                                            onChange={(e) =>
-                                              updateArchiveWorkStep(wsIdx, {
-                                                seedReagentsData: {
-                                                  ...curSeed,
-                                                  pipetteType: e.target.value,
-                                                },
-                                              })
-                                            }
-                                            className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
-                                          />
-                                        </div>
-                                        <div>
-                                          <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
-                                            Cells Seeded
-                                          </label>
-                                          <input
-                                            type="text"
-                                            placeholder="e.g. Jurkat T-cells"
-                                            value={curSeed.cellsSeeded || ''}
-                                            onChange={(e) =>
-                                              updateArchiveWorkStep(wsIdx, {
-                                                seedReagentsData: {
-                                                  ...curSeed,
-                                                  cellsSeeded: e.target.value,
-                                                },
-                                              })
-                                            }
-                                            className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
-                                          />
-                                        </div>
-                                        <div>
-                                          <label className="text-[10px] uppercase text-slate-400 block mb-0.5">
-                                            Cells Per Well
-                                          </label>
-                                          <input
-                                            type="text"
-                                            placeholder="e.g. 10000"
-                                            value={curSeed.cellsPerWell || ''}
-                                            onChange={(e) =>
-                                              updateArchiveWorkStep(wsIdx, {
-                                                seedReagentsData: {
-                                                  ...curSeed,
-                                                  cellsPerWell: e.target.value,
-                                                },
-                                              })
-                                            }
-                                            className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
-                                          />
-                                        </div>
-                                      </div>
-
-                                      <div>
-                                        <div className="flex items-center justify-between mb-0.5">
-                                          <label className="text-[10px] uppercase text-slate-400">
-                                            Seeded Columns (1–12, Left to Right)
-                                          </label>
-                                          <span className="text-[10px] text-cyan-400">
-                                            {currentCols.length > 0
-                                              ? `${currentCols.length} column(s) selected: [${currentCols.join(', ')}]`
-                                              : 'No columns selected'}
-                                          </span>
-                                        </div>
-                                        <input
-                                          type="text"
-                                          placeholder="e.g. 1, 2, 3 or 1-12"
-                                          value={currentColsText}
-                                          onChange={(e) => {
-                                            const cols = parseColumnNumbersFromText(e.target.value);
-                                            const resolved = resolveSeededColumnsAndWells({ seededColumns: cols });
-                                            updateArchiveWorkStep(wsIdx, {
-                                              seedReagentsData: {
-                                                ...curSeed,
-                                                seededColumns: resolved.seededColumns,
-                                                seededWells: resolved.seededWells,
-                                                seedingEventsCount: resolved.seededColumns.length,
-                                                isSeedingCountCorrect: resolved.seededColumns.length === 12,
-                                              },
-                                            });
-                                          }}
-                                          className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:border-indigo-500 focus:outline-none"
-                                        />
-                                        <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
-                                          <span className="text-[10px] text-slate-500">Quick set:</span>
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              const allCols = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-                                              const resolved = resolveSeededColumnsAndWells({ seededColumns: allCols });
-                                              updateArchiveWorkStep(wsIdx, {
-                                                seedReagentsData: {
-                                                  ...curSeed,
-                                                  seededColumns: resolved.seededColumns,
-                                                  seededWells: resolved.seededWells,
-                                                  seedingEventsCount: 12,
-                                                  isSeedingCountCorrect: true,
-                                                },
-                                              });
-                                            }}
-                                            className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 text-[10px]"
-                                          >
-                                            All 12 Columns (Full Plate)
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              const resolved = resolveSeededColumnsAndWells({ seededColumns: [] });
-                                              updateArchiveWorkStep(wsIdx, {
-                                                seedReagentsData: {
-                                                  ...curSeed,
-                                                  seededColumns: [],
-                                                  seededWells: [],
-                                                  seedingEventsCount: 0,
-                                                  isSeedingCountCorrect: false,
-                                                },
-                                              });
-                                            }}
-                                            className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 text-[10px]"
-                                          >
-                                            Clear
-                                          </button>
-                                        </div>
-                                      </div>
-
-                                      {/* 96-Well Plate Map Preview */}
-                                      <div className="pt-2">
-                                        <span className="text-[10px] uppercase text-slate-400 font-semibold block mb-1">
-                                          96-Well Plate Map (Columns 1–12 Left to Right, Rows A–H)
-                                        </span>
-                                        <pre className="p-2.5 rounded bg-slate-950/90 border border-slate-800 text-[10px] font-mono text-cyan-300 leading-tight overflow-x-auto whitespace-pre">
-                                          {render96WellPlateMarkdown(
-                                            curSeed.seededColumns,
-                                            curSeed.seededWells
-                                          )}
-                                        </pre>
-                                        <p className="text-[10px] text-slate-500 mt-1">
-                                          96-well plate does not use cryo-box top-left black marker. Rows A–H, columns 1–12 left to right. [X] = Seeded well, [ ] = Unseeded well.
-                                        </p>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
-                        )}
-                      </div>
-
-                      {hitlCommitError && (
-                        <div className="flex items-start gap-2 p-3 rounded-lg bg-red-950/60 border border-red-800/80 text-red-200 text-xs font-mono">
-                          <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                          <span>{hitlCommitError}</span>
-                        </div>
-                      )}
-
-                      {hitlCommitSuccess && (
-                        <div className="flex items-start gap-2 p-3 rounded-lg bg-emerald-950/60 border border-emerald-800/80 text-emerald-200 text-xs font-mono">
-                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                          <span>{hitlCommitSuccess}</span>
-                        </div>
-                      )}
-
-                      {isHitlCommitted ? (
-                        <div className="flex items-center justify-end gap-3 pt-1">
-                          <div className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-xs font-mono font-semibold">
-                            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                            <span>Experiment Archive Notebook has been committed to database.</span>
-                          </div>
-                          <button
-                            type="button"
-                            disabled={isUndoingHitl}
-                            onClick={() => handleUndoHitlCommit(selectedVideo.videoId)}
-                            data-testid="hitl-undo-commit-archive-btn"
-                            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-amber-300 border border-amber-500/40 hover:border-amber-500 transition-all shadow-sm"
-                            title="Unlock notebook notes to edit and re-commit"
-                          >
-                            {isUndoingHitl ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            ) : (
-                              <RotateCcw className="w-3.5 h-3.5" />
-                            )}
-                            <span>Undo Commit</span>
-                          </button>
-                        </div>
-                      ) : (
-                        <div className="flex justify-end pt-1">
-                          <button
-                            type="button"
-                            disabled={isCommittingHitl}
-                            onClick={handleCommitArchiveHitl}
-                            data-testid="hitl-commit-archive-btn"
-                            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white shadow-lg shadow-indigo-600/20 transition-all"
-                          >
-                            {isCommittingHitl ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            ) : (
-                              <CheckCircle2 className="w-3.5 h-3.5" />
-                            )}
-                            <span>Commit to Database (Experiment Archive Notebook)</span>
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  );
-                }
-
-                if (pass1Actions.length === 0) return null;
-
-                const committedBoxUpdates: any[] = Array.isArray(
-                  (selectedPasses.hitl as any)?.data?.boxUpdates
-                )
-                  ? (selectedPasses.hitl as any).data.boxUpdates
-                  : Array.isArray((selectedVideo.passes?.hitl as any)?.data?.boxUpdates)
-                    ? (selectedVideo.passes?.hitl as any).data.boxUpdates
-                    : [];
-
-                const getActionEditState = (act: any, idx: number) => {
-                  const actId = act.actionId || `act_${idx + 1}`;
-                  const key = `${selectedVideo.videoId}_${actId}`;
-                  if (hitlActionEdits[key]) {
-                    return hitlActionEdits[key];
-                  }
-
-                  const committed =
-                    committedBoxUpdates.find((u: any) => u?.actionId === actId) ||
-                    committedBoxUpdates[idx];
-                  if (committed) {
-                    const committedRow = String(committed.row || 'A').toUpperCase();
-                    const committedCol = Number(committed.col) || 1;
-                    const committedCoord = `${committedRow}${committedCol}`;
-                    const committedIsRemoval =
-                      committed.actionType === 'VIAL_REMOVAL' ||
-                      committed.status === 'EMPTY';
-                    return {
-                      actionId: actId,
-                      actionType: (committedIsRemoval
-                        ? 'VIAL_REMOVAL'
-                        : 'VIAL_INSERTION') as 'VIAL_INSERTION' | 'VIAL_REMOVAL',
-                      boxId: String(committed.boxId || 'box_01'),
-                      coordinate: committedCoord,
-                      cellLineName: String(committed.cellLineName || ''),
-                      userInitials: String(
-                        committed.userInitials || committed.operatorInitials || ''
-                      ),
-                      dateFrozen: String(committed.dateFrozen || ''),
-                      fullText: String(
-                        committed.fullText || committed.cellLineName || ''
-                      ),
-                      lotNumber: String(committed.lotNumber || ''),
-                      passage: String(committed.passage ?? 1),
-                    };
-                  }
-
-                  const vLabel = act.vialLabelData || {};
-                  const cInfo = act.cellLineInfo || {};
-                  const wellLoc = act.boxWellLocation || {};
-                  const coord =
-                    wellLoc.coordinate ||
-                    act.targetCoordinate ||
-                    cInfo.targetCoordinate ||
-                    (act.boxRowId ? `${act.boxRowId}${act.boxColId ?? 1}` : 'A1');
-                  const isRemoval = String(act.actionType || act.actionClass || '')
-                    .toUpperCase()
-                    .includes('REMOVAL');
-
-                  return {
-                    actionId: actId,
-                    actionType: (isRemoval ? 'VIAL_REMOVAL' : 'VIAL_INSERTION') as
-                      | 'VIAL_INSERTION'
-                      | 'VIAL_REMOVAL',
-                    boxId: String(cInfo.boxId || 'box_01'),
-                    coordinate: String(coord).toUpperCase(),
-                    cellLineName: String(
-                      vLabel.cellLineName || act.cellLineName || cInfo.name || ''
-                    ),
-                    userInitials: String(
-                      vLabel.userInitials ||
-                        cInfo.userInitials ||
-                        cInfo.operatorInitials ||
-                        cInfo.operator ||
-                        ''
-                    ),
-                    dateFrozen: String(vLabel.dateFrozen || cInfo.dateFrozen || ''),
-                    fullText: String(
-                      vLabel.fullText ||
-                        act.conflatedLabelText ||
-                        cInfo.fullText ||
-                        vLabel.cellLineName ||
-                        act.cellLineName ||
-                        ''
-                    ),
-                    lotNumber: String(cInfo.lotNumber || cInfo.lot || ''),
-                    passage: String(cInfo.passage ?? 1),
-                  };
-                };
-
-                const updateHitlField = (
-                  act: any,
-                  idx: number,
-                  field: string,
-                  value: string
-                ) => {
-                  const current = getActionEditState(act, idx);
-                  const key = `${selectedVideo.videoId}_${current.actionId}`;
-                  setHitlCommitError(null);
-                  setHitlCommitSuccess(null);
-                  setHitlActionEdits((prev) => ({
-                    ...prev,
-                    [key]: {
-                      ...current,
-                      [field]: value,
-                    },
-                  }));
-                };
-
-                const handleDirectHitlCommit = async () => {
-                  setIsCommittingHitl(true);
-                  setHitlCommitError(null);
-                  setHitlCommitSuccess(null);
-                  try {
-                    const targetInventoryId =
-                      selectedVideo.inventoryId ||
-                      pass1Actions[0]?.inventoryId ||
-                      selectedPasses.pass0?.data?.inventoryName ||
-                      inventories[0]?.id ||
-                      'tank_alpha_01';
-
-                    const boxUpdates = pass1Actions.map((act, idx) => {
-                      const st = getActionEditState(act, idx);
-                      const m = st.coordinate
-                        .trim()
-                        .toUpperCase()
-                        .match(/^([A-Z])(\d+)$/);
-                      const row = m ? m[1] : 'A';
-                      const col = m ? Math.max(1, parseInt(m[2], 10)) : 1;
-                      const isRemoval = st.actionType === 'VIAL_REMOVAL';
-                      return {
-                        boxId: st.boxId || 'box_01',
-                        row,
-                        col,
-                        cellLineName: isRemoval ? (st.cellLineName || '') : (st.cellLineName || 'Unknown'),
-                        userInitials: st.userInitials || undefined,
-                        dateFrozen: st.dateFrozen || undefined,
-                        fullText: isRemoval ? (st.fullText || '') : (st.fullText || st.cellLineName || 'Unknown'),
-                        lotNumber: st.lotNumber || undefined,
-                        passage: isRemoval ? undefined : (Number(st.passage) || 1),
-                        operatorInitials: st.userInitials || tenant.operatorInitials || 'RS',
-                        actionId: st.actionId,
-                        actionType: st.actionType,
-                        highlighted: !isRemoval,
-                        status: (isRemoval ? 'EMPTY' : 'OCCUPIED') as 'EMPTY' | 'OCCUPIED',
-                        updatedAt: new Date().toISOString(),
-                      };
-                    });
-
-                    const res = await apiService.commitInventorySignOff(
-                      tenant.databaseId,
-                      selectedVideo.videoId,
-                      targetInventoryId,
-                      boxUpdates
-                    );
-
-                    const applyEditsToActions = (actions: any[]) =>
-                      actions.map((act: any, idx: number) => {
-                        const actId = act.actionId || `act_${idx + 1}`;
-                        const upd =
-                          boxUpdates.find((u) => u.actionId === actId) || boxUpdates[idx];
-                        if (!upd) return act;
-                        const coord = `${upd.row}${upd.col}`;
-                        return {
-                          ...act,
-                          actionId: actId,
-                          actionType: upd.actionType,
-                          actionClass: upd.actionType,
-                          targetCoordinate: coord,
-                          boxRowId: upd.row,
-                          boxColId: upd.col,
-                          cellLineName: upd.cellLineName,
-                          conflatedLabelText: upd.fullText,
-                          boxWellLocation: {
-                            ...(act.boxWellLocation || {}),
-                            row: upd.row,
-                            column: upd.col,
-                            coordinate: coord,
-                          },
-                          vialLabelData: {
-                            ...(act.vialLabelData || {}),
-                            cellLineName: upd.cellLineName,
-                            userInitials: upd.userInitials || act.vialLabelData?.userInitials,
-                            dateFrozen: upd.dateFrozen || act.vialLabelData?.dateFrozen,
-                            fullText: upd.fullText,
-                          },
-                          cellLineInfo: {
-                            ...(act.cellLineInfo || {}),
-                            boxId: upd.boxId,
-                            name: upd.cellLineName,
-                            targetCoordinate: coord,
-                            userInitials: upd.userInitials || act.cellLineInfo?.userInitials,
-                            operatorInitials: upd.operatorInitials,
-                            dateFrozen: upd.dateFrozen || act.cellLineInfo?.dateFrozen,
-                            fullText: upd.fullText,
-                            lotNumber: upd.lotNumber || act.cellLineInfo?.lotNumber,
-                            passage: upd.passage,
-                          },
-                        };
-                      });
-
-                    setPassesByVideo((prev) => {
-                      const cur = ensurePasses(
-                        prev[selectedVideo.videoId] || selectedVideo.passes
-                      );
-                      const updatedPass1Data = cur.pass1?.data
-                        ? {
-                            ...cur.pass1.data,
-                            actions: Array.isArray(cur.pass1.data.actions)
-                              ? applyEditsToActions(cur.pass1.data.actions)
-                              : cur.pass1.data.actions,
-                          }
-                        : cur.pass1?.data;
-                      return {
-                        ...prev,
-                        [selectedVideo.videoId]: {
-                          ...cur,
-                          pass1: cur.pass1
-                            ? { ...cur.pass1, data: updatedPass1Data }
-                            : cur.pass1,
-                          hitl: {
-                            status: 'COMPLETED',
-                            completedAt: res.signedOffAt,
-                            data: {
-                              inventoryId: targetInventoryId,
-                              signedOffAt: res.signedOffAt,
-                              boxUpdates,
-                            },
-                          } as any,
-                        },
-                      };
-                    });
-
-                    setVideos((prev) =>
-                      prev.map((v) => {
-                        if (v.videoId !== selectedVideo.videoId) return v;
-                        const cur = ensurePasses(v.passes);
-                        const updatedPass1Data = cur.pass1?.data
-                          ? {
-                              ...cur.pass1.data,
-                              actions: Array.isArray(cur.pass1.data.actions)
-                                ? applyEditsToActions(cur.pass1.data.actions)
-                                : cur.pass1.data.actions,
-                            }
-                          : cur.pass1?.data;
-                        return {
-                          ...v,
-                          passes: {
-                            ...cur,
-                            pass1: cur.pass1
-                              ? { ...cur.pass1, data: updatedPass1Data }
-                              : cur.pass1,
-                            hitl: {
-                              status: 'COMPLETED',
-                              completedAt: res.signedOffAt,
-                              data: {
-                                inventoryId: targetInventoryId,
-                                signedOffAt: res.signedOffAt,
-                                boxUpdates,
-                              },
-                            } as any,
-                          },
-                        };
-                      })
-                    );
-
-                    const successMsg = `Committed ${boxUpdates.length} verified inventory action(s) to Cryo-Inventory (${targetInventoryId}).`;
-                    setHitlCommitSuccess(successMsg);
-                    setStatusBanner(successMsg);
-                    onNavigateToInventory?.(targetInventoryId, selectedVideo.videoId);
-                  } catch (err: any) {
-                    const errMsg = `Failed to commit HITL inventory actions: ${err?.message || 'Unknown error'}`;
-                    setHitlCommitError(errMsg);
-                    setStatusBanner(errMsg);
-                  } finally {
-                    setIsCommittingHitl(false);
-                  }
-                };
-
-                return (
-                  <div className="space-y-3 pt-2 border-t border-slate-800/80">
-                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
-                      <span className="text-emerald-300 font-semibold">
-                        Verify & Edit Refined Inventory Update Actions ({pass1Actions.length})
-                      </span>
-                      <span className="text-[10px] text-amber-300">
-                        Origin A1 = Top-Left Black Corner • Rows: A.. • Cols: 1..
-                      </span>
-                    </div>
-
-                    <div className="space-y-2.5">
-                      {pass1Actions.map((act: any, idx: number) => {
-                        const st = getActionEditState(act, idx);
-                        return (
-                          <div
-                            key={st.actionId}
-                            className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2.5 text-xs font-mono"
-                            data-testid={`hitl-action-editor-${st.actionId}`}
-                          >
-                            <div className="flex flex-wrap items-center justify-between gap-2">
-                              <div className="flex items-center gap-2">
-                                <span className="font-bold text-cyan-300">{st.actionId}</span>
-                                <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-700 text-[10px] text-slate-300">
-                                  {st.actionType}
-                                </span>
-                              </div>
-                              <span className="text-[10px] text-slate-400">
-                                Well Coordinate (A1 = Top-Left Black Corner)
-                              </span>
-                            </div>
-
-                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5">
-                              <div>
-                                <label className="block text-[10px] text-slate-400 mb-1">
-                                  Well Coordinate (Row+Col)
-                                </label>
-                                <input
-                                  type="text"
-                                  value={st.coordinate}
-                                  onChange={(e) =>
-                                    updateHitlField(
-                                      act,
-                                      idx,
-                                      'coordinate',
-                                      e.target.value.toUpperCase()
-                                    )
-                                  }
-                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-emerald-300 font-bold text-xs focus:outline-none focus:border-cyan-500"
-                                />
-                              </div>
-                              <div>
-                                <label className="block text-[10px] text-slate-400 mb-1">
-                                  Cell Line Name *
-                                </label>
-                                <input
-                                  type="text"
-                                  value={st.cellLineName}
-                                  onChange={(e) =>
-                                    updateHitlField(act, idx, 'cellLineName', e.target.value)
-                                  }
-                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-slate-100 text-xs focus:outline-none focus:border-cyan-500"
-                                />
-                              </div>
-                              <div>
-                                <label className="block text-[10px] text-slate-400 mb-1">
-                                  User Initials
-                                </label>
-                                <input
-                                  type="text"
-                                  value={st.userInitials}
-                                  onChange={(e) =>
-                                    updateHitlField(act, idx, 'userInitials', e.target.value)
-                                  }
-                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-slate-100 text-xs focus:outline-none focus:border-cyan-500"
-                                />
-                              </div>
-                              <div>
-                                <label className="block text-[10px] text-slate-400 mb-1">
-                                  Date Frozen
-                                </label>
-                                <input
-                                  type="text"
-                                  value={st.dateFrozen}
-                                  onChange={(e) =>
-                                    updateHitlField(act, idx, 'dateFrozen', e.target.value)
-                                  }
-                                  placeholder="YYYY-MM-DD"
-                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-slate-100 text-xs focus:outline-none focus:border-cyan-500"
-                                />
-                              </div>
-                              <div className="sm:col-span-2">
-                                <label className="block text-[10px] text-slate-400 mb-1">
-                                  Full Label Text *
-                                </label>
-                                <input
-                                  type="text"
-                                  value={st.fullText}
-                                  onChange={(e) =>
-                                    updateHitlField(act, idx, 'fullText', e.target.value)
-                                  }
-                                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-cyan-200 text-xs focus:outline-none focus:border-cyan-500"
-                                />
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    {hitlCommitError && (
-                      <div
-                        data-testid="hitl-commit-error"
-                        className="flex items-start gap-2 p-3 rounded-lg bg-red-950/60 border border-red-800/80 text-red-200 text-xs font-mono"
-                      >
-                        <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                        <span>{hitlCommitError}</span>
-                      </div>
-                    )}
-
-                    {hitlCommitSuccess && (
-                      <div
-                        data-testid="hitl-commit-success"
-                        className="flex items-start gap-2 p-3 rounded-lg bg-emerald-950/60 border border-emerald-800/80 text-emerald-200 text-xs font-mono"
-                      >
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                        <span>{hitlCommitSuccess}</span>
-                      </div>
-                    )}
-
-                    {isHitlCommitted ? (
-                      <div
-                        data-testid="hitl-actions-committed-status"
-                        className="flex items-center justify-end gap-3 pt-1"
-                      >
-                        <div className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-xs font-mono font-semibold">
-                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                          <span>Inventory update actions have been committed.</span>
-                        </div>
-                        <button
-                          type="button"
-                          disabled={isUndoingHitl}
-                          onClick={() => handleUndoHitlCommit(selectedVideo.videoId)}
-                          data-testid="hitl-undo-commit-inventory-btn"
-                          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-amber-300 border border-amber-500/40 hover:border-amber-500 transition-all shadow-sm"
-                          title="Unlock inventory actions to edit and re-commit"
-                        >
-                          {isUndoingHitl ? (
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          ) : (
-                            <RotateCcw className="w-3.5 h-3.5" />
-                          )}
-                          <span>Undo Commit</span>
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="flex justify-end pt-1">
-                        <button
-                          type="button"
-                          disabled={isCommittingHitl}
-                          onClick={handleDirectHitlCommit}
-                          data-testid="hitl-commit-inventory-btn"
-                          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white shadow-lg shadow-emerald-600/20 transition-all"
-                        >
-                          {isCommittingHitl ? (
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          ) : (
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                          )}
-                          <span>Commit Verified Actions to Inventory Database</span>
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
             </div>
-          );
-        })()}
-      </div>
-    </div>
-  )}
+
+            {/* Modal Footer */}
+            <div className="flex items-center justify-between px-6 py-3 border-t border-slate-800 bg-slate-900/50 text-xs font-mono text-slate-400">
+              <span>
+                Active Video: {selectedVideo.originalName} ({selectedVideo.videoId})
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsReviewAnalysisModalOpen(false)}
+                className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Pipeline Call & Prompt Inspector Modal */}
       {inspectionModal && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto"
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto"
           onClick={() => setInspectionModal(null)}
         >
           <div

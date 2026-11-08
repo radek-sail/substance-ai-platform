@@ -18,6 +18,7 @@ const {
   extractCellsPerWellFromText,
   extractCellsSeededFromText,
   resolveSeedReagentsDataFromContext,
+  toActiveVoiceDescription,
 } = require('@sail/shared');
 
 const {
@@ -541,6 +542,26 @@ describe('96-Well Plate Seeding Event Detection, Column Mapping & Sign-Off Verif
       assert.strictEqual(step.seedReagentsData.cellsPerWell, 'N/A');
       assert.strictEqual(step.seedReagentsData.plateType, 'N/A');
       assert.strictEqual(step.seedReagentsData.pipetteType, 'N/A');
+      assert.strictEqual(step.description, 'Dispensing liquid into wells.');
+    });
+
+    it('should convert "Operator pours..." and "Operator seeds..." descriptions into active voice ("Pouring...", "Seeding...")', () => {
+      assert.strictEqual(
+        toActiveVoiceDescription('Operator pours 5 mL FBS into 45 mL DMEM'),
+        'Pouring 5 mL FBS into 45 mL DMEM'
+      );
+      assert.strictEqual(
+        toActiveVoiceDescription('operator seeds A549 cells into a 96-well plate'),
+        'Seeding A549 cells into a 96-well plate'
+      );
+      assert.strictEqual(
+        toActiveVoiceDescription('Operator mixes two reagents together'),
+        'Mixing two reagents together'
+      );
+      assert.strictEqual(
+        toActiveVoiceDescription('The operator dispenses media into columns 1 to 12'),
+        'Dispensing media into columns 1 to 12'
+      );
     });
   });
 });

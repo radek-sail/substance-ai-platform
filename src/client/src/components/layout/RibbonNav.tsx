@@ -6,14 +6,14 @@ import {
   Database,
   Building,
   User,
-  CheckCircle2,
-  FileCheck2,
   Sliders,
   Sparkles,
   LogOut,
-  RotateCcw,
+  Sun,
+  Moon,
 } from 'lucide-react';
 import { TenantConfig, DEFAULT_GCS_BUCKET } from '../../services/api.service';
+import { ThemeMode, useTheme } from '../../utils/theme';
 
 export type WorkflowTab = 'inventory' | 'archive' | 'videos';
 
@@ -29,6 +29,8 @@ interface RibbonNavProps {
   userEmail?: string | null;
   onSignOut?: () => void;
   authControls?: React.ReactNode;
+  theme?: ThemeMode;
+  onToggleTheme?: () => void;
 }
 
 export const RibbonNav: React.FC<RibbonNavProps> = ({
@@ -36,13 +38,15 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
   onSelectTab,
   tenant,
   onUpdateTenant,
-  isSignedOff = false,
-  onOpenSignOffModal,
-  onUndoSignOff,
   userEmail,
   onSignOut,
   authControls,
+  theme: propTheme,
+  onToggleTheme: propToggleTheme,
 }) => {
+  const { theme: contextTheme, toggleTheme: contextToggleTheme } = useTheme();
+  const activeTheme: ThemeMode = propTheme ?? contextTheme;
+  const handleToggleTheme = propToggleTheme ?? contextToggleTheme;
   const [showTenantModal, setShowTenantModal] = useState(false);
   const [tempCustomer, setTempCustomer] = useState(tenant.customerId);
   const [tempDatabase, setTempDatabase] = useState(tenant.databaseId);
@@ -89,6 +93,20 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
             <nav className="flex items-center bg-slate-950/80 p-1 rounded-xl border border-slate-800/80 shadow-inner">
               <button
                 type="button"
+                onClick={() => onSelectTab('videos')}
+                className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 ${
+                  activeTab === 'videos'
+                    ? 'bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-md shadow-indigo-500/25'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+                }`}
+                title="Video Manager & Ingestion"
+              >
+                <Video className="w-4 h-4" />
+                <span>📹 Video Manager</span>
+              </button>
+
+              <button
+                type="button"
                 onClick={() => onSelectTab('inventory')}
                 className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 ${
                   activeTab === 'inventory'
@@ -114,75 +132,42 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
                 <FlaskConical className="w-4 h-4" />
                 <span>🧪 Experiment Archive</span>
               </button>
-
-              <button
-                type="button"
-                onClick={() => onSelectTab('videos')}
-                className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 ${
-                  activeTab === 'videos'
-                    ? 'bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-md shadow-indigo-500/25'
-                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-                }`}
-                title="Video Manager & Ingestion"
-              >
-                <Video className="w-4 h-4" />
-                <span>📹 Video Manager</span>
-              </button>
             </nav>
 
-            {/* Tenant Context & Sign-Off Action */}
+            {/* Tenant Context, Theme Switch & Sign-Off Action */}
             <div className="flex items-center gap-3">
-              {/* Tenant context pill button */}
+              {/* Theme Switch (Light / Dark Mode) */}
               <button
                 type="button"
-                onClick={() => setShowTenantModal(true)}
-                className="flex items-center gap-2 bg-slate-800/60 hover:bg-slate-800 border border-slate-700/60 rounded-lg px-2.5 py-1.5 text-xs text-slate-300 transition-colors"
-                title="Click to edit tenant configuration"
+                role="switch"
+                aria-checked={activeTheme === 'dark'}
+                aria-label={`Switch to ${activeTheme === 'light' ? 'dark' : 'light'} mode`}
+                data-testid="theme-toggle-switch"
+                onClick={handleToggleTheme}
+                className="flex items-center gap-1.5 bg-slate-950/80 hover:bg-slate-800 border border-slate-700/70 rounded-xl p-1 text-xs font-medium transition-all cursor-pointer shadow-inner"
+                title={`Current theme: ${activeTheme === 'light' ? 'Light Mode' : 'Dark Mode'} (click to switch)`}
               >
-                <div className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-                <div className="flex items-center gap-1.5 font-mono text-[11px]">
-                  <span className="text-slate-400">{tenant.customerId}</span>
-                  <span className="text-slate-600">/</span>
-                  <span className="text-cyan-400">{tenant.databaseId}</span>
-                </div>
-                <span className="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded text-[10px] font-bold">
-                  {tenant.operatorInitials || 'OP'}
+                <span
+                  className={`flex items-center gap-1 px-2 py-1 rounded-lg transition-all ${
+                    activeTheme === 'light'
+                      ? 'bg-amber-500 text-white shadow-sm font-semibold'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Sun className="w-3.5 h-3.5" />
+                  <span className="hidden md:inline text-[11px]">Light</span>
                 </span>
-                <Sliders className="w-3 h-3 text-slate-400 ml-0.5" />
+                <span
+                  className={`flex items-center gap-1 px-2 py-1 rounded-lg transition-all ${
+                    activeTheme === 'dark'
+                      ? 'bg-indigo-600 text-white shadow-sm font-semibold'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Moon className="w-3.5 h-3.5" />
+                  <span className="hidden md:inline text-[11px]">Dark</span>
+                </span>
               </button>
-
-              {/* Sign-off status & commit trigger (only shown on Archive tab) */}
-              {activeTab === 'archive' && (
-                isSignedOff ? (
-                  <div className="flex items-center gap-2">
-                    <div className="flex items-center gap-1.5 bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm shadow-emerald-950">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                      <span>Signed Off</span>
-                    </div>
-                    {onUndoSignOff && (
-                      <button
-                        type="button"
-                        onClick={onUndoSignOff}
-                        data-testid="ribbon-undo-signoff-btn"
-                        className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 hover:border-slate-600 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors shadow-sm"
-                        title="Re-open experiment notes for editing and re-committing"
-                      >
-                        <RotateCcw className="w-3.5 h-3.5 text-cyan-400" />
-                        <span>Undo Sign-Off</span>
-                      </button>
-                    )}
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={onOpenSignOffModal}
-                    className="flex items-center gap-2 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-400 hover:to-orange-500 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold shadow-md shadow-orange-500/20 active:scale-95 transition-all"
-                  >
-                    <FileCheck2 className="w-4 h-4" />
-                    <span>Review & Sign Off</span>
-                  </button>
-                )
-              )}
 
               {/* Authenticated Operator Controls */}
               {authControls ? (
@@ -223,7 +208,7 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
               <button
                 type="button"
                 onClick={() => setShowTenantModal(false)}
-                className="text-slate-400 hover:text-white text-lg font-bold"
+                className="text-slate-400 hover:text-slate-100 text-lg font-bold"
               >
                 ✕
               </button>

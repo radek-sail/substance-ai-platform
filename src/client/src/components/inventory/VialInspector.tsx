@@ -773,7 +773,7 @@ export const VialInspector: React.FC<VialInspectorProps> = ({
               <button
                 type="button"
                 onClick={() => setSelectedImage(null)}
-                className="text-slate-400 hover:text-white text-base font-bold"
+                className="text-slate-400 hover:text-slate-100 text-base font-bold"
               >
                 ✕
               </button>

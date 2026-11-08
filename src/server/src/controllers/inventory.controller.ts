@@ -71,7 +71,6 @@ export function createDefaultDemoInventory(): InventoryRecord {
     { coord: 'A5', cellLine: 'Jurkat-T', lot: 'LOT-8812', passage: 6 },
     { coord: 'B2', cellLine: 'CHO-K1', lot: 'LOT-7740', passage: 3 },
     { coord: 'B3', cellLine: 'CHO-K1', lot: 'LOT-7740', passage: 3 },
-    { coord: 'C4', cellLine: 'HEK293T', lot: 'LOT-8841', passage: 5 },
     { coord: 'D4', cellLine: 'HeLa', lot: 'LOT-5510', passage: 12 },
     { coord: 'D5', cellLine: 'HeLa', lot: 'LOT-5510', passage: 12 },
     { coord: 'E8', cellLine: 'Vero-E6', lot: 'LOT-4419', passage: 8 },

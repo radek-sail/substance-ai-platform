@@ -96,9 +96,7 @@ export function resolveGridSlotData(params: {
       isHighlighted,
       isSearchMatch: c.occupied && isSearchMatch,
       cellLineName: c.occupied
-        ? c.vial?.cellLineName ||
-          c.vial?.cellLineIdentifier ||
-          (isTarget ? 'HEK293T' : undefined)
+        ? c.vial?.cellLineName || c.vial?.cellLineIdentifier
         : undefined,
       userInitials: c.vial?.userInitials || c.vial?.operatorInitials,
       dateFrozen: c.vial?.dateFrozen,
@@ -120,7 +118,7 @@ export function resolveGridSlotData(params: {
 
   const custom = slots[key];
   const isOccupied =
-    custom?.isOccupied !== undefined ? custom.isOccupied : DEFAULT_OCCUPIED_KEYS.has(key) || isTarget;
+    custom?.isOccupied !== undefined ? custom.isOccupied : DEFAULT_OCCUPIED_KEYS.has(key);
   const isHighlighted = Boolean(
     custom?.isHighlighted ||
       highlightedCoords.includes(key) ||
@@ -136,12 +134,10 @@ export function resolveGridSlotData(params: {
     isDifferenced: isDiff,
     isHighlighted,
     isSearchMatch: Boolean(isOccupied && (custom?.isSearchMatch || isSearchMatch)),
-    cellLineName: custom?.cellLineName || (isTarget ? 'HEK293T' : isOccupied ? 'Jurkat-T' : undefined),
-    userInitials: custom?.userInitials || (isTarget ? 'JS' : undefined),
-    dateFrozen: custom?.dateFrozen || (isTarget ? '2026-03-15' : undefined),
-    fullText:
-      custom?.fullText ||
-      (isTarget ? 'HEK293T | JS | 2026-03-15' : undefined),
+    cellLineName: custom?.cellLineName || (isOccupied ? 'Jurkat-T' : undefined),
+    userInitials: custom?.userInitials,
+    dateFrozen: custom?.dateFrozen,
+    fullText: custom?.fullText,
     lotNumber: custom?.lotNumber,
     passage: custom?.passage,
     notes: custom?.notes,
@@ -636,10 +632,6 @@ export const BoxGridView: React.FC<BoxGridViewProps> = ({
             </h3>
             <p className="text-[11px] text-slate-400 flex flex-wrap items-center gap-2">
               <span>Top-left origin: Rows (A–{rowIndexToLetter(rows - 1)}) × Columns (1–{cols})</span>
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-950 border border-slate-700 text-[10px] font-mono text-slate-300">
-                <span className="w-2 h-2 rounded-sm bg-black border border-slate-400 inline-block" />
-                Origin A1: Top-Left Black Corner
-              </span>
             </p>
           </div>
         </div>
@@ -664,14 +656,6 @@ export const BoxGridView: React.FC<BoxGridViewProps> = ({
               <span className="text-amber-300">Diff Change</span>
             </div>
           )}
-          <div className="flex items-center gap-1.5">
-            <span className="w-3 h-3 rounded bg-slate-700 border border-slate-600" />
-            <span className="text-slate-400">Occupied</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span className="w-3 h-3 rounded bg-slate-950 border border-slate-800" />
-            <span className="text-slate-500">Empty</span>
-          </div>
         </div>
       </div>
 

@@ -30,6 +30,12 @@ import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import { CheckCircle2, AlertCircle, Info, Lock, Loader2, LogOut } from 'lucide-react';
 import { auth } from './firebase';
 import { Login } from './components/Login';
+import {
+  ThemeMode,
+  getInitialTheme,
+  applyThemeToDocument,
+  getNextTheme,
+} from './utils/theme';
 
 function deriveInventoryDataFromAnalysis(
   doc: VideoAnalysisDoc | null,
@@ -153,15 +159,36 @@ export const App: React.FC = () => {
   // Authentication state gated via Firebase Auth
   const [user, setUser] = useState<User | null>(auth.currentUser);
 
+  // Theme state (Light Mode default, switches between 'light' and 'dark')
+  const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme());
+
+  useEffect(() => {
+    applyThemeToDocument(theme);
+  }, [theme]);
+
+  const handleToggleTheme = () => {
+    setTheme((prev) => {
+      const next = getNextTheme(prev);
+      applyThemeToDocument(next);
+      return next;
+    });
+  };
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
+      setUser((prevUser) => {
+        if (!prevUser && currentUser) {
+          setActiveTab('videos');
+        }
+        return currentUser;
+      });
     });
     return () => unsubscribe();
   }, []);
 
   // Navigation tab state
-  const [activeTab, setActiveTab] = useState<WorkflowTab>('inventory');
+  const [activeTab, setActiveTab] = useState<WorkflowTab>('videos');
+  const [signOffReturnTab, setSignOffReturnTab] = useState<WorkflowTab | null>(null);
   const [selectedInventoryId, setSelectedInventoryId] = useState<string | null>(null);
   const [selectedArchiveId, setSelectedArchiveId] = useState<string | null>(null);
 
@@ -376,6 +403,12 @@ export const App: React.FC = () => {
     const resolvedTab: WorkflowTab =
       targetTab === 'hitl' ? (isArchiveDoc ? 'archive' : 'inventory') : targetTab;
 
+    if (targetTab === 'hitl') {
+      setSignOffReturnTab('videos');
+    } else {
+      setSignOffReturnTab(null);
+    }
+
     setActiveVideoId(videoId);
     setActiveTab(resolvedTab);
 
@@ -550,6 +583,7 @@ export const App: React.FC = () => {
 
   // Handle sign-off commit success
   const handleSignOffSuccess = (res: SignOffResponse) => {
+    setSignOffReturnTab(null);
     const details = (res.details || res) as Record<string, any>;
     const committedArchiveId = details?.archiveId || derivedArchiveData.archiveId;
     setIsSignedOff(true);
@@ -623,16 +657,21 @@ export const App: React.FC = () => {
   };
 
   if (!user) {
-    return <Login />;
+    return <Login theme={theme} onToggleTheme={handleToggleTheme} />;
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-white">
+    <div
+      data-theme={theme}
+      className={`${theme} min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-white transition-colors duration-200`}
+    >
       {/* Navigation Ribbon Shell */}
       <RibbonNav
         activeTab={activeTab}
         onSelectTab={handleSelectTab}
         tenant={tenant}
+        theme={theme}
+        onToggleTheme={handleToggleTheme}
         onUpdateTenant={(updated) => {
           setTenant((prev) => ({ ...prev, ...updated }));
           apiService.setTenant(updated);
@@ -811,6 +850,9 @@ export const App: React.FC = () => {
                 onSeekVideo={handleTimelineSeek}
                 signOffVersion={signOffVersion}
                 activeAnalysis={analysis}
+                isSignedOff={isSignedOff}
+                onUndoSignOff={handleUndoSignOff}
+                onOpenSignOffModal={() => setIsSignOffModalOpen(true)}
               />
             )}
           </div>
@@ -820,7 +862,13 @@ export const App: React.FC = () => {
       {/* Atomic HITL Sign-Off Modal */}
       <SignOffModal
         isOpen={isSignOffModalOpen}
-        onClose={() => setIsSignOffModalOpen(false)}
+        onClose={() => {
+          setIsSignOffModalOpen(false);
+          if (signOffReturnTab) {
+            setActiveTab(signOffReturnTab);
+            setSignOffReturnTab(null);
+          }
+        }}
         workflowType={
           activeTab === 'archive' ||
           analysis?.workflowClassification?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||

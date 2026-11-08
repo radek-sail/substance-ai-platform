@@ -8,14 +8,26 @@ import {
   Loader2,
   ShieldCheck,
   ArrowRight,
+  Sun,
+  Moon,
 } from 'lucide-react';
 import { auth } from '../firebase';
+import { ThemeMode, useTheme } from '../utils/theme';
 
 export interface LoginProps {
   onLoginSuccess?: () => void;
+  theme?: ThemeMode;
+  onToggleTheme?: () => void;
 }
 
-export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
+export const Login: React.FC<LoginProps> = ({
+  onLoginSuccess,
+  theme: propTheme,
+  onToggleTheme: propToggleTheme,
+}) => {
+  const { theme: contextTheme, toggleTheme: contextToggleTheme } = useTheme();
+  const activeTheme: ThemeMode = propTheme ?? contextTheme;
+  const handleToggleTheme = propToggleTheme ?? contextToggleTheme;
   const [email, setEmail] = useState<string>('');
   const [password, setPassword] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
@@ -56,7 +68,45 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-4 font-sans selection:bg-cyan-500 selection:text-white">
+    <div
+      data-theme={activeTheme}
+      className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-4 font-sans selection:bg-cyan-500 selection:text-white relative transition-colors duration-200"
+    >
+      {/* Theme Switch (Light / Dark Mode) */}
+      <div className="fixed top-4 right-4 z-50">
+        <button
+          type="button"
+          role="switch"
+          aria-checked={activeTheme === 'dark'}
+          aria-label={`Switch to ${activeTheme === 'light' ? 'dark' : 'light'} mode`}
+          data-testid="login-theme-toggle-switch"
+          onClick={handleToggleTheme}
+          className="flex items-center gap-1.5 bg-slate-900/90 hover:bg-slate-800 border border-slate-700/70 rounded-xl p-1 text-xs font-medium transition-all cursor-pointer shadow-md"
+          title={`Current theme: ${activeTheme === 'light' ? 'Light Mode' : 'Dark Mode'} (click to switch)`}
+        >
+          <span
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg transition-all ${
+              activeTheme === 'light'
+                ? 'bg-amber-500 text-white shadow-sm font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Sun className="w-3.5 h-3.5" />
+            <span className="text-[11px]">Light</span>
+          </span>
+          <span
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg transition-all ${
+              activeTheme === 'dark'
+                ? 'bg-indigo-600 text-white shadow-sm font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Moon className="w-3.5 h-3.5" />
+            <span className="text-[11px]">Dark</span>
+          </span>
+        </button>
+      </div>
+
       <div className="w-full max-w-md bg-slate-900/90 backdrop-blur-md border border-slate-800 rounded-2xl p-8 shadow-2xl shadow-black/60 space-y-6">
         {/* Brand Header */}
         <div className="flex flex-col items-center text-center space-y-3">

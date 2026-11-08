@@ -154,7 +154,7 @@ export const NotebookEditor: React.FC<NotebookEditorProps> = ({
             className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-colors ${
               activeTab === 'editor'
                 ? 'bg-cyan-600 text-white font-medium'
-                : 'text-slate-400 hover:text-white'
+                : 'text-slate-400 hover:text-slate-100'
             }`}
           >
             <Code className="w-3.5 h-3.5" />
@@ -166,7 +166,7 @@ export const NotebookEditor: React.FC<NotebookEditorProps> = ({
             className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-colors ${
               activeTab === 'split'
                 ? 'bg-cyan-600 text-white font-medium'
-                : 'text-slate-400 hover:text-white'
+                : 'text-slate-400 hover:text-slate-100'
             }`}
           >
             <FileText className="w-3.5 h-3.5" />
@@ -178,7 +178,7 @@ export const NotebookEditor: React.FC<NotebookEditorProps> = ({
             className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-colors ${
               activeTab === 'preview'
                 ? 'bg-cyan-600 text-white font-medium'
-                : 'text-slate-400 hover:text-white'
+                : 'text-slate-400 hover:text-slate-100'
             }`}
           >
             <Eye className="w-3.5 h-3.5" />

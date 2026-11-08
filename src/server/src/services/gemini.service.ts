@@ -55,6 +55,7 @@ import {
   deduplicateReagentLabelPresentationEvents,
   isReagentLabelPresentationEvent,
   computeLabelVisibilityScore,
+  toActiveVoiceDescription,
 } from '@sail/shared';
 
 export {
@@ -1215,7 +1216,7 @@ CRITICAL WORK STEP DETECTION RULES:
 - CRITICAL PASS 0 IDENTIFICATION EVENT EXCLUSION: The opening announcement of the archive/experiment title, creator/researcher name, creation date, or target inventory name (ARCHIVE_IDENTIFICATION / INVENTORY_IDENTIFICATION) is detected in Pass 0. Do NOT repeat it in Pass 1 "events" and do NOT misclassify it as VIAL_LABEL_PRESENTATION, REAGENT_LABEL_PRESENTATION_EVENT, or PROTOCOL_AUDIO_UTTERANCE_EVENT.
 
 CRITICAL CONSTRAINTS:
-- \`description\`: Concise sentence under 15 words (max 20 words, e.g., "Operator mixes 5 mL FBS into 45 mL DMEM").
+- \`description\`: Concise sentence under 15 words in active voice using gerunds (max 20 words, e.g., "Pouring 5 mL FBS into 45 mL DMEM", "Mixing 5 mL FBS into 45 mL DMEM", or "Seeding A549 cells into 96-well plate"; use "Pouring..." or "Seeding..." rather than "Operator pours..." or "Operator seeds...").
 - \`startTime\` / \`endTime\` on actions: Single "MM:SS" string only (e.g., "00:01", "00:45"), paired with numeric \`startTimestampSeconds\` / \`endTimestampSeconds\` and \`confidenceScore\` (0.0–1.0).
 - Explicitly forbidden: NEVER output comma-separated lists of alternate timestamp formats (e.g., "00:01.000,00:01,1.0s,..."), repeating timestamp strings, or repeating phrase chains.
 
@@ -1765,15 +1766,16 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       targetLocation.coordinate = targetCoordinate;
     }
 
-    const description =
+    const rawDescription =
       raw.description ||
       (actionType === 'REAGENT_SEEDING_ACTION'
-        ? 'Operator seeds cells into 96-well plate'
+        ? 'Seeding cells into 96-well plate'
         : actionType === 'REAGENT_MIXING_ACTION'
-        ? 'Operator mixes reagents'
+        ? 'Mixing reagents'
         : `Operator performs ${actionType} at ${
             targetCoordinate || (boxRowId ? `${boxRowId}${boxColId || ''}` : 'target slot')
           }`);
+    const description = isArchiveAct ? toActiveVoiceDescription(rawDescription) : rawDescription;
 
     const cellLineName = raw.cellLineName || (raw.cellLineInfo?.name as string) || undefined;
     const inventoryId = raw.inventoryId || (classification.inventoryName || undefined);
@@ -6235,9 +6237,10 @@ Output a JSON object (or array of 1 Refinement object) with:
               stepNumber: idx + 1,
               actionType: 'MIX_REAGENTS',
               actionId: act.actionId,
-              description:
+              description: toActiveVoiceDescription(
                 act.description ||
-                `Mixed ${mixData.firstReagentAmount} of ${mixData.firstReagentName} with ${mixData.secondReagentAmount} of ${mixData.secondReagentName}.`,
+                  `Mixing ${mixData.firstReagentAmount} of ${mixData.firstReagentName} with ${mixData.secondReagentAmount} of ${mixData.secondReagentName}.`
+              ),
               startTime: typeof act.startTime === 'number' ? formatSecondsToTimeString(act.startTime) : act.startTime,
               endTime: typeof act.endTime === 'number' ? formatSecondsToTimeString(act.endTime) : act.endTime,
               mixReagentsData: mixData,
@@ -6375,9 +6378,10 @@ Output a JSON object (or array of 1 Refinement object) with:
               stepNumber: idx + 1,
               actionType: 'SEED_REAGENTS',
               actionId: act.actionId,
-              description:
+              description: toActiveVoiceDescription(
                 act.description ||
-                `Seeded ${seedData.cellsSeeded} (${seedData.cellsPerWell}) into ${seedData.plateType} using ${seedData.pipetteType} (${seedData.seedingEventsCount}/${seedData.expectedSeedingEventsCount} seeding events detected).`,
+                  `Seeding ${seedData.cellsSeeded} (${seedData.cellsPerWell}) into ${seedData.plateType} using ${seedData.pipetteType} (${seedData.seedingEventsCount}/${seedData.expectedSeedingEventsCount} seeding events detected).`
+              ),
               startTime: typeof act.startTime === 'number' ? formatSecondsToTimeString(act.startTime) : act.startTime,
               endTime: typeof act.endTime === 'number' ? formatSecondsToTimeString(act.endTime) : act.endTime,
               seedReagentsData: seedData,

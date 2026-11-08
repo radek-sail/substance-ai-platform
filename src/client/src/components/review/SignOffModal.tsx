@@ -498,7 +498,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
             type="button"
             onClick={onClose}
             disabled={isSubmitting}
-            className="text-slate-400 hover:text-white text-lg font-bold"
+            className="text-slate-400 hover:text-slate-100 text-lg font-bold"
           >
             ✕
           </button>

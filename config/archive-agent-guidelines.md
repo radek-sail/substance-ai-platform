@@ -26,8 +26,8 @@ Identify and segment EVERY experimental work step action across the entire video
 - **`ARCHIVE_IDENTIFICATION` Exclusion (Do NOT Repeat Pass 0 Identification Events in Pass 1)**:
   - The operator's opening announcement of the experiment/archive title, researcher/creator name, creation date, or create/append intent is an `ARCHIVE_IDENTIFICATION` event populated in **Pass 0**.
   - Once `ARCHIVE_IDENTIFICATION` is detected in Pass 0, it MUST NOT be repeated in Pass 1 `events`, and MUST NOT be misclassified as `VIAL_LABEL_PRESENTATION`, `REAGENT_LABEL_PRESENTATION_EVENT`, or `PROTOCOL_AUDIO_UTTERANCE_EVENT`.
-- **Concise Formatting (CRITICAL)**:
-  - Keep `description` concise and under 15 words (max 20 words, e.g., `"Operator mixes 5 mL FBS into 45 mL DMEM"` or `"Operator seeds HEK293T cells into 96-well plate"`).
+- **Concise Formatting & Active Voice (CRITICAL)**:
+  - Keep `description` concise and under 15 words in active voice using gerunds (max 20 words, e.g., `"Pouring 5 mL FBS into 45 mL DMEM"`, `"Mixing 5 mL FBS into 45 mL DMEM"`, or `"Seeding A549 cells into 96-well plate"` — use `"Pouring..."` or `"Seeding..."` rather than `"Operator pours..."` or `"Operator seeds..."`).
   - Format `startTime` and `endTime` on actions as a single `"MM:SS"` string (e.g., `"00:01"`, `"01:15"`), paired with numeric `startTimestampSeconds` and `endTimestampSeconds` and `confidenceScore` (0.0–1.0).
   - **Explicitly forbidden**: NEVER output comma-separated lists of alternate timestamp formats (e.g., `"00:01.000,00:01,1.0s,..."`), repeating timestamp strings, or repeating phrase chains.
 - **Distinction Between Vial Label Presentation and Reagent Label Presentation**:

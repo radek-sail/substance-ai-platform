@@ -3,7 +3,6 @@ import {
   BookOpen,
   FlaskConical,
   ListChecks,
-  FileText,
   User,
   Calendar,
   CheckCircle2,
@@ -18,6 +17,8 @@ import {
   Pipette,
   Grid,
   Beaker,
+  RotateCcw,
+  FileCheck2,
 } from 'lucide-react';
 import {
   generateReagentAcronym,
@@ -27,6 +28,7 @@ import {
   render96WellPlateMarkdown,
   areSameReagent,
   mergeReagentRecords,
+  toActiveVoiceDescription,
   type ArchiveRecord,
   type ArchiveReagent,
   type ArchiveWorkStep,
@@ -49,6 +51,9 @@ interface ExperimentArchiveProps {
   onSeekVideo?: (seconds: number) => void;
   signOffVersion?: number;
   activeAnalysis?: VideoAnalysisDoc | null;
+  isSignedOff?: boolean;
+  onUndoSignOff?: () => void;
+  onOpenSignOffModal?: () => void;
 }
 
 const formatTimestamp = (seconds: number): string => {
@@ -70,6 +75,9 @@ export const ExperimentArchive: React.FC<ExperimentArchiveProps> = ({
   onSeekVideo,
   signOffVersion,
   activeAnalysis,
+  isSignedOff,
+  onUndoSignOff,
+  onOpenSignOffModal,
 }) => {
   const activeTenant = tenant || DEFAULT_TENANT_CONFIG;
   const [archives, setArchives] = useState<ArchiveRecord[]>([]);
@@ -304,7 +312,12 @@ export const ExperimentArchive: React.FC<ExperimentArchiveProps> = ({
         creatorName: rawActiveArchive.creatorName || 'N/A',
         reagents: isErasedArchive ? [] : rawActiveArchive.reagents || [],
         labelTranscriptions: isErasedArchive ? [] : rawActiveArchive.labelTranscriptions || [],
-        workSteps: isErasedArchive ? [] : rawActiveArchive.workSteps || [],
+        workSteps: isErasedArchive
+          ? []
+          : (rawActiveArchive.workSteps || []).map((ws) => ({
+              ...ws,
+              description: ws.description ? toActiveVoiceDescription(ws.description) : ws.description,
+            })),
       }
     : null;
 
@@ -505,7 +518,7 @@ export const ExperimentArchive: React.FC<ExperimentArchiveProps> = ({
         actionType: 'MIX_REAGENTS',
         startTimeSeconds: 0,
         endTimeSeconds: 10,
-        description: 'Mix two reagents',
+        description: 'Mixing two reagents',
         mixReagentsData: {
           firstReagentName: 'N/A',
           firstReagentAmount: 'N/A',
@@ -524,7 +537,7 @@ export const ExperimentArchive: React.FC<ExperimentArchiveProps> = ({
         actionType: 'SEED_REAGENTS',
         startTimeSeconds: 10,
         endTimeSeconds: 30,
-        description: 'Seed cells into plate',
+        description: 'Seeding cells into plate',
         seedReagentsData: {
           plateType: '96-well plate',
           pipetteType: '8-channel pipette',
@@ -658,10 +671,6 @@ export const ExperimentArchive: React.FC<ExperimentArchiveProps> = ({
         lotNumber: normalizeNA(r.lotNumber),
       }));
 
-  const displayTranscriptions = isEditing
-    ? editLabelTranscriptions
-    : activeArchive?.labelTranscriptions || [];
-
   const displayWorkSteps = isEditing
     ? editWorkSteps
     : activeArchive?.workSteps || [];
@@ -725,6 +734,41 @@ export const ExperimentArchive: React.FC<ExperimentArchiveProps> = ({
               <div className="flex flex-wrap items-center gap-2">
                 {!isEditing ? (
                   <>
+                    {isSignedOff || Boolean((activeArchive as any)?.isSignedOff) ? (
+                      <div className="flex items-center gap-2">
+                        <div
+                          data-testid="archive-signed-off-badge"
+                          className="flex items-center gap-1.5 bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm shadow-emerald-950"
+                        >
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                          <span>Signed Off</span>
+                        </div>
+                        {onUndoSignOff && (
+                          <button
+                            type="button"
+                            onClick={onUndoSignOff}
+                            data-testid="ribbon-undo-signoff-btn"
+                            className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-slate-100 border border-slate-700 hover:border-slate-600 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors shadow-sm"
+                            title="Re-open experiment notes for editing and re-committing"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5 text-cyan-400" />
+                            <span>Undo Sign-Off</span>
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      onOpenSignOffModal && (
+                        <button
+                          type="button"
+                          onClick={onOpenSignOffModal}
+                          data-testid="archive-review-signoff-btn"
+                          className="flex items-center gap-2 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-400 hover:to-orange-500 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold shadow-md shadow-orange-500/20 active:scale-95 transition-all"
+                        >
+                          <FileCheck2 className="w-4 h-4" />
+                          <span>Review & Sign Off</span>
+                        </button>
+                      )
+                    )}
                     <button
                       type="button"
                       data-testid="erase-archive-notebook-btn"
@@ -1084,83 +1128,10 @@ export const ExperimentArchive: React.FC<ExperimentArchiveProps> = ({
                   </tbody>
                 </table>
               </div>
-
-              {/* Below the table: Transcription of the text read from the labels presented to the camera */}
-              <div
-                data-testid="label-transcriptions-box"
-                className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 space-y-2.5"
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <FileText className="w-4 h-4 text-cyan-400" />
-                    <h4 className="text-xs font-bold text-slate-200 font-mono uppercase tracking-wider">
-                      Transcription of Reagent Labels Presented to Camera
-                    </h4>
-                  </div>
-                  {isEditing && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setEditLabelTranscriptions((prev) => [...prev, ''])
-                      }
-                      className="text-[11px] font-mono text-cyan-400 hover:underline flex items-center gap-1"
-                    >
-                      <Plus className="w-3 h-3" />
-                      <span>Add Label Transcription</span>
-                    </button>
-                  )}
-                </div>
-
-                {displayTranscriptions.length === 0 ? (
-                  <p className="text-xs font-mono text-slate-500 italic">
-                    No label transcriptions extracted from camera presentations.
-                  </p>
-                ) : (
-                  <ul className="space-y-2">
-                    {displayTranscriptions.map((text, idx) => (
-                      <li
-                        key={idx}
-                        data-testid={`label-transcription-item-${idx}`}
-                        className="text-xs font-mono text-slate-300 bg-slate-950/80 border border-slate-800/80 rounded-lg p-2.5 flex items-start justify-between gap-2"
-                      >
-                        {isEditing ? (
-                          <>
-                            <input
-                              type="text"
-                              value={text}
-                              onChange={(e) =>
-                                setEditLabelTranscriptions((prev) =>
-                                  prev.map((item, i) =>
-                                    i === idx ? e.target.value : item
-                                  )
-                                )
-                              }
-                              className="flex-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-slate-200"
-                            />
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setEditLabelTranscriptions((prev) =>
-                                  prev.filter((_, i) => i !== idx)
-                                )
-                              }
-                              className="text-rose-400 hover:text-rose-300 p-1"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </>
-                        ) : (
-                          <span className="leading-relaxed">"{text}"</span>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
             </section>
 
             {/* ===================================================================== */}
-            {/* SECTION 3: Work Steps (Mix Reagents & Seed Reagents)                  */}
+            {/* SECTION 3: Procedure (Mix Reagents & Seed Reagents)                   */}
             {/* ===================================================================== */}
             <section
               data-testid="section-work-steps"
@@ -1173,7 +1144,7 @@ export const ExperimentArchive: React.FC<ExperimentArchiveProps> = ({
                   </span>
                   <ListChecks className="w-4 h-4 text-emerald-400" />
                   <h3 className="text-sm font-bold text-slate-100 font-mono">
-                    Work Steps
+                    Procedure
                   </h3>
                 </div>
 
@@ -1242,7 +1213,7 @@ export const ExperimentArchive: React.FC<ExperimentArchiveProps> = ({
                               </span>
                             )}
                             <span className="text-xs text-slate-300 font-mono">
-                              {step.description}
+                              {toActiveVoiceDescription(step.description)}
                             </span>
                           </div>
 

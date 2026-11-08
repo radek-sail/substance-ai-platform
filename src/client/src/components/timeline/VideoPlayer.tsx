@@ -338,7 +338,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                   className={`px-1.5 py-0.5 rounded ${
                     playbackSpeed === rate
                       ? 'bg-cyan-500/20 text-cyan-300 font-bold'
-                      : 'text-slate-400 hover:text-white'
+                      : 'text-slate-400 hover:text-slate-100'
                   }`}
                 >
                   {rate}x

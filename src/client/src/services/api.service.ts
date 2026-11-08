@@ -23,6 +23,7 @@ import {
   type CreateArchiveInput,
   render96WellPlateMarkdown,
   generateReagentAcronym,
+  toActiveVoiceDescription,
   DEFAULT_VIDEO_PASSES,
 } from '@sail/shared';
 import { auth } from '../firebase';
@@ -1721,7 +1722,10 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
       ? raw.passes.pass3.data.workSteps
       : [];
 
-  const workSteps: ArchiveWorkStep[] = [...rawWorkStepCandidates];
+  const workSteps: ArchiveWorkStep[] = rawWorkStepCandidates.map((ws: ArchiveWorkStep) => ({
+    ...ws,
+    description: ws.description ? toActiveVoiceDescription(ws.description) : ws.description,
+  }));
   if (workSteps.length === 0 && actions.length > 0) {
     actions.forEach((act: Record<string, any>, idx: number) => {
       const cls = String(act.actionType || act.actionClass || '').toUpperCase();
@@ -1798,15 +1802,16 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
         actionType: isSeed ? 'SEED_REAGENTS' : 'MIX_REAGENTS',
         startTimeSeconds,
         endTimeSeconds,
-        description:
+        description: toActiveVoiceDescription(
           act.description ||
-          (isSeed && seedReagentsData
-            ? `Seeded ${seedReagentsData.cellsSeeded} (${seedReagentsData.cellsPerWell}) into ${seedReagentsData.plateType}.`
-            : mixReagentsData
-            ? `Mixed ${mixReagentsData.firstReagentAmount} of ${mixReagentsData.firstReagentName} with ${mixReagentsData.secondReagentAmount} of ${mixReagentsData.secondReagentName}.`
-            : isSeed
-            ? 'Seed reagents into plate'
-            : 'Mix two reagents'),
+            (isSeed && seedReagentsData
+              ? `Seeding ${seedReagentsData.cellsSeeded} (${seedReagentsData.cellsPerWell}) into ${seedReagentsData.plateType}.`
+              : mixReagentsData
+              ? `Mixing ${mixReagentsData.firstReagentAmount} of ${mixReagentsData.firstReagentName} with ${mixReagentsData.secondReagentAmount} of ${mixReagentsData.secondReagentName}.`
+              : isSeed
+              ? 'Seeding reagents into plate'
+              : 'Mixing two reagents')
+        ),
         ...(mixReagentsData ? { mixReagentsData } : {}),
         ...(seedReagentsData ? { seedReagentsData } : {}),
         ...(raw.videoId ? { videoId: raw.videoId } : {}),

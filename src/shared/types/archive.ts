@@ -1475,7 +1475,6 @@ export function render96WellPlateMarkdown(
 
   const headerCols = PLATE_96_COLS.map((c) => String(c).padStart(3, ' ')).join('');
   const lines: string[] = [
-    '```text',
     '96-Well Plate Map (Rows A–H, Columns 1–12 Left to Right):',
     `    ${headerCols}`,
     `   +${'-'.repeat(PLATE_96_COLS.length * 3 + 1)}+`,
@@ -1494,8 +1493,163 @@ export function render96WellPlateMarkdown(
   lines.push(
     `Legend: ● = Seeded (${resolvedWells.length}/96 wells across ${resolvedCols.length}/12 columns) | ○ = Empty`
   );
-  lines.push('```');
   return lines.join('\n');
+}
+
+const OPERATOR_VERB_TO_GERUND: Record<string, string> = {
+  pour: 'Pouring',
+  pours: 'Pouring',
+  poured: 'Pouring',
+  pouring: 'Pouring',
+  seed: 'Seeding',
+  seeds: 'Seeding',
+  seeded: 'Seeding',
+  seeding: 'Seeding',
+  mix: 'Mixing',
+  mixes: 'Mixing',
+  mixed: 'Mixing',
+  mixing: 'Mixing',
+  dispense: 'Dispensing',
+  dispenses: 'Dispensing',
+  dispensed: 'Dispensing',
+  dispensing: 'Dispensing',
+  transfer: 'Transferring',
+  transfers: 'Transferring',
+  transferred: 'Transferring',
+  transferring: 'Transferring',
+  add: 'Adding',
+  adds: 'Adding',
+  added: 'Adding',
+  adding: 'Adding',
+  pipette: 'Pipetting',
+  pipettes: 'Pipetting',
+  pipetted: 'Pipetting',
+  pipetting: 'Pipetting',
+  prepare: 'Preparing',
+  prepares: 'Preparing',
+  prepared: 'Preparing',
+  preparing: 'Preparing',
+  dilute: 'Diluting',
+  dilutes: 'Diluting',
+  diluted: 'Diluting',
+  diluting: 'Diluting',
+  aspirate: 'Aspirating',
+  aspirates: 'Aspirating',
+  aspirated: 'Aspirating',
+  aspirating: 'Aspirating',
+  present: 'Presenting',
+  presents: 'Presenting',
+  presented: 'Presenting',
+  presenting: 'Presenting',
+  plate: 'Plating',
+  plates: 'Plating',
+  plated: 'Plating',
+  plating: 'Plating',
+  reconstitute: 'Reconstituting',
+  reconstitutes: 'Reconstituting',
+  reconstituted: 'Reconstituting',
+  reconstituting: 'Reconstituting',
+  invert: 'Inverting',
+  inverts: 'Inverting',
+  inverted: 'Inverting',
+  inverting: 'Inverting',
+  swirl: 'Swirling',
+  swirls: 'Swirling',
+  swirled: 'Swirling',
+  swirling: 'Swirling',
+  resuspend: 'Resuspending',
+  resuspends: 'Resuspending',
+  resuspended: 'Resuspending',
+  resuspending: 'Resuspending',
+  combine: 'Combining',
+  combines: 'Combining',
+  combined: 'Combining',
+  combining: 'Combining',
+  aliquot: 'Aliquoting',
+  aliquots: 'Aliquoting',
+  aliquoted: 'Aliquoting',
+  aliquoting: 'Aliquoting',
+  inoculate: 'Inoculating',
+  inoculates: 'Inoculating',
+  inoculated: 'Inoculating',
+  inoculating: 'Inoculating',
+  vortex: 'Vortexing',
+  vortexes: 'Vortexing',
+  vortexed: 'Vortexing',
+  vortexing: 'Vortexing',
+  perform: 'Performing',
+  performs: 'Performing',
+  performed: 'Performing',
+  performing: 'Performing',
+};
+
+function verbToGerund(verb: string): string {
+  const lower = verb.toLowerCase();
+  if (OPERATOR_VERB_TO_GERUND[lower]) {
+    return OPERATOR_VERB_TO_GERUND[lower];
+  }
+  if (lower.endsWith('ing')) {
+    return lower.charAt(0).toUpperCase() + lower.slice(1);
+  }
+  let stem = lower;
+  if (lower.endsWith('ies') && lower.length > 4) {
+    stem = lower.slice(0, -3) + 'y';
+  } else if (
+    lower.endsWith('xes') ||
+    lower.endsWith('ches') ||
+    lower.endsWith('shes') ||
+    lower.endsWith('sses') ||
+    lower.endsWith('zes')
+  ) {
+    stem = lower.slice(0, -2);
+  } else if (lower.endsWith('es') && lower.length > 3) {
+    const withoutS = lower.slice(0, -1);
+    if (withoutS.endsWith('e') && !withoutS.endsWith('ee')) {
+      stem = withoutS.slice(0, -1);
+    } else {
+      stem = withoutS;
+    }
+  } else if (lower.endsWith('s') && !lower.endsWith('ss') && lower.length > 2) {
+    stem = lower.slice(0, -1);
+  } else if (lower.endsWith('e') && !lower.endsWith('ee') && lower.length > 2) {
+    stem = lower.slice(0, -1);
+  }
+  const gerund = `${stem}ing`;
+  return gerund.charAt(0).toUpperCase() + gerund.slice(1);
+}
+
+/**
+ * Converts third-person / passive descriptions such as "Operator pours..." or "Operator seeds..."
+ * into active gerund phrasing such as "Pouring..." or "Seeding...".
+ */
+export function toActiveVoiceDescription(description?: string | null): string {
+  if (!description || typeof description !== 'string') return '';
+  const trimmed = description.trim();
+  if (!trimmed) return '';
+
+  // Match leading "(The )?operator (is |was )?<verb>\b"
+  const leadingOperatorMatch = trimmed.match(
+    /^(?:the\s+)?operator\s+(?:(?:is|was)\s+)?([a-zA-Z]+)\b(.*)$/i
+  );
+  if (leadingOperatorMatch) {
+    const gerund = verbToGerund(leadingOperatorMatch[1]);
+    return `${gerund}${leadingOperatorMatch[2]}`;
+  }
+
+  // Match leading bare/past verbs like "Pours ...", "Seeds ...", "Seeded ...", "Mixed ...", "Pour ...", "Seed ...", "Mix ..."
+  const leadingVerbMatch = trimmed.match(
+    /^(pours?|poured|seeds?|seeded|mix(?:es|ed)?|dispenses?|dispensed|transfers?|transferred|adds?|added|pipettes?|pipetted)\b(.*)$/i
+  );
+  if (leadingVerbMatch) {
+    const gerund = verbToGerund(leadingVerbMatch[1]);
+    return `${gerund}${leadingVerbMatch[2]}`;
+  }
+
+  // Also replace any mid-sentence "operator <verb>s" occurrences
+  return trimmed.replace(
+    /\b(?:the\s+)?operator\s+(?:(?:is|was)\s+)?(pours?|poured|seeds?|seeded|mix(?:es|ed)?|dispenses?|dispensed|transfers?|transferred|adds?|added|pipettes?|pipetted)\b/gi,
+    (_full, verb: string) => verbToGerund(verb).toLowerCase()
+  );
 }
 
 /**
