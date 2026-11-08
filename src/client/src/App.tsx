@@ -158,6 +158,8 @@ function deriveInventoryDataFromAnalysis(
 export const App: React.FC = () => {
   // Authentication state gated via Firebase Auth
   const [user, setUser] = useState<User | null>(auth.currentUser);
+  const [organizationId, setOrganizationId] = useState<string>('');
+  const [userRole, setUserRole] = useState<string>('user');
 
   // Theme state (Light Mode default, switches between 'light' and 'dark')
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme());
@@ -175,13 +177,41 @@ export const App: React.FC = () => {
   };
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser((prevUser) => {
         if (!prevUser && currentUser) {
           setActiveTab('videos');
         }
         return currentUser;
       });
+
+      if (currentUser) {
+        try {
+          const token = await currentUser.getIdToken();
+          const res = await fetch('/api/auth/me', {
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          });
+          if (res.ok) {
+            const profile = await res.json();
+            const resolvedOrgId = profile.organizationId || 'default-org';
+            setOrganizationId(resolvedOrgId);
+            setUserRole(profile.role || 'user');
+            setTenant((prev) => ({ ...prev, customerId: resolvedOrgId }));
+            apiService.setTenant({ customerId: resolvedOrgId });
+          } else {
+            setOrganizationId('default-org');
+          }
+        } catch (err) {
+          console.warn('[App] Could not fetch /api/auth/me profile:', err);
+          setOrganizationId('default-org');
+        }
+      } else {
+        setOrganizationId('');
+        setUserRole('user');
+      }
     });
     return () => unsubscribe();
   }, []);
@@ -701,15 +731,20 @@ export const App: React.FC = () => {
         }}
         videoTitle={activeVideoId}
         userEmail={user.email}
+        organizationId={organizationId}
+        userRole={userRole}
         onSignOut={handleSignOut}
         authControls={
-          <div className="flex items-center gap-2 pl-2 border-l border-slate-800">
-            <span className="text-xs font-mono text-slate-300 bg-slate-800/60 border border-slate-700/60 px-2.5 py-1.5 rounded-lg">
-              {user.email}
+          <div className="flex items-center gap-3 text-sm pl-2 border-l border-slate-800">
+            <span className="px-2.5 py-1 rounded bg-slate-800 border border-slate-700 text-slate-300">
+              Org: <strong className={theme === 'light' ? 'text-black' : 'text-white'}>{organizationId || 'Loading...'}</strong>
+            </span>
+            <span className="text-slate-400">
+              User: <strong className="text-slate-200">{user.email}</strong>
             </span>
             <button
               type="button"
-              onClick={handleSignOut}
+              onClick={() => signOut(auth)}
               className="flex items-center gap-1.5 bg-slate-800 hover:bg-rose-950/80 text-slate-300 hover:text-rose-200 border border-slate-700 hover:border-rose-500/50 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
             >
               <LogOut className="w-3.5 h-3.5" />

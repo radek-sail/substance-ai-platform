@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo } from 'react';
 import { Search, X } from 'lucide-react';
-import { BoxGridView, CellContentPanel, resolveGridSlotData } from './BoxGridView';
+import { BoxGridView } from './BoxGridView';
 import { type HumanEditedVialData } from './VialInspector';
 import { InventorySidebar } from './InventorySidebar';
 import { TowerOverview } from './TowerOverview';
@@ -573,33 +573,15 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
     return coords;
   }, [activeBox, normalizedSearch]);
 
-  const selectedSlot = useMemo(() => {
-    return resolveGridSlotData({
-      row: selectedCellCoord.row,
-      col: selectedCellCoord.col,
-      targetRow: selectedCellCoord.row,
-      targetCol: selectedCellCoord.col,
-      highlightedCoords,
-      searchMatchingCoords,
-      cells: activeBox?.cells,
-    });
-  }, [
-    selectedCellCoord.row,
-    selectedCellCoord.col,
-    highlightedCoords,
-    searchMatchingCoords,
-    activeBox?.cells,
-  ]);
-
   const handleSelectSlot = (row: string, col: number) => {
     setSelectedCellCoord({ row, col });
     onSelectGridSlot(row, col);
   };
 
   return (
-    <div className="flex flex-col lg:flex-row gap-6 items-start">
-      {/* 1. Left Inventory Sidebar & Creation Panel */}
-      <div className="w-full lg:w-72 shrink-0">
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+      {/* 1. Left Column (Half Width): Inventory Sidebar & Creation Panel */}
+      <div className="w-full">
         <InventorySidebar
           inventories={inventories}
           activeInventoryId={activeInventory?.id || null}
@@ -617,10 +599,10 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
         />
       </div>
 
-      {/* Main Multi-Inventory Content */}
-      <div className="flex-1 w-full grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+      {/* 2. Center Column (Half Width): Search Bar, Tower & Box Architecture + Cryo-Box Matrix */}
+      <div className="w-full space-y-6">
         {/* Top Search Bar: Search Vials by Cell Line Name */}
-        <div className="lg:col-span-12 bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="relative flex-1">
             <Search className="w-4 h-4 text-fuchsia-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
@@ -673,42 +655,30 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
           )}
         </div>
 
-        {/* Left Column: Tower & Box Architecture + Cryo-Box Matrix */}
-        <div className="lg:col-span-6 space-y-6">
-          <TowerOverview
-            inventory={activeInventory}
-            selectedBoxId={displayBoxId}
-            onSelectBox={handleSelectBox}
-            matchingBoxIds={matchingBoxIds}
-            matchingBoxCounts={matchingBoxCounts}
-            searchQuery={searchQuery}
-          />
+        <TowerOverview
+          inventory={activeInventory}
+          selectedBoxId={displayBoxId}
+          onSelectBox={handleSelectBox}
+          matchingBoxIds={matchingBoxIds}
+          matchingBoxCounts={matchingBoxCounts}
+          searchQuery={searchQuery}
+        />
 
-          <BoxGridView
-            rows={boxRows}
-            cols={boxCols}
-            boxId={displayBoxId}
-            inventoryId={activeInventory?.id}
-            cells={activeBox?.cells}
-            targetRow={selectedCellCoord.row}
-            targetCol={selectedCellCoord.col}
-            highlightedCoords={highlightedCoords}
-            searchMatchingCoords={searchMatchingCoords}
-            onSelectSlot={handleSelectSlot}
-            onUpdateCell={handleUpdateCell}
-            readOnly={false}
-          />
-        </div>
-
-        {/* Right Column: Selected Cryo-Box Cell Content Panel */}
-        <div className="lg:col-span-6 lg:sticky lg:top-24">
-          <CellContentPanel
-            boxId={displayBoxId}
-            slot={selectedSlot}
-            onUpdateCell={handleUpdateCell}
-            readOnly={false}
-          />
-        </div>
+        <BoxGridView
+          rows={boxRows}
+          cols={boxCols}
+          boxId={displayBoxId}
+          inventoryId={activeInventory?.id}
+          cells={activeBox?.cells}
+          targetRow={selectedCellCoord.row}
+          targetCol={selectedCellCoord.col}
+          highlightedCoords={highlightedCoords}
+          searchMatchingCoords={searchMatchingCoords}
+          onSelectSlot={handleSelectSlot}
+          onUpdateCell={handleUpdateCell}
+          readOnly={false}
+          showModalOnSelect={true}
+        />
       </div>
     </div>
   );

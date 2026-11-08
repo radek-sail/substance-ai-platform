@@ -51,6 +51,7 @@ export interface VideoRecord {
   analysisId?: string;
   organizationId?: string;
   uploadedBy?: string;
+  uploaderEmail?: string;
   uploadedAt: FirebaseFirestore.FieldValue | string;
   capturedAt?: FirebaseFirestore.FieldValue | string;
   transcodedAt?: FirebaseFirestore.FieldValue | string;
@@ -162,18 +163,36 @@ function createInMemoryCollectionFactory(dbId: string) {
   const makeCollection = (collectionPath: string): any => {
     const cleanCollectionPath = collectionPath.replace(/^\/+|\/+$/g, '');
 
-    const queryCollection = (orderField?: string, orderDir: 'asc' | 'desc' = 'desc') => {
+    type WhereFilter = { field: string; op: string; value: any };
+
+    const queryCollection = (
+      filters: WhereFilter[] = [],
+      orderField?: string,
+      orderDir: 'asc' | 'desc' = 'desc'
+    ) => {
       const prefix = `${cleanCollectionPath}/`;
       const docs: Array<{ id: string; exists: boolean; data: () => Record<string, any> }> = [];
       for (const [key, val] of store.entries()) {
         if (key.startsWith(prefix)) {
           const remainder = key.slice(prefix.length);
           if (!remainder.includes('/')) {
-            docs.push({
-              id: remainder,
-              exists: true,
-              data: () => ({ ...val }),
+            const matchesAll = filters.every((f) => {
+              const docVal =
+                f.field === 'organizationId' && val[f.field] === undefined
+                  ? 'default-org'
+                  : val[f.field];
+              if (f.op === '==') return docVal === f.value;
+              if (f.op === '!=') return docVal !== f.value;
+              if (f.op === 'in' && Array.isArray(f.value)) return f.value.includes(docVal);
+              return true;
             });
+            if (matchesAll) {
+              docs.push({
+                id: remainder,
+                exists: true,
+                data: () => ({ ...val }),
+              });
+            }
           }
         }
       }
@@ -193,13 +212,26 @@ function createInMemoryCollectionFactory(dbId: string) {
       };
     };
 
+    const makeQueryBuilder = (
+      filters: WhereFilter[] = [],
+      orderField?: string,
+      orderDir: 'asc' | 'desc' = 'asc'
+    ): any => ({
+      get: async () => queryCollection(filters, orderField, orderDir),
+      where: (field: string, op: string, value: any) =>
+        makeQueryBuilder([...filters, { field, op, value }], orderField, orderDir),
+      orderBy: (field: string, direction: 'asc' | 'desc' = 'asc') =>
+        makeQueryBuilder(filters, field, direction),
+    });
+
     return {
       id: cleanCollectionPath.split('/').pop() || cleanCollectionPath,
       path: cleanCollectionPath,
       get: async () => queryCollection(),
-      orderBy: (field: string, direction: 'asc' | 'desc' = 'asc') => ({
-        get: async () => queryCollection(field, direction),
-      }),
+      where: (field: string, op: string, value: any) =>
+        makeQueryBuilder([{ field, op, value }]),
+      orderBy: (field: string, direction: 'asc' | 'desc' = 'asc') =>
+        makeQueryBuilder([], field, direction),
       doc: (docId: string) => {
         const cleanDocId = String(docId).replace(/^\/+|\/+$/g, '');
         const fullDocPath = `${cleanCollectionPath}/${cleanDocId}`;
@@ -744,29 +776,36 @@ function formatVideoDocument(id: string, data: Record<string, any>): Record<stri
  * Falls back to `db.collection('videos').get()` and sorts in memory if `orderBy('uploadedAt', 'desc')`
  * fails due to missing indexes or mixed timestamp types.
  */
-export async function listVideos(databaseId: string = '(default)'): Promise<Array<Record<string, any>>> {
+export async function listVideos(
+  databaseId: string = '(default)',
+  organizationId?: string
+): Promise<Array<Record<string, any>>> {
   const dbId = normalizeDatabaseId(databaseId || '(default)');
   const db = getTenantFirestore(dbId);
-  const videosCollection = db.collection('videos') as any;
+  const baseCol = db.collection('videos') as any;
+  const videosQuery =
+    organizationId && baseCol && typeof baseCol.where === 'function'
+      ? baseCol.where('organizationId', '==', organizationId)
+      : baseCol;
 
   let snapshot: any = null;
-  if (videosCollection && typeof videosCollection.orderBy === 'function') {
+  if (videosQuery && typeof videosQuery.orderBy === 'function') {
     try {
-      snapshot = await videosCollection.orderBy('uploadedAt', 'desc').get();
+      snapshot = await videosQuery.orderBy('uploadedAt', 'desc').get();
     } catch (orderErr) {
       console.warn(
-        '[FirestoreService] orderBy("uploadedAt", "desc") failed, falling back to unfiltered get():',
+        '[FirestoreService] orderBy("uploadedAt", "desc") failed, falling back to where/unfiltered get():',
         orderErr
       );
       try {
-        snapshot = await videosCollection.get();
+        snapshot = await videosQuery.get();
       } catch (getErr) {
         console.warn('[FirestoreService] videos.get() failed, using in-memory registry fallback:', getErr);
       }
     }
-  } else if (videosCollection && typeof videosCollection.get === 'function') {
+  } else if (videosQuery && typeof videosQuery.get === 'function') {
     try {
-      snapshot = await videosCollection.get();
+      snapshot = await videosQuery.get();
     } catch (getErr) {
       console.warn('[FirestoreService] videos.get() failed, using in-memory registry fallback:', getErr);
     }
@@ -776,6 +815,9 @@ export async function listVideos(databaseId: string = '(default)'): Promise<Arra
 
   for (const docSnap of snapshot?.docs || []) {
     const rawData = typeof docSnap.data === 'function' ? docSnap.data() || {} : {};
+    if (organizationId && rawData.organizationId && rawData.organizationId !== organizationId) {
+      continue;
+    }
     const formatted = formatVideoDocument(docSnap.id, rawData);
     byId.set(formatted.videoId, formatted);
   }
@@ -786,6 +828,9 @@ export async function listVideos(databaseId: string = '(default)'): Promise<Arra
     if (key.startsWith('videos/')) {
       const id = key.slice('videos/'.length);
       if (!byId.has(id)) {
+        if (organizationId && rawData.organizationId && rawData.organizationId !== organizationId) {
+          continue;
+        }
         const formatted = formatVideoDocument(id, rawData);
         byId.set(formatted.videoId, formatted);
       }

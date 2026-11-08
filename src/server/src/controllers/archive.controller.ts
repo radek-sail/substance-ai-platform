@@ -12,7 +12,7 @@ const deletedArchiveDatabases = new Set<string>();
 /**
  * Builds the default demo experiment archive.
  */
-export function createDefaultDemoArchive(): ArchiveRecord {
+export function createDefaultDemoArchive(organizationId: string = 'default-org'): ArchiveRecord {
   const nowIso = new Date().toISOString();
   const defaultReagents = [
     {
@@ -85,9 +85,14 @@ export function createDefaultDemoArchive(): ArchiveRecord {
       },
     },
   ];
+  const demoId =
+    organizationId === 'default-org'
+      ? 'demo-archive-01'
+      : `demo-archive-01_${organizationId}`;
   return {
-    id: 'demo-archive-01',
+    id: demoId,
     name: 'Cell Seeding & Media Prep Protocol',
+    organizationId,
     creatorName: 'Dr. Sarah Chen',
     creationDate: '2026-10-15',
     reagents: defaultReagents,
@@ -102,24 +107,29 @@ export function createDefaultDemoArchive(): ArchiveRecord {
 
 /**
  * GET /api/archives
- * Fetches all experiment archive documents from Firestore `archives` collection.
+ * Fetches all experiment archive documents from Firestore `archives` collection scoped by `organizationId`.
  */
 export const listArchivesHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const organizationId = req.user?.organizationId || 'default-org';
   try {
     const rawDatabaseId = (req.headers['x-database-id'] || req.query?.databaseId) as string | undefined;
     const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
     const dbTarget = getTenantFirestore(databaseId);
-    const archivesRef = dbTarget.collection('archives');
+    const archivesRef = dbTarget.collection('archives') as any;
+    const scopedQuery =
+      archivesRef && typeof archivesRef.where === 'function'
+        ? archivesRef.where('organizationId', '==', organizationId)
+        : archivesRef;
 
     let snapshot: any;
     try {
-      snapshot = await archivesRef.get();
+      snapshot = await scopedQuery.get();
       if (!snapshot || snapshot.empty) {
-        snapshot = await archivesRef.orderBy('createdAt', 'desc').get();
+        snapshot = await scopedQuery.orderBy('createdAt', 'desc').get();
       }
     } catch {
       try {
-        snapshot = await archivesRef.orderBy('createdAt', 'desc').get();
+        snapshot = await scopedQuery.orderBy('createdAt', 'desc').get();
       } catch {
         snapshot = null;
       }
@@ -127,17 +137,61 @@ export const listArchivesHandler = async (req: Request, res: Response): Promise<
 
     if ((!snapshot || snapshot.empty) && db && db !== dbTarget) {
       try {
-        snapshot = await db.collection('archives').get();
+        const fallbackRef = db.collection('archives') as any;
+        const fallbackQuery =
+          fallbackRef && typeof fallbackRef.where === 'function'
+            ? fallbackRef.where('organizationId', '==', organizationId)
+            : fallbackRef;
+        snapshot = await fallbackQuery.get();
       } catch {
         // ignore fallback error
       }
     }
 
-    if (!snapshot || snapshot.empty) {
+    const docsById = new Map<string, any>();
+    if (snapshot && !snapshot.empty && Array.isArray(snapshot.docs)) {
+      for (const doc of snapshot.docs) {
+        docsById.set(doc.id, doc);
+      }
+    }
+
+    // Backfill and include legacy unscoped archives created for 'substance-ai' prior to organizationId scoping
+    if (organizationId === 'substance-ai' && archivesRef && typeof archivesRef.get === 'function') {
+      try {
+        const allSnap = await archivesRef.get();
+        if (allSnap && !allSnap.empty && Array.isArray(allSnap.docs)) {
+          for (const doc of allSnap.docs) {
+            const data = doc.data() || {};
+            const docOrg = data.organizationId;
+            if (!docOrg || docOrg === 'default-org' || docOrg === 'substance-ai') {
+              if (!docOrg || docOrg === 'default-org') {
+                try {
+                  await archivesRef.doc(doc.id).set({ ...data, organizationId: 'substance-ai' }, { merge: true });
+                } catch {
+                  // Ignore backfill write error
+                }
+              }
+              docsById.set(doc.id, {
+                id: doc.id,
+                data: () => ({ ...data, organizationId: 'substance-ai' }),
+              });
+            }
+          }
+        }
+      } catch {
+        // Ignore fallback scan error
+      }
+    }
+
+    if (docsById.has('demo-archive-01') && docsById.has('demo-archive-01_substance-ai')) {
+      docsById.delete('demo-archive-01_substance-ai');
+    }
+
+    if (docsById.size === 0) {
       if (deletedArchiveDatabases.has(databaseId) || deletedArchiveDatabases.has('(default)')) {
         return res.status(200).json({ archives: [] });
       }
-      const demoArchive = createDefaultDemoArchive();
+      const demoArchive = createDefaultDemoArchive(organizationId);
       try {
         await archivesRef.doc(demoArchive.id).set(demoArchive);
       } catch (saveErr) {
@@ -146,14 +200,15 @@ export const listArchivesHandler = async (req: Request, res: Response): Promise<
       return res.status(200).json({ archives: [demoArchive] });
     }
 
-    const archives: ArchiveRecord[] = snapshot.docs.map((doc: any) => {
+    const archives: ArchiveRecord[] = Array.from(docsById.values()).map((doc: any) => {
       const data = doc.data() || {};
-      const isDefaultDemo = doc.id === 'demo-archive-01';
+      const isDefaultDemo = doc.id === 'demo-archive-01' || doc.id.startsWith('demo-archive-01_');
       const isErased = Boolean(data.contentErased);
-      const demoFallback = isDefaultDemo && !isErased ? createDefaultDemoArchive() : null;
+      const demoFallback = isDefaultDemo && !isErased ? createDefaultDemoArchive(organizationId) : null;
       return {
         id: doc.id,
         name: data.name || doc.id,
+        ...(data.organizationId ? { organizationId: data.organizationId } : { organizationId }),
         creatorName: data.creatorName ?? null,
         creationDate: data.creationDate ?? null,
         reagents: Array.isArray(data.reagents)
@@ -198,6 +253,7 @@ export const listArchivesHandler = async (req: Request, res: Response): Promise<
  * Creates a new experiment archive (and optionally associates a video with it).
  */
 export const createArchiveHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const organizationId = req.user?.organizationId || 'default-org';
   try {
     const parseResult = CreateArchiveInputSchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -236,6 +292,7 @@ export const createArchiveHandler = async (req: Request, res: Response): Promise
     const archiveRecord: ArchiveRecord = {
       id: archiveId,
       name: trimmedName,
+      organizationId,
       creatorName: normalizedCreator,
       creationDate: normalizedDate,
       reagents: Array.isArray(reagents) ? reagents : [],

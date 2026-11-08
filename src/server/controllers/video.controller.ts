@@ -247,10 +247,9 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
     const durationSeconds =
       parsedDuration !== undefined && Number.isFinite(parsedDuration) ? parsedDuration : undefined;
 
-    const uploadedBy =
-      (req.headers['x-operator-initials'] as string) ||
-      req.body?.uploadedBy ||
-      'RS';
+    const organizationId = req.user?.organizationId || 'substance-ai';
+    const uploadedBy = req.user?.uid || 'anonymous';
+    const uploaderEmail = req.user?.email || '';
 
     // 5. Save the Firestore record in videos/{videoId} only AFTER the file is confirmed in GCS
     const newVideoRecord: VideoRecord & VideoMetadata & { bucketName?: string } = {
@@ -273,10 +272,11 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
       updatedAt: nowIso,
       transcodedAt: nowIso,
       passes: defaultPasses,
-      organizationId: customerId,
+      organizationId,
       customerId,
       databaseId,
       uploadedBy,
+      uploaderEmail,
     };
 
     firestoreService.mirrorVideoToMemory(databaseId, videoId, newVideoRecord);
@@ -313,8 +313,9 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
       uploadedAt: nowIso,
       transcodedAt: nowIso,
       passes: defaultPasses,
-      organizationId: customerId,
+      organizationId,
       uploadedBy,
+      uploaderEmail,
       customerId,
       databaseId,
       metadata: responseMetadata,
@@ -434,6 +435,9 @@ export const requestUploadUrlHandler = async (req: Request, res: Response): Prom
       return res.status(400).json({ error: 'Missing required field: filename' });
     }
 
+    const organizationId = req.user?.organizationId || 'substance-ai';
+    const uploadedBy = req.user?.uid || 'anonymous';
+    const uploaderEmail = req.user?.email || '';
     const videoId = `vid_${Date.now()}`;
     const bucket = storage.bucket(process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod');
     const rawPath = `raw/${videoId}/${filename}`;
@@ -450,6 +454,9 @@ export const requestUploadUrlHandler = async (req: Request, res: Response): Prom
       videoId,
       signedUrl,
       rawGcsUri: `gs://${bucket.name}/${rawPath}`,
+      organizationId,
+      uploadedBy,
+      uploaderEmail,
     });
   } catch (err: any) {
     console.error('[VideoController] Error generating signed upload URL:', err);
@@ -477,11 +484,17 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
     });
   }
 
+  const organizationId = req.user?.organizationId || 'substance-ai';
+  const uploadedBy = req.user?.uid || 'anonymous';
+  const uploaderEmail = req.user?.email || '';
   const uploadedAt = new Date().toISOString();
   const initialRecord = {
     videoId,
     originalName,
     rawGcsUri,
+    organizationId,
+    uploadedBy,
+    uploaderEmail,
     status: 'TRANSCODING' as const,
     totalChunks: 0,
     chunks: [],
@@ -665,6 +678,9 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         chunks: chunks,
         transcodedAt,
         normalizedGcsUri,
+        organizationId,
+        uploadedBy,
+        uploaderEmail,
       });
       firestoreService.mirrorVideoToMemory('(default)', videoId, {
         status: 'READY_FOR_ANALYSIS',
@@ -672,6 +688,9 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         chunks: chunks,
         transcodedAt,
         normalizedGcsUri,
+        organizationId,
+        uploadedBy,
+        uploaderEmail,
       });
       console.log(`[Transcode] Video ${videoId} successfully marked READY_FOR_ANALYSIS`);
     } catch (err: any) {

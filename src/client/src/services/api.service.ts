@@ -480,6 +480,30 @@ export class ApiService {
   }
 
   /**
+   * GET authenticated user profile and tenant organization context from `/api/auth/me`.
+   */
+  public async fetchCurrentUserProfile(): Promise<{
+    uid: string;
+    email: string;
+    role: string;
+    organizationId: string;
+  } | null> {
+    try {
+      const headers = await this.getHeaders();
+      const response = await fetch(`${this.baseUrl}/api/auth/me`, {
+        method: 'GET',
+        headers,
+      });
+      if (response.ok) {
+        return await response.json();
+      }
+    } catch (err) {
+      console.warn('[ApiService] Failed to fetch user profile from /api/auth/me:', err);
+    }
+    return null;
+  }
+
+  /**
    * GET all uploaded/transcoded videos from `/api/videos` ordered by `uploadedAt desc`.
    */
   public async fetchVideos(options?: { customerId?: string; databaseId?: string }): Promise<VideoRecord[]> {

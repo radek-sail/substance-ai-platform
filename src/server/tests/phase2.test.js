@@ -547,6 +547,86 @@ describe('Phase 2: Multi-Tenant Data & Media Engine', () => {
         if (fs.existsSync(thumbFile)) fs.unlinkSync(thumbFile);
       }
     });
+
+    it('should backfill legacy videos missing organizationId via POST /api/admin/backfill-videos', async () => {
+      const firestoreService = require('../dist/services/firestore.service');
+      const legacyId = `vid_legacy_${Date.now()}`;
+      await firestoreService.saveVideoMetadata('(default)', legacyId, {
+        videoId: legacyId,
+        originalName: 'legacy_unscoped_video.mp4',
+        rawGcsUri: `gs://sail-platform-videos-prod/uploads/${legacyId}.mp4`,
+        normalizedGcsUri: `gs://sail-platform-videos-prod/normalized/norm_${legacyId}.mp4`,
+        status: 'READY_FOR_ANALYSIS',
+        uploadedAt: new Date().toISOString(),
+      });
+
+      const server = app.listen(0);
+      const port = server.address().port;
+
+      try {
+        const backfillRes = await fetch(`http://127.0.0.1:${port}/api/admin/backfill-videos`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-organization-id': 'substance-ai',
+          },
+          body: JSON.stringify({}),
+        });
+        assert.strictEqual(backfillRes.status, 200);
+        const backfillJson = await backfillRes.json();
+        assert.strictEqual(backfillJson.success, true);
+        assert.ok(backfillJson.updatedCount >= 1);
+
+        const listRes = await fetch(`http://127.0.0.1:${port}/api/videos`, {
+          headers: {
+            'x-organization-id': 'substance-ai',
+          },
+        });
+        assert.strictEqual(listRes.status, 200);
+        const listJson = await listRes.json();
+        const backfilledDoc = listJson.videos.find((v) => v.videoId === legacyId);
+        assert.ok(backfilledDoc, 'Backfilled legacy video must be visible under substance-ai org');
+        assert.strictEqual(backfilledDoc.organizationId, 'substance-ai');
+        assert.strictEqual(backfilledDoc.uploadedBy, 'legacy-system');
+        assert.strictEqual(backfilledDoc.uploaderEmail, 'admin@substance-ai.com');
+      } finally {
+        server.close();
+      }
+    });
+
+    it('should include and backfill legacy unscoped inventories (e.g. smurf) for substance-ai on GET /api/inventories', async () => {
+      const firestoreService = require('../dist/services/firestore.service');
+      const smurfId = `inv_smurf_${Date.now()}`;
+      await firestoreService.db.collection('inventories').doc(smurfId).set({
+        id: smurfId,
+        name: 'smurf',
+        towersCount: 1,
+        boxesPerTower: 2,
+        rowsPerBox: 9,
+        colsPerBox: 9,
+        createdAt: new Date().toISOString(),
+        boxes: {},
+      });
+
+      const server = app.listen(0);
+      const port = server.address().port;
+
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/inventories`, {
+          headers: {
+            'x-organization-id': 'substance-ai',
+          },
+        });
+        assert.strictEqual(res.status, 200);
+        const data = await res.json();
+        assert.ok(Array.isArray(data.inventories));
+        const smurfInv = data.inventories.find((inv) => inv.id === smurfId || inv.name === 'smurf');
+        assert.ok(smurfInv, 'smurf inventory must be returned for substance-ai organization');
+        assert.strictEqual(smurfInv.organizationId, 'substance-ai');
+      } finally {
+        server.close();
+      }
+    });
   });
 });
 

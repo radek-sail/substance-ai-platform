@@ -40,6 +40,7 @@ export type InventoryBox = z.infer<typeof InventoryBoxSchema>;
 export const InventoryRecordSchema = z.object({
   id: z.string(),
   name: z.string(),
+  organizationId: z.string().optional(),
   towersCount: z.number(),
   boxesPerTower: z.number(),
   rowsPerBox: z.number(),

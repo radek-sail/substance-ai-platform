@@ -44,37 +44,13 @@ export const TowerOverview: React.FC<TowerOverviewProps> = ({
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col gap-4 select-none">
       {/* Overview Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-800 pb-3 gap-2">
-        <div className="flex items-center gap-2">
-          <div className="p-1.5 rounded-lg bg-cyan-950 border border-cyan-800 text-cyan-400 shrink-0">
-            <Server className="w-4 h-4" />
-          </div>
-          <div>
-            <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2 font-mono">
-              <span>RACK & TOWER OVERVIEW</span>
-              <span className="text-[11px] font-normal text-cyan-400">
-                [{inventory.name}]
-              </span>
-            </h3>
-            <p className="text-[11px] text-slate-400">
-              Interactive rack layout: Select a box tile to inspect and edit its grid matrix below
-            </p>
-          </div>
+      <div className="flex items-center gap-2 border-b border-slate-800 pb-3">
+        <div className="p-1.5 rounded-lg bg-cyan-950 border border-cyan-800 text-cyan-400 shrink-0">
+          <Server className="w-4 h-4" />
         </div>
-
-        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
-          {hasActiveSearch && (
-            <span className="inline-flex items-center gap-1.5 bg-fuchsia-950/80 px-2.5 py-1 rounded-lg border border-fuchsia-500/40 text-fuchsia-300">
-              <span className="w-2.5 h-2.5 rounded-sm bg-fuchsia-500/40 border border-fuchsia-400 inline-block" />
-              Search Match ({matchingBoxIds.length}{' '}
-              {matchingBoxIds.length === 1 ? 'box' : 'boxes'})
-            </span>
-          )}
-          <span className="bg-slate-950 px-2.5 py-1 rounded-lg border border-slate-800 text-slate-400">
-            Selected Box:{' '}
-            <strong className="text-cyan-300 font-bold ml-1">{selectedBoxId || 'None'}</strong>
-          </span>
-        </div>
+        <h3 className="text-sm font-bold text-slate-100 font-mono">
+          RACK &amp; TOWER OVERVIEW
+        </h3>
       </div>
 
       {/* Horizontal Towers Rack Visualization */}

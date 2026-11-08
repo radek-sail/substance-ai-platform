@@ -27,6 +27,7 @@ import {
   reconcileVideoInventoryAssociation,
   reconcileVideoArchiveAssociation,
 } from './pipeline.controller';
+import { backfillLegacyVideos } from './admin.controller';
 import * as firestoreService from '../services/firestore.service';
 import {
   db,
@@ -314,10 +315,9 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
     const probedMeta = await probeVideoMetadata(inputLocalPath);
     const capturedAt = probedMeta.capturedAt || req.body?.capturedAt;
 
-    const uploadedBy =
-      (req.headers['x-operator-initials'] as string) ||
-      req.body?.uploadedBy ||
-      'RS';
+    const organizationId = req.user?.organizationId || 'substance-ai';
+    const uploadedBy = req.user?.uid || 'anonymous';
+    const uploaderEmail = req.user?.email || '';
 
     // 5. Save the Firestore record in videos/{videoId} only AFTER the file is confirmed in GCS
     const newVideoRecord: VideoRecord & VideoMetadata & { bucketName?: string } = {
@@ -342,10 +342,11 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
       updatedAt: nowIso,
       transcodedAt: nowIso,
       passes: defaultPasses,
-      organizationId: customerId,
+      organizationId,
       customerId,
       databaseId,
       uploadedBy,
+      uploaderEmail,
     };
 
     firestoreService.mirrorVideoToMemory(databaseId, videoId, newVideoRecord);
@@ -383,8 +384,9 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
       uploadedAt: nowIso,
       transcodedAt: nowIso,
       passes: defaultPasses,
-      organizationId: customerId,
+      organizationId,
       uploadedBy,
+      uploaderEmail,
       customerId,
       databaseId,
       metadata: responseMetadata,
@@ -420,23 +422,37 @@ export async function uploadVideoHandler(req: Request, res: Response): Promise<R
 /**
  * Controller for GET /api/videos
  * Targets the default Firestore database `(default)` using `admin.firestore()`.
- * Fetches documents safely with a fallback to unordered `.get()` and in-memory sorting if `orderBy` fails.
+ * Scopes queries by `organizationId == req.user.organizationId` with a fallback to unordered `.get()`
+ * and in-memory sorting if `orderBy` fails due to composite index constraints.
  */
 export const listVideosHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const organizationId = req.user?.organizationId || 'default-org';
   try {
+    if (organizationId === 'substance-ai' && process.env.NODE_ENV !== 'test') {
+      await backfillLegacyVideos('substance-ai').catch((err) => {
+        console.warn('[VideoController] Non-fatal lazy backfill warning:', err);
+      });
+    }
+
+    const videosCol = db.collection('videos') as any;
+    const scopedQuery =
+      videosCol && typeof videosCol.where === 'function'
+        ? videosCol.where('organizationId', '==', organizationId)
+        : videosCol;
+
     let snapshot;
     try {
       // Try ordered retrieval first
-      snapshot = await db.collection('videos').orderBy('uploadedAt', 'desc').get();
+      snapshot = await scopedQuery.orderBy('uploadedAt', 'desc').get();
       if (snapshot.empty) {
-        snapshot = await db.collection('videos').get();
+        snapshot = await scopedQuery.get();
       }
     } catch (orderErr) {
       console.warn('[VideoController] orderBy failed, falling back to unordered get:', orderErr);
-      snapshot = await db.collection('videos').get();
+      snapshot = await scopedQuery.get();
     }
 
-    const videos = snapshot.docs.map((doc) => {
+    const videos = snapshot.docs.map((doc: any) => {
       const d = doc.data();
       let uploadedAtStr = new Date().toISOString();
       const rawUploadedAt = d.uploadedAt || d.createdAt || d.updatedAt;
@@ -463,9 +479,13 @@ export const listVideosHandler = async (req: Request, res: Response): Promise<Re
       };
     });
 
-    // Merge any in-memory mirrored video records for immediate read-after-write consistency
+    // Merge any in-memory mirrored video records for immediate read-after-write consistency (scoped by organizationId)
     for (const memVideo of firestoreService.getInMemoryVideos('(default)')) {
-      if (!videos.some((v) => v.videoId === memVideo.videoId)) {
+      const memOrgId = memVideo.organizationId || 'default-org';
+      if (memOrgId !== organizationId) {
+        continue;
+      }
+      if (!videos.some((v: any) => v.videoId === memVideo.videoId)) {
         videos.push({
           passes: DEFAULT_VIDEO_PASSES,
           ...memVideo,
@@ -633,14 +653,18 @@ export const listVideosHandler = async (req: Request, res: Response): Promise<Re
     }
 
     // In-memory sort by timestamp descending
-    videos.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+    videos.sort(
+      (a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
+    );
 
     console.log(`[VideoController] Found ${videos.length} videos in Firestore registry`);
     // Return both formats so any frontend structure succeeds
     return res.status(200).json({ videos, count: videos.length });
   } catch (err: any) {
     console.error('[VideoController] Error fetching videos:', err);
-    const fallbackVideos = firestoreService.getInMemoryVideos('(default)');
+    const fallbackVideos = firestoreService
+      .getInMemoryVideos('(default)')
+      .filter((v) => (v.organizationId || 'default-org') === organizationId);
     if (fallbackVideos.length > 0) {
       fallbackVideos.sort(
         (a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
@@ -666,6 +690,9 @@ export const requestUploadUrlHandler = async (req: Request, res: Response): Prom
       return res.status(400).json({ error: 'Missing required field: filename' });
     }
 
+    const organizationId = req.user?.organizationId || 'substance-ai';
+    const uploadedBy = req.user?.uid || 'anonymous';
+    const uploaderEmail = req.user?.email || '';
     const videoId = `vid_${Date.now()}`;
     const bucket = storage.bucket(process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod');
     const rawPath = `raw/${videoId}/${filename}`;
@@ -682,6 +709,9 @@ export const requestUploadUrlHandler = async (req: Request, res: Response): Prom
       videoId,
       signedUrl,
       rawGcsUri: `gs://${bucket.name}/${rawPath}`,
+      organizationId,
+      uploadedBy,
+      uploaderEmail,
     });
   } catch (err: any) {
     console.error('[VideoController] Error generating signed upload URL:', err);
@@ -709,11 +739,17 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
     });
   }
 
+  const organizationId = req.user?.organizationId || 'substance-ai';
+  const uploadedBy = req.user?.uid || 'anonymous';
+  const uploaderEmail = req.user?.email || '';
   const uploadedAt = new Date().toISOString();
   const initialRecord: Record<string, any> = {
     videoId,
     originalName,
     rawGcsUri,
+    organizationId,
+    uploadedBy,
+    uploaderEmail,
     status: 'TRANSCODING' as const,
     totalChunks: 0,
     chunks: [],
@@ -967,6 +1003,9 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         chunks: chunks,
         transcodedAt,
         normalizedGcsUri,
+        organizationId,
+        uploadedBy,
+        uploaderEmail,
         ...(thumbnailGcsUri ? { thumbnailGcsUri } : {}),
       });
       firestoreService.mirrorVideoToMemory('(default)', videoId, {
@@ -975,6 +1014,9 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         chunks: chunks,
         transcodedAt,
         normalizedGcsUri,
+        organizationId,
+        uploadedBy,
+        uploaderEmail,
         ...(thumbnailGcsUri ? { thumbnailGcsUri } : {}),
       });
       if (probedMeta.capturedAt || probedMeta.durationSeconds !== undefined) {

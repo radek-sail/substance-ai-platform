@@ -27,6 +27,8 @@ interface RibbonNavProps {
   onUndoSignOff?: () => void;
   videoTitle?: string;
   userEmail?: string | null;
+  organizationId?: string;
+  userRole?: string;
   onSignOut?: () => void;
   authControls?: React.ReactNode;
   theme?: ThemeMode;
@@ -39,6 +41,7 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
   tenant,
   onUpdateTenant,
   userEmail,
+  organizationId,
   onSignOut,
   authControls,
   theme: propTheme,
@@ -74,18 +77,8 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
                   <Sparkles className="w-5 h-5 text-cyan-400 animate-pulse" />
                 </div>
               </div>
-              <div>
-                <div className="flex items-center gap-1.5">
-                  <span className="font-bold text-lg tracking-wider bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 via-indigo-300 to-emerald-400 font-mono">
-                    SAIL
-                  </span>
-                  <span className="text-xs uppercase tracking-widest text-slate-500 font-semibold">
-                    v1.0 HITL
-                  </span>
-                </div>
-                <div className="text-[11px] text-slate-400 hidden sm:block">
-                  Substance AI Lab Automation
-                </div>
+              <div className="text-sm font-bold leading-tight text-slate-100 max-w-[115px]">
+                Substance AI Lab Automation
               </div>
             </div>
 
@@ -173,10 +166,13 @@ export const RibbonNav: React.FC<RibbonNavProps> = ({
               {authControls ? (
                 authControls
               ) : (userEmail || onSignOut) ? (
-                <div className="flex items-center gap-2 pl-2 border-l border-slate-800">
+                <div className="flex items-center gap-3 text-sm pl-2 border-l border-slate-800">
+                  <span className="px-2.5 py-1 rounded bg-slate-800 border border-slate-700 text-slate-300">
+                    Org: <strong className={activeTheme === 'light' ? 'text-black' : 'text-white'}>{organizationId || 'Loading...'}</strong>
+                  </span>
                   {userEmail && (
-                    <span className="text-xs font-mono text-slate-300 bg-slate-800/60 border border-slate-700/60 px-2.5 py-1.5 rounded-lg">
-                      {userEmail}
+                    <span className="text-slate-400">
+                      User: <strong className="text-slate-200">{userEmail}</strong>
                     </span>
                   )}
                   {onSignOut && (

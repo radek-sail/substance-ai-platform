@@ -618,61 +618,20 @@ export const BoxGridView: React.FC<BoxGridViewProps> = ({
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col gap-4 select-none relative">
       {/* Box Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-800 pb-3 gap-2">
-        <div className="flex items-center gap-2">
-          <div className="p-1.5 rounded-lg bg-cyan-950 border border-cyan-800 text-cyan-400 shrink-0">
-            <Layers className="w-4 h-4" />
-          </div>
-          <div>
-            <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2 font-mono">
-              <span>CRYO-BOX MATRIX: {boxId}</span>
-              <span className="text-[11px] font-normal text-slate-400">
-                ({rows}x{cols} · {rows * cols} slots)
-              </span>
-            </h3>
-            <p className="text-[11px] text-slate-400 flex flex-wrap items-center gap-2">
-              <span>Top-left origin: Rows (A–{rowIndexToLetter(rows - 1)}) × Columns (1–{cols})</span>
-            </p>
-          </div>
+      <div className="flex items-center gap-2 border-b border-slate-800 pb-3">
+        <div className="p-1.5 rounded-lg bg-cyan-950 border border-cyan-800 text-cyan-400 shrink-0">
+          <Layers className="w-4 h-4" />
         </div>
-
-        {/* Legend */}
-        <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono">
-          <div className="flex items-center gap-1.5">
-            <span className="w-3 h-3 rounded bg-fuchsia-500/30 border-2 border-fuchsia-400 shadow-sm shadow-fuchsia-400/50" />
-            <span className="text-fuchsia-300">Search Match</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span className="w-3 h-3 rounded bg-emerald-500/30 border-2 border-emerald-400 shadow-sm shadow-emerald-400/50" />
-            <span className="text-emerald-300">Inserted Vial</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span className="w-3 h-3 rounded bg-cyan-500/20 border-2 border-cyan-400 animate-pulse shadow-sm shadow-cyan-400" />
-            <span className="text-cyan-300">Selected ({targetRow}{targetCol})</span>
-          </div>
-          {differencedRow && differencedCol !== undefined && (
-            <div className="flex items-center gap-1.5">
-              <span className="w-3 h-3 rounded bg-amber-500/30 border border-amber-400" />
-              <span className="text-amber-300">Diff Change</span>
-            </div>
-          )}
-        </div>
+        <h3 className="text-sm font-bold text-slate-100 font-mono">
+          CRYO-BOX MATRIX
+        </h3>
       </div>
 
       {/* Grid Container with 1:1 Aligned Columns via Matching CSS Grid */}
       <div className="overflow-x-auto flex justify-center py-2">
         <div className="inline-block bg-slate-950 p-4 rounded-xl border border-slate-800 shadow-inner relative">
-          {/* Physical Black Painted Corner Indicator in Top-Left */}
-          <div
-            className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black border border-slate-600 text-[9px] font-mono text-slate-300 flex items-center gap-1 shadow"
-            title="Origin of the cryo-box is in the top-left corner painted black (Row A, Col 1)"
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            <span>A1 Origin (Top-Left Black Corner)</span>
-          </div>
-
           {/* Top Column Labels: Uses exact matching grid with row header offset */}
-          <div className="flex items-center gap-1.5 mb-2 mt-2">
+          <div className="flex items-center gap-1.5 mb-2">
             {/* Matching Row Label Offset spacer */}
             <div className="w-7 shrink-0 text-center" />
 
@@ -834,10 +793,13 @@ export const BoxGridView: React.FC<BoxGridViewProps> = ({
         )}
       </div>
 
-      {/* Optional Modal Fallback when showModalOnSelect is explicitly true */}
+      {/* Pop-up Modal when showModalOnSelect is enabled */}
       {showModalOnSelect && inspectedCell && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
-          <div className="w-full max-w-lg">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150"
+          onClick={() => setInspectedCoord(null)}
+        >
+          <div className="w-full max-w-lg" onClick={(e) => e.stopPropagation()}>
             <CellContentPanel
               boxId={boxId}
               slot={inspectedCell}

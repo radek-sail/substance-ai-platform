@@ -57,7 +57,7 @@ export function generateInventoryBoxes(
 /**
  * Builds the default 9x9 demo inventory.
  */
-export function createDefaultDemoInventory(): InventoryRecord {
+export function createDefaultDemoInventory(organizationId: string = 'default-org'): InventoryRecord {
   const towersCount = 3;
   const boxesPerTower = 5;
   const rowsPerBox = 9;
@@ -96,9 +96,15 @@ export function createDefaultDemoInventory(): InventoryRecord {
     }
   }
 
+  const demoId =
+    organizationId === 'default-org'
+      ? 'demo-inventory-01'
+      : `demo-inventory-01_${organizationId}`;
+
   return {
-    id: 'demo-inventory-01',
+    id: demoId,
     name: 'Primary Cryo Tank (BioBank Alpha)',
+    organizationId,
     towersCount,
     boxesPerTower,
     rowsPerBox,
@@ -110,25 +116,80 @@ export function createDefaultDemoInventory(): InventoryRecord {
 
 /**
  * GET /api/inventories
- * Fetches all inventory documents from Firestore `inventories` collection on `admin.firestore()`.
- * If empty, creates and returns the default 9x9 demo inventory.
+ * Fetches all inventory documents from Firestore `inventories` collection on `admin.firestore()`
+ * scoped strictly to `where('organizationId', '==', req.user.organizationId)`.
+ * If empty, creates and returns the default 9x9 demo inventory for that organization.
  */
-export const listInventoriesHandler = async (_req: Request, res: Response): Promise<Response | void> => {
+export const listInventoriesHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const organizationId = req.user?.organizationId || 'default-org';
   try {
-    const inventoriesRef = db.collection('inventories');
+    const inventoriesRef = db.collection('inventories') as any;
+    const scopedQuery =
+      inventoriesRef && typeof inventoriesRef.where === 'function'
+        ? inventoriesRef.where('organizationId', '==', organizationId)
+        : inventoriesRef;
+
     let snapshot;
     try {
-      snapshot = await inventoriesRef.orderBy('createdAt', 'desc').get();
+      snapshot = await scopedQuery.orderBy('createdAt', 'desc').get();
       if (!snapshot || snapshot.empty) {
-        snapshot = await inventoriesRef.get();
+        snapshot = await scopedQuery.get();
       }
     } catch {
-      snapshot = await inventoriesRef.get();
+      snapshot = await scopedQuery.get();
     }
 
-    if (!snapshot || snapshot.empty) {
+    const byId = new Map<string, InventoryRecord>();
+    if (snapshot && !snapshot.empty && Array.isArray(snapshot.docs)) {
+      for (const doc of snapshot.docs) {
+        const data = doc.data() || {};
+        byId.set(doc.id, {
+          id: doc.id,
+          ...data,
+          organizationId: data.organizationId || organizationId,
+        });
+      }
+    }
+
+    // Backfill and include legacy unscoped inventories (e.g. 'smurf') created for 'substance-ai'
+    // prior to organizationId scoping
+    if (organizationId === 'substance-ai' && inventoriesRef && typeof inventoriesRef.get === 'function') {
+      try {
+        const allSnap = await inventoriesRef.get();
+        if (allSnap && !allSnap.empty && Array.isArray(allSnap.docs)) {
+          for (const doc of allSnap.docs) {
+            const data = doc.data() || {};
+            const docOrg = data.organizationId;
+            if (!docOrg || docOrg === 'default-org' || docOrg === 'substance-ai') {
+              const updatedRecord: InventoryRecord = {
+                id: doc.id,
+                ...data,
+                organizationId: 'substance-ai',
+              };
+              if (!docOrg || docOrg === 'default-org') {
+                try {
+                  await inventoriesRef.doc(doc.id).set(updatedRecord, { merge: true });
+                } catch {
+                  // Ignore backfill write error
+                }
+              }
+              byId.set(doc.id, updatedRecord);
+            }
+          }
+        }
+      } catch {
+        // Ignore fallback scan error
+      }
+    }
+
+    // Deduplicate redundant auto-created demo inventory if both demo-inventory-01 and demo-inventory-01_substance-ai exist
+    if (byId.has('demo-inventory-01') && byId.has('demo-inventory-01_substance-ai')) {
+      byId.delete('demo-inventory-01_substance-ai');
+    }
+
+    if (byId.size === 0) {
       // Create and persist the default demo inventory for instant onboarding
-      const demoInventory = createDefaultDemoInventory();
+      const demoInventory = createDefaultDemoInventory(organizationId);
       try {
         await inventoriesRef.doc(demoInventory.id).set(demoInventory);
       } catch (saveErr) {
@@ -137,12 +198,12 @@ export const listInventoriesHandler = async (_req: Request, res: Response): Prom
       return res.status(200).json({ inventories: [demoInventory] });
     }
 
-    const inventories: InventoryRecord[] = snapshot.docs.map((doc: any) => {
-      const data = doc.data();
-      return {
-        id: doc.id,
-        ...data,
-      };
+    const inventories: InventoryRecord[] = Array.from(byId.values());
+
+    inventories.sort((a, b) => {
+      const timeA = Date.parse(a.createdAt || '') || 0;
+      const timeB = Date.parse(b.createdAt || '') || 0;
+      return timeB - timeA;
     });
 
     return res.status(200).json({ inventories });
@@ -155,9 +216,10 @@ export const listInventoriesHandler = async (_req: Request, res: Response): Prom
 
 /**
  * POST /api/inventories
- * Creates a new customizable inventory with initialized cell states.
+ * Creates a new customizable inventory with initialized cell states tagged with `organizationId`.
  */
 export const createInventoryHandler = async (req: Request, res: Response): Promise<Response | void> => {
+  const organizationId = req.user?.organizationId || 'default-org';
   try {
     const parseResult = CreateInventorySchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -187,6 +249,7 @@ export const createInventoryHandler = async (req: Request, res: Response): Promi
     const inventoryRecord: InventoryRecord = {
       id: inventoryId,
       name: name.trim(),
+      organizationId,
       towersCount,
       boxesPerTower,
       rowsPerBox,

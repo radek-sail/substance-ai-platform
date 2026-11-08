@@ -585,7 +585,10 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       if (showLoadingSpinner) {
         setLoading(true);
       }
-      const res = await fetch('/api/videos');
+      const authHeaders = await apiService.getHeaders();
+      const res = await fetch('/api/videos', {
+        headers: authHeaders,
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       const rawList: VideoRecord[] = Array.isArray(json) ? json : (json.videos || []);
@@ -1228,11 +1231,12 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       setStatusBanner('Step 1/3: Requesting V4 Signed URL and uploading raw video directly to Cloud Storage...');
 
       // 1. Request signed URL: POST /api/videos/request-upload-url
+      const uploadHeaders = await apiService.getHeaders({
+        'Content-Type': 'application/json',
+      });
       const urlRes = await fetch('/api/videos/request-upload-url', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: uploadHeaders,
         body: JSON.stringify({
           filename: file.name,
           contentType,
@@ -1273,11 +1277,12 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
           ? new Date(file.lastModified).toISOString()
           : undefined;
 
+      const finalizeHeaders = await apiService.getHeaders({
+        'Content-Type': 'application/json',
+      });
       const finalizeRes = await fetch('/api/videos/finalize-upload', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: finalizeHeaders,
         body: JSON.stringify({
           videoId,
           rawGcsUri,

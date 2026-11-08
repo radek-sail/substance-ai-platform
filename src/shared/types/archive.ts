@@ -1681,6 +1681,7 @@ export type ArchiveWorkStep = z.infer<typeof ArchiveWorkStepSchema>;
 export const ArchiveRecordSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
+  organizationId: z.string().optional(),
   creatorName: z.string().nullable().optional(),
   creationDate: z.string().nullable().optional(),
   markdownDoc: z.string().default(''),
