@@ -412,7 +412,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
   // Decoupled Upload & Transcoding State
   const [uploading, setUploading] = useState<boolean>(false);
-  const [uploadProgress, setUploadProgress] = useState<string>('');
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [uploadStep, setUploadStep] = useState<UploadStep>('IDLE');
   const [latestUploadedVideo, setLatestUploadedVideo] = useState<VideoRecord | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -1023,11 +1023,14 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         const currentActiveId = selectedVideoId || activeStreamId || transcodingVideoId;
         const activeVid = list.find((v) => v.videoId === currentActiveId);
 
-        if (activeVid && activeVid.status === 'READY_FOR_ANALYSIS') {
+        if (activeVid && activeVid.status === 'TRANSCODING') {
+          const transcodePct = typeof activeVid.transcodeProgress === 'number' ? activeVid.transcodeProgress : 0;
+          setStatusBanner(`Stage 2/2: Normalizing & segmenting video... [${transcodePct}%]`);
+        } else if (activeVid && activeVid.status === 'READY_FOR_ANALYSIS') {
           setTranscodingVideoId(null);
           setUploadStep('SAVED');
           setUploading(false);
-          setUploadProgress('');
+          setUploadProgress(0);
           setLatestUploadedVideo(activeVid);
 
           const p0Status = ensurePasses(activeVid.passes).pass0.status;
@@ -1064,7 +1067,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
           setTranscodingVideoId(null);
           setUploadStep('ERROR');
           setUploading(false);
-          setUploadProgress('');
+          setUploadProgress(0);
           setUploadError((activeVid as any).errorMessage || 'Video background transcoding failed');
           setStatusBanner(null);
           await fetchVideos(false);
@@ -1163,8 +1166,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       setPollingStoppedForActive(false);
       setTranscodingVideoId(video.videoId);
       setUploadStep('TRANSCODING');
-      setUploadProgress('Transcoding & segmenting video in background...');
-      setStatusBanner('Transcoding & segmenting video in background...');
+      setUploadProgress(100);
+      setStatusBanner(`Stage 2/2: Normalizing & segmenting video... [0%]`);
     }
   };
 
@@ -1216,11 +1219,37 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
    * 3. Notify server to process 10-minute normalized chunks: POST /api/videos/finalize-upload.
    * 4. Refresh video registry on success.
    */
+  const uploadToGcsWithProgress = (
+    signedUrl: string,
+    file: File,
+    onProgress: (pct: number) => void
+  ): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', signedUrl, true);
+      xhr.setRequestHeader('Content-Type', file.type || 'video/mp4');
+  
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const percent = Math.round((e.loaded / e.total) * 100);
+          onProgress(percent);
+        }
+      };
+  
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new Error(`GCS Upload failed with status ${xhr.status}`));
+      };
+      xhr.onerror = () => reject(new Error('Network error during GCS upload'));
+      xhr.send(file);
+    });
+  };
+
   const uploadVideoFile = async (file: File) => {
     try {
       setUploading(true);
       const contentType = file.type || 'video/mp4';
-      setUploadProgress('Requesting signed GCS upload URL...');
+      setUploadProgress(0);
       console.log('[VideoManager] Starting direct-to-GCS upload for:', file.name, file.size);
 
       setSelectedFile(file);
@@ -1252,24 +1281,19 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
       const { videoId, signedUrl, rawGcsUri } = await urlRes.json();
 
-      // 2. Upload raw file directly to GCS via PUT to V4 Signed URL
-      setUploadProgress('Uploading raw video directly to Google Cloud Storage...');
-      const putRes = await fetch(signedUrl, {
-        method: 'PUT',
-        body: file,
-        headers: {
-          'Content-Type': contentType,
-        },
+      // 2. Upload raw file directly to GCS via PUT to V4 Signed URL with progress tracking
+      setUploadProgress(0);
+      setStatusBanner('Stage 1/2: Uploading raw video to Cloud Storage... [0%]');
+      await uploadToGcsWithProgress(signedUrl, file, (pct) => {
+        setUploadProgress(pct);
+        setStatusBanner(`Stage 1/2: Uploading raw video to Cloud Storage... [${pct}%]`);
       });
-
-      if (!putRes.ok) {
-        throw new Error(`Direct GCS upload failed with HTTP status ${putRes.status}`);
-      }
+      setUploadProgress(100);
 
       // 3. Notify server to process chunks asynchronously: POST /api/videos/finalize-upload
       setUploadStep('TRANSCODING');
-      setUploadProgress('Transcoding & segmenting video in background...');
-      setStatusBanner('Transcoding & segmenting video in background...');
+      setUploadProgress(100);
+      setStatusBanner(`Stage 2/2: Normalizing & segmenting video... [0%]`);
 
       const browserDuration = await durationPromise;
       const fallbackCapturedAt =
@@ -1318,7 +1342,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       setUploadStep('ERROR');
       setUploadError(err?.message || 'Upload failed');
       setStatusBanner(null);
-      setUploadProgress('');
+      setUploadProgress(0);
       alert(`Upload failed: ${err.message}`);
     } finally {
       setUploading(false);
@@ -1816,10 +1840,11 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       );
     }
     if (video.status === 'TRANSCODING') {
+      const pct = typeof video.transcodeProgress === 'number' ? video.transcodeProgress : 0;
       return (
         <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-yellow-950/80 text-yellow-300 border border-yellow-700/60">
           <Loader2 className="w-3 h-3 animate-spin" />
-          <span>Transcoding</span>
+          <span>{`Transcoding (${video.transcodeProgress || 0}%)`}</span>
         </span>
       );
     }
@@ -2473,7 +2498,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 ) : (
                   <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                 )}
-                <span>1. Uploading Raw Video</span>
+                <span>{uploadStep === 'UPLOADING' ? `Stage 1/2: Uploading raw video to Cloud Storage... [${uploadProgress}%]` : '1. Uploading Raw Video'}</span>
               </div>
 
               <div
@@ -2492,7 +2517,11 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 ) : (
                   <Clock className="w-4 h-4 text-slate-600 shrink-0" />
                 )}
-                <span>2. Transcoding & segmenting video in background...</span>
+                <span>
+                  {uploadStep === 'TRANSCODING'
+                    ? `Stage 2/2: Normalizing & segmenting video... [${(videos.find((v) => v.videoId === transcodingVideoId) || latestUploadedVideo)?.transcodeProgress || 0}%]`
+                    : '2. Transcoding & segmenting video in background...'}
+                </span>
               </div>
 
               <div
@@ -2510,6 +2539,46 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 <span>3. Saved to Firestore `videos`</span>
               </div>
             </div>
+
+            {uploadStep === 'UPLOADING' && (
+              <div className="space-y-1.5 pt-2 font-mono">
+                <div className="flex items-center justify-between text-xs text-cyan-300">
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-400 shrink-0" />
+                    <span>{`Stage 1/2: Uploading raw video to Cloud Storage... [${uploadProgress}%]`}</span>
+                  </span>
+                  <span className="font-bold">{`${uploadProgress}%`}</span>
+                </div>
+                <div className="w-full h-2 rounded-full bg-slate-900 border border-slate-800 overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full transition-all duration-200"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {uploadStep === 'TRANSCODING' && (() => {
+              const activeVid = videos.find((v) => v.videoId === transcodingVideoId) || latestUploadedVideo;
+              const transcodePct = activeVid?.transcodeProgress || 0;
+              return (
+                <div className="space-y-1.5 pt-2 font-mono">
+                  <div className="flex items-center justify-between text-xs text-amber-300">
+                    <span className="flex items-center gap-2">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400 shrink-0" />
+                      <span>{`Stage 2/2: Normalizing & segmenting video... [${transcodePct}%]`}</span>
+                    </span>
+                    <span className="font-bold">{`${transcodePct}%`}</span>
+                  </div>
+                  <div className="w-full h-2 rounded-full bg-slate-900 border border-slate-800 overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-amber-500 to-yellow-500 rounded-full transition-all duration-300"
+                      style={{ width: `${transcodePct}%` }}
+                    />
+                  </div>
+                </div>
+              );
+            })()}
 
             {uploadError && (
               <div className="flex items-center gap-2 text-xs font-mono text-rose-300">
@@ -2942,6 +3011,24 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                   </div>
                                 </div>
 
+                                {video.status === 'TRANSCODING' && (
+                                  <div className="w-full space-y-1.5 py-1 font-mono">
+                                    <div className="flex items-center justify-between text-xs text-amber-300">
+                                      <span className="flex items-center gap-1.5">
+                                        <Loader2 className="w-3 h-3 animate-spin text-amber-400 shrink-0" />
+                                        <span>{`Stage 2/2: Normalizing & segmenting video... [${video.transcodeProgress || 0}%]`}</span>
+                                      </span>
+                                      <span className="font-bold">{`${video.transcodeProgress || 0}%`}</span>
+                                    </div>
+                                    <div className="w-full h-2 rounded-full bg-slate-900 border border-slate-800 overflow-hidden">
+                                      <div
+                                        className="h-full bg-gradient-to-r from-amber-500 to-yellow-500 rounded-full transition-all duration-300"
+                                        style={{ width: `${video.transcodeProgress || 0}%` }}
+                                      />
+                                    </div>
+                                  </div>
+                                )}
+
                                 {isActive && (
                                   <>
                                     {/* Ingestion & Pipeline Status Badges */}
@@ -3038,6 +3125,24 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 Execute individual passes (Pass 0 → Pass 3) or all passes sequentially
               </p>
             </div>
+
+            {selectedVideo.status === 'TRANSCODING' && (
+              <div className="w-full p-3.5 rounded-xl bg-amber-950/40 border border-amber-500/40 space-y-2 font-mono">
+                <div className="flex items-center justify-between text-xs text-amber-300">
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400 shrink-0" />
+                    <span>{`Stage 2/2: Normalizing & segmenting video... [${selectedVideo.transcodeProgress || 0}%]`}</span>
+                  </span>
+                  <span className="font-bold">{`${selectedVideo.transcodeProgress || 0}%`}</span>
+                </div>
+                <div className="w-full h-2 rounded-full bg-slate-900 border border-slate-800 overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-amber-500 to-yellow-500 rounded-full transition-all duration-300"
+                    style={{ width: `${selectedVideo.transcodeProgress || 0}%` }}
+                  />
+                </div>
+              </div>
+            )}
 
             <div className="flex items-center gap-3 shrink-0">
               <button

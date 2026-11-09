@@ -47,6 +47,7 @@ export interface VideoRecord {
     | 'FAILED'
     | 'ERROR';
   errorMessage?: string;
+  transcodeProgress?: number;
   passes?: VideoPasses;
   analysisId?: string;
   organizationId?: string;
