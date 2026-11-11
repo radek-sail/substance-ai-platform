@@ -55,39 +55,91 @@ export function normalizeVideo(inputPath: string, outputPath: string): Promise<s
 
 /**
  * FFmpeg options for generating a small, thumbnail-size MP4 preview video:
- * -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -vf "scale=320:-2:flags=bicubic" -an -movflags +faststart
+ * -c:v libx264 -preset ultrafast -crf 30 -maxrate 300k -bufsize 600k -r 15 -pix_fmt yuv420p -vf "scale=320:-2:flags=bicubic" -an -movflags +faststart
  */
 export const THUMBNAIL_PREVIEW_FFMPEG_OPTIONS = [
   '-c:v libx264',
   '-preset ultrafast',
-  '-crf 28',
+  '-crf 30',
+  '-maxrate 300k',
+  '-bufsize 600k',
+  '-r 15',
   '-pix_fmt yuv420p',
   '-vf scale=320:-2:flags=bicubic',
   '-an',
   '-movflags +faststart',
 ];
 
+export interface GenerateThumbnailVideoOptions {
+  startTimeSec?: number;
+  durationSec?: number;
+}
+
 /**
- * Generates a small, thumbnail-sized MP4 preview video (320px width, muted, faststart)
+ * Generates a small, thumbnail-sized MP4 preview video (320px width, 15fps, capped bitrate, muted, faststart)
  * suitable for inline playback in the Video Manager tab.
+ * By default caps each thumbnail segment to at most 600s (10 minutes) so thumbnail files stay compact (~5-15MB).
  *
  * @param inputPath - Local file path or signed HTTP URL of source video
  * @param outputPath - Destination local file path for the thumbnail MP4
+ * @param options - Optional chunk seek offset (`startTimeSec`) and max duration (`durationSec`, default 600s)
  * @returns Promise resolving to the output path on completion
  */
-export function generateThumbnailVideo(inputPath: string, outputPath: string): Promise<string> {
+export function generateThumbnailVideo(
+  inputPath: string,
+  outputPath: string,
+  options?: GenerateThumbnailVideoOptions
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const outputDirectory = path.dirname(outputPath);
     if (!fs.existsSync(outputDirectory)) {
       fs.mkdirSync(outputDirectory, { recursive: true });
     }
 
+    const tmpOutputPath = path.join(
+      outputDirectory,
+      `.tmp_${path.basename(outputPath, '.mp4')}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.mp4`
+    );
+
+    const inputOpts = ['-nostdin'];
+    if (
+      typeof options?.startTimeSec === 'number' &&
+      Number.isFinite(options.startTimeSec) &&
+      options.startTimeSec > 0
+    ) {
+      inputOpts.push(`-ss ${options.startTimeSec}`);
+    }
+
+    const maxDurationSec =
+      typeof options?.durationSec === 'number' && Number.isFinite(options.durationSec) && options.durationSec > 0
+        ? options.durationSec
+        : 600;
+    const outputOpts = ['-y', `-t ${maxDurationSec}`, ...THUMBNAIL_PREVIEW_FFMPEG_OPTIONS];
+
     ffmpeg(inputPath)
-      .inputOptions(['-nostdin'])
-      .outputOptions(['-y', ...THUMBNAIL_PREVIEW_FFMPEG_OPTIONS])
-      .output(outputPath)
-      .on('end', () => resolve(outputPath))
-      .on('error', (err) => reject(err))
+      .inputOptions(inputOpts)
+      .outputOptions(outputOpts)
+      .output(tmpOutputPath)
+      .on('end', () => {
+        try {
+          if (fs.existsSync(tmpOutputPath)) {
+            fs.renameSync(tmpOutputPath, outputPath);
+          }
+          resolve(outputPath);
+        } catch (err) {
+          reject(err);
+        }
+      })
+      .on('error', (err) => {
+        try {
+          if (fs.existsSync(tmpOutputPath)) {
+            fs.unlinkSync(tmpOutputPath);
+          }
+        } catch {
+          // ignore cleanup error
+        }
+        reject(err);
+      })
       .run();
   });
 }
@@ -311,12 +363,19 @@ export async function selectBestEventFrames(
     highestContrastTimestamp?: number;
     minimalBlurTimestamp?: number;
     bestShotTimes?: number[];
+    seekOffsetSec?: number;
   } = {}
 ): Promise<SelectedEventFramesResult> {
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
+  const seekOffsetSec =
+    typeof aiCandidateTimestamps.seekOffsetSec === 'number' &&
+    Number.isFinite(aiCandidateTimestamps.seekOffsetSec) &&
+    aiCandidateTimestamps.seekOffsetSec > 0
+      ? aiCandidateTimestamps.seekOffsetSec
+      : 0;
   const safeStart = Math.max(0, Number.isFinite(startTime) ? startTime : 0);
   const safeEnd = Math.max(safeStart, Number.isFinite(endTime) ? endTime : safeStart + 1);
   const candidateSet = new Set<number>();
@@ -358,8 +417,12 @@ export async function selectBestEventFrames(
   const candidates = Array.from(candidateSet);
   const evaluated: FrameQualityMetrics[] = [];
   for (const ts of candidates) {
-    const metrics = await analyzeFrameQuality(videoPath, ts);
-    evaluated.push(metrics);
+    const localSeekTs = Math.max(0, Number((ts - seekOffsetSec).toFixed(2)));
+    const metrics = await analyzeFrameQuality(videoPath, localSeekTs);
+    evaluated.push({
+      ...metrics,
+      timestampSec: Number(ts.toFixed(2)),
+    });
   }
 
   // Primary criterion is clear label visibility to the camera (AI-selected timestamp); contrast is secondary
@@ -388,8 +451,9 @@ export async function selectBestEventFrames(
   const extractOrPlaceholder = async (ts: number, tag: string): Promise<{ localPath: string; filename: string }> => {
     const filename = `frame_${eventId}_${tag}_${ts}.jpg`;
     const fullPath = path.join(outputDir, filename);
+    const localSeekTs = Math.max(0, Number((ts - seekOffsetSec).toFixed(2)));
     try {
-      await extractCandidateFrame(videoPath, ts, outputDir, filename);
+      await extractCandidateFrame(videoPath, localSeekTs, outputDir, filename);
     } catch {
       fs.writeFileSync(fullPath, Buffer.from(`SAIL_FRAME_${eventId}_${tag}_${ts}`));
     }

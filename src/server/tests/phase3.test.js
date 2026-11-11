@@ -309,6 +309,140 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       assert.ok(passedModel.includes('flash'), 'Pass 0 must utilize Gemini Flash');
     });
 
+    it('Pass 0: should extract JSON when GenAI response has thinking parts before the JSON text part or requires bounded clip fallback', async () => {
+      let callCount = 0;
+      const mockClient = {
+        models: {
+          generateContent: async () => {
+            callCount++;
+            if (callCount === 1) {
+              // Simulate first call hitting MAX_TOKENS with only an empty/thought part
+              return {
+                text: undefined,
+                candidates: [
+                  {
+                    finishReason: 'MAX_TOKENS',
+                    content: {
+                      parts: [{ thought: true, thoughtSignature: 'sig_123' }],
+                    },
+                  },
+                ],
+              };
+            }
+            // Second call (bounded clip retry) returns a thinking part at parts[0] and JSON text at parts[1]
+            return {
+              text: undefined,
+              candidates: [
+                {
+                  finishReason: 'STOP',
+                  content: {
+                    parts: [
+                      {
+                        thought: true,
+                        text: 'Analyzing spoken transcript for workflow classification...',
+                        thoughtSignature: 'sig_456',
+                      },
+                      {
+                        text: JSON.stringify({
+                          workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+                          archiveName: 'Media Prep Alpha',
+                          transcribedAudio: 'Initializing new experiment archive Media Prep Alpha',
+                        }),
+                      },
+                    ],
+                  },
+                },
+              ],
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const result = await runPass0WorkflowClassification({
+        videoGcsUri: 'gs://sail-platform-videos-prod/normalized/vid_long_01/chunk_000.mp4',
+        videoId: 'vid_long_01',
+      });
+
+      assert.strictEqual(callCount, 2, 'Should retry with bounded clip when first response has no extractable text');
+      assert.strictEqual(result.workflowType, 'EXPERIMENT_NOTEBOOK_WORKFLOW');
+      assert.strictEqual(result.archiveName, 'Media Prep Alpha');
+    });
+
+    it('Pass 0: should recover via targeted opening sub-windows when full chunk hits SAFETY block without falling back to non-existent 3.1-pro-preview', async () => {
+      const modelsCalled = [];
+      const mockClient = {
+        models: {
+          generateContent: async (params) => {
+            modelsCalled.push(params.model);
+            const videoMeta = params.contents?.[0]?.parts?.[0]?.videoMetadata;
+            if (!videoMeta?.startOffset) {
+              return {
+                promptFeedback: { blockReason: 'SAFETY' },
+                candidates: [],
+              };
+            }
+            if (videoMeta.startOffset === '5s' && videoMeta.endOffset === '25s') {
+              return {
+                candidates: [
+                  {
+                    finishReason: 'STOP',
+                    content: {
+                      parts: [
+                        {
+                          text: JSON.stringify({
+                            workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+                            archiveName: 'Passaging and seeding Panc-1 cells',
+                            purpose: 'Potential viability assay of MEF and scramble 6',
+                            archiveIntent: 'CREATE',
+                            isAppending: false,
+                            transcribedAudio:
+                              'Okay, this is starting a new experiment, passaging and seeding Panc-1 cells for potential viability assay of MEF and scramble 6.',
+                          }),
+                        },
+                      ],
+                    },
+                  },
+                ],
+              };
+            }
+            return {
+              candidates: [
+                {
+                  finishReason: 'STOP',
+                  content: {
+                    parts: [
+                      {
+                        text: JSON.stringify({
+                          workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+                          creationDate: '2026-10-15',
+                          transcribedAudio: 'Again, these are Panc-1 cells, passage 19, passaged on October 15th.',
+                        }),
+                      },
+                    ],
+                  },
+                },
+              ],
+            };
+          },
+        },
+      };
+
+      setGenAIClient(mockClient);
+
+      const result = await runPass0WorkflowClassification({
+        videoGcsUri: 'gs://sail-platform-videos-prod/normalized/vid_1794352797510/chunk_000.mp4',
+        videoId: 'vid_1794352797510',
+      });
+
+      assert.ok(!modelsCalled.includes('gemini-3.1-pro-preview'), 'Must never call gemini-3.1-pro-preview');
+      assert.strictEqual(result.workflowType, 'EXPERIMENT_NOTEBOOK_WORKFLOW');
+      assert.strictEqual(result.archiveName, 'Passaging and seeding Panc-1 cells');
+      assert.strictEqual(result.purpose, 'Potential viability assay of MEF and scramble 6');
+      assert.strictEqual(result.creationDate, '2026-10-15');
+    });
+
     it('Pass 0: should retry with exponential backoff on HTTP 503 / 429 transient errors', async () => {
       let attempts = 0;
 

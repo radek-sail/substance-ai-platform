@@ -211,6 +211,7 @@ export const listArchivesHandler = async (req: Request, res: Response): Promise<
         ...(data.organizationId ? { organizationId: data.organizationId } : { organizationId }),
         creatorName: data.creatorName ?? null,
         creationDate: data.creationDate ?? null,
+        purpose: data.purpose ?? null,
         reagents: Array.isArray(data.reagents)
           ? data.reagents.length > 0 || isErased || !demoFallback
             ? data.reagents
@@ -263,7 +264,7 @@ export const createArchiveHandler = async (req: Request, res: Response): Promise
       });
     }
 
-    const { name, creatorName, creationDate, reagents, labelTranscriptions, workSteps, markdownDoc, videoId } =
+    const { name, creatorName, creationDate, purpose, reagents, labelTranscriptions, workSteps, markdownDoc, videoId } =
       parseResult.data;
     const trimmedName = name.trim();
     if (!trimmedName) {
@@ -278,12 +279,14 @@ export const createArchiveHandler = async (req: Request, res: Response): Promise
     const nowIso = new Date().toISOString();
     const normalizedCreator = creatorName?.trim() || null;
     const normalizedDate = creationDate?.trim() || null;
+    const normalizedPurpose = purpose?.trim() || null;
 
     const defaultMarkdownHeader = [
       `# ${trimmedName}`,
       '',
       ...(normalizedCreator ? [`- **Creator**: ${normalizedCreator}`] : []),
       ...(normalizedDate ? [`- **Creation Date**: ${normalizedDate}`] : []),
+      ...(normalizedPurpose ? [`- **Purpose**: ${normalizedPurpose}`] : []),
       '',
       '## Experiment Log',
       '',
@@ -295,6 +298,7 @@ export const createArchiveHandler = async (req: Request, res: Response): Promise
       organizationId,
       creatorName: normalizedCreator,
       creationDate: normalizedDate,
+      purpose: normalizedPurpose,
       reagents: Array.isArray(reagents) ? reagents : [],
       labelTranscriptions: Array.isArray(labelTranscriptions) ? labelTranscriptions : [],
       workSteps: Array.isArray(workSteps) ? workSteps : [],
@@ -322,6 +326,7 @@ export const createArchiveHandler = async (req: Request, res: Response): Promise
         archiveName: trimmedName,
         archiveCreatorName: normalizedCreator,
         archiveCreationDate: normalizedDate,
+        archivePurpose: normalizedPurpose,
         unmatchedArchiveName: null,
         archiveAssociationType: 'MANUAL' as const,
         associatedAt: nowIso,
@@ -344,6 +349,7 @@ export const createArchiveHandler = async (req: Request, res: Response): Promise
               archiveName: trimmedName,
               creatorName: normalizedCreator ?? prevPass0Data.creatorName ?? null,
               creationDate: normalizedDate ?? prevPass0Data.creationDate ?? null,
+              purpose: normalizedPurpose ?? prevPass0Data.purpose ?? null,
             },
           };
           await firestoreService.updateVideoPass(databaseId, videoId, 'pass0', updatedPass0State);
@@ -365,6 +371,7 @@ export const createArchiveHandler = async (req: Request, res: Response): Promise
             archiveName: trimmedName,
             creatorName: normalizedCreator,
             creationDate: normalizedDate,
+            purpose: normalizedPurpose,
             ...(existingAnalysis.workflowClassification
               ? {
                   workflowClassification: {
@@ -372,6 +379,7 @@ export const createArchiveHandler = async (req: Request, res: Response): Promise
                     archiveName: trimmedName,
                     creatorName: normalizedCreator,
                     creationDate: normalizedDate,
+                    purpose: normalizedPurpose,
                   },
                 }
               : {}),
@@ -382,6 +390,7 @@ export const createArchiveHandler = async (req: Request, res: Response): Promise
                     archiveName: trimmedName,
                     creatorName: normalizedCreator,
                     creationDate: normalizedDate,
+                    purpose: normalizedPurpose,
                   },
                 }
               : {}),
@@ -500,12 +509,15 @@ export const emptyArchiveHandler = async (req: Request, res: Response): Promise<
       existingData.creatorName !== undefined ? existingData.creatorName : (req.body?.creatorName ?? null);
     const creationDate =
       existingData.creationDate !== undefined ? existingData.creationDate : (req.body?.creationDate ?? null);
+    const purpose =
+      existingData.purpose !== undefined ? existingData.purpose : (req.body?.purpose ?? null);
 
     const defaultMarkdownHeader = [
       `# ${archiveName}`,
       '',
       ...(creatorName ? [`- **Creator**: ${creatorName}`] : []),
       ...(creationDate ? [`- **Creation Date**: ${creationDate}`] : []),
+      ...(purpose ? [`- **Purpose**: ${purpose}`] : []),
       '',
       '## Experiment Log',
       '',
@@ -516,6 +528,7 @@ export const emptyArchiveHandler = async (req: Request, res: Response): Promise<
       name: archiveName,
       creatorName,
       creationDate,
+      purpose,
       reagents: [],
       labelTranscriptions: [],
       workSteps: [],
@@ -649,6 +662,7 @@ export const deleteArchiveHandler = async (req: Request, res: Response): Promise
           archiveName: null,
           archiveCreatorName: null,
           archiveCreationDate: null,
+          archivePurpose: null,
           archiveAssociationType: null,
           updatedAt: nowIso,
         };

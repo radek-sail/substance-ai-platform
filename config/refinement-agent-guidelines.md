@@ -62,6 +62,20 @@ Your responsibility is to execute high-resolution modal tasks across the two bes
        - `expectedSeedingEventsCount`: Expected number of seeding events based on plate wells and pipette channels (e.g., `12` for a `96-well plate` with an `8-channel pipette`).
        - `isSeedingCountCorrect`: Boolean (`true` if `seedingEventsCount === expectedSeedingEventsCount`, `false` otherwise).
        - `seededColumns`: Array of column numbers (`1`–`12`, where column `1` is on the left side and column `12` is all the way to the right) where cells were seeded. When generating archive notes, draw a 96-well plate diagram showing which wells/columns were seeded.
+   - **For `INCUBATE_CELLS` (`INCUBATE_CELLS_ACTION` — Incubate Cells) & `INCUBATOR_SETTINGS` Event**:
+     - `INCUBATE_CELLS` corresponds to the operator inserting a container containing cells into an incubator.
+     - Associated with the `INCUBATOR_SETTINGS` event, which corresponds to the operator looking at the incubator settings panel.
+     - Inspect the two full-resolution best shots (`HIGHEST_CONTRAST` and `MINIMAL_BLUR` frames) of the `INCUBATOR_SETTINGS` event alongside the video clip and spoken audio to extract `incubateCellsData` / `incubatorSettings`:
+       - `temperature`: Incubator temperature read from the settings panel (e.g., `"37.0°C"`, `"37°C"`), or `"N/A"` if not visible/found.
+       - `co2Level`: Incubator CO2 level read from the settings panel (e.g., `"5.0%"`, `"5%"`), or `"N/A"` if not visible/found.
+   - **For `ASPIRATE_MEDIA` / `ASPRIRATE_MEDIA` (`ASPIRATE_MEDIA_ACTION` — Aspirate Media)**:
+     - Corresponds to the action of emptying the content of a container with media using a pipette or aspirator.
+     - Preserve the active-voice description (e.g., `"Aspirating media from container using pipette"`) and refined timestamps in the Experiment Archive work steps.
+   - **For `hemocytometer_loading` / `HEMOCYTOMETER_LOADING` (`HEMOCYTOMETER_LOADING_ACTION` — Hemocytometer Loading) & `hemocytometer_load` / `HEMOCYTOMETER_LOAD` Event**:
+     - `hemocytometer_loading` (`HEMOCYTOMETER_LOADING`) corresponds to the action when the operator loads the cells into the two squares of the hemocytometer slide.
+     - Associated with the `hemocytometer_load` (`HEMOCYTOMETER_LOAD`) event, which contains information about the substance that was loaded into the hemocytometer slide.
+     - Conflate the `hemocytometer_load` event, spoken audio narration, and any associated reagent/cell suspension context into `hemocytometerLoadingData`:
+       - `substanceLoaded`: Information about the substance (cells, cell line suspension, or cell + stain mixture) loaded into the two squares of the hemocytometer slide (or `"N/A"` if not specified).
 
 ## Output Schema
 Return structured JSON conforming strictly to `RefinementSchema` and `AnalysisRefinementPassResultSchema` in `src/shared/types/pipeline.ts`.

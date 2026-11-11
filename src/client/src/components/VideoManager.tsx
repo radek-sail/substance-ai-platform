@@ -15,6 +15,7 @@ import {
   Play,
   Eye,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   FileJson,
   ShieldCheck,
@@ -201,26 +202,56 @@ interface ActiveStreamThumbnailPreviewProps {
   videoId: string;
   originalName: string;
   status: string;
+  tenant?: TenantConfig;
+  organizationId?: string;
+  durationSeconds?: number;
+  chunks?: { index: number; gcsUri: string }[];
+  totalChunks?: number;
 }
 
 const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> = ({
   videoId,
   originalName,
   status,
+  tenant,
+  organizationId,
+  durationSeconds,
+  chunks,
+  totalChunks,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [hasError, setHasError] = useState<boolean>(false);
+  const [retryCount, setRetryCount] = useState<number>(0);
+  const [currentChunkIndex, setCurrentChunkIndex] = useState<number>(0);
 
+  const durationEstimatedChunks =
+    typeof durationSeconds === 'number' && Number.isFinite(durationSeconds) && durationSeconds > 600
+      ? Math.ceil(durationSeconds / 600)
+      : 1;
+  const numChunks = Math.max(1, totalChunks || 0, chunks?.length || 0, durationEstimatedChunks);
   const isIngesting = status === 'UPLOADING' || status === 'TRANSCODING';
-  const thumbnailUrl = `/api/videos/${encodeURIComponent(videoId)}/thumbnail`;
+
+  const effectiveCustomerId = organizationId || tenant?.customerId;
+  const tenantParams = new URLSearchParams();
+  tenantParams.set('v', '2');
+  if (effectiveCustomerId) tenantParams.set('customerId', effectiveCustomerId);
+  if (organizationId) tenantParams.set('organizationId', organizationId);
+  if (tenant?.databaseId) tenantParams.set('databaseId', tenant.databaseId);
+  tenantParams.set('chunk', String(currentChunkIndex));
+  if (retryCount > 0) {
+    tenantParams.set('retry', String(retryCount));
+  }
+  const thumbnailUrl = `/api/videos/${encodeURIComponent(videoId)}/thumbnail?${tenantParams.toString()}`;
 
   useEffect(() => {
     setIsPlaying(false);
     setHasError(false);
+    setRetryCount(0);
+    setCurrentChunkIndex(0);
     setIsLoading(!isIngesting);
-  }, [videoId, status, isIngesting]);
+  }, [videoId, isIngesting]);
 
   const handleLoadedData = () => {
     setIsLoading(false);
@@ -242,17 +273,36 @@ const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> 
 
   const handleEnded = () => {
     const el = videoRef.current;
+    if (numChunks > 1 && currentChunkIndex + 1 < numChunks) {
+      setHasError(false);
+      setRetryCount(0);
+      setCurrentChunkIndex((c) => c + 1);
+      setIsLoading(true);
+      return;
+    }
     if (el) {
       el.pause();
       el.currentTime = 0;
+    }
+    if (numChunks > 1) {
+      setHasError(false);
+      setRetryCount(0);
+      setCurrentChunkIndex(0);
     }
     setIsPlaying(false);
   };
 
   const handleTogglePlay = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (isIngesting) return;
+    if (hasError) {
+      setHasError(false);
+      setIsLoading(true);
+      setRetryCount((c) => c + 1);
+      return;
+    }
     const el = videoRef.current;
-    if (!el || hasError || isIngesting) return;
+    if (!el) return;
     if (el.paused) {
       if (el.ended || (el.duration && el.currentTime >= el.duration - 0.05)) {
         el.currentTime = 0;
@@ -272,6 +322,9 @@ const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> 
     if (!el) return;
     el.pause();
     el.currentTime = 0;
+    if (numChunks > 1) {
+      setCurrentChunkIndex(0);
+    }
     setIsPlaying(false);
   };
 
@@ -279,7 +332,9 @@ const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> 
     <div
       data-testid={`active-stream-thumbnail-preview-${videoId}`}
       onClick={handleTogglePlay}
-      title={`${originalName} — Plays once, then rewinds to 00:00 and stops (click to replay/pause)`}
+      title={`${originalName}${
+        numChunks > 1 ? ` (Chunk ${currentChunkIndex + 1} of ${numChunks})` : ''
+      } — Plays once, then rewinds to 00:00 and stops (click to replay/pause)`}
       className="relative w-24 h-40 sm:w-28 sm:h-48 rounded-xl overflow-hidden bg-slate-950 border border-cyan-500/50 shadow-md shadow-cyan-950/40 shrink-0 group select-none cursor-pointer"
     >
       {isIngesting ? (
@@ -291,7 +346,7 @@ const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> 
         <>
           <video
             ref={videoRef}
-            key={`${videoId}-${status}`}
+            key={`${videoId}-${currentChunkIndex}-${retryCount}`}
             src={thumbnailUrl}
             muted
             playsInline
@@ -301,16 +356,24 @@ const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> 
             onPause={() => setIsPlaying(false)}
             onEnded={handleEnded}
             onError={() => {
-              setIsLoading(false);
-              setHasError(true);
+              if (retryCount < 6) {
+                setTimeout(() => {
+                  setRetryCount((c) => c + 1);
+                }, Math.min(3000, 800 * (retryCount + 1)));
+              } else {
+                setIsLoading(false);
+                setHasError(true);
+              }
             }}
             className="w-full h-full object-contain bg-black"
           />
 
           {isLoading && !hasError && (
-            <div className="absolute inset-0 bg-slate-950/85 flex flex-col items-center justify-center gap-1 text-cyan-300 p-2 text-center">
+            <div className="absolute inset-0 bg-slate-950/85 flex flex-col items-center justify-center gap-1 text-cyan-300 p-2 text-center pointer-events-none">
               <Loader2 className="w-4 h-4 animate-spin text-cyan-400" />
-              <span className="text-[9px] font-mono leading-tight">Loading preview...</span>
+              <span className="text-[9px] font-mono leading-tight">
+                {numChunks > 1 ? `Loading chunk ${currentChunkIndex + 1}...` : 'Loading preview...'}
+              </span>
             </div>
           )}
 
@@ -318,11 +381,12 @@ const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> 
             <div className="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center gap-1 text-slate-400 p-2 text-center">
               <FileVideo className="w-5 h-5 text-cyan-400/70" />
               <span className="text-[9px] font-mono leading-tight">Preview Ready on Demand</span>
+              <span className="text-[8px] font-mono text-cyan-400/80 underline mt-0.5">Click to retry</span>
             </div>
           )}
 
           {/* Top-left LIVE PREVIEW badge */}
-          <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black/75 backdrop-blur-sm border border-cyan-500/40 flex items-center gap-1 pointer-events-none">
+          <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black/75 backdrop-blur-sm border border-cyan-500/40 flex items-center gap-1 pointer-events-none z-10">
             <span
               className={`w-1.5 h-1.5 rounded-full ${
                 isPlaying ? 'bg-emerald-400 animate-pulse' : 'bg-cyan-400'
@@ -333,9 +397,49 @@ const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> 
             </span>
           </div>
 
+          {/* Top-right Chunk Switcher (when multiple chunks exist) */}
+          {numChunks > 1 && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="absolute top-1.5 right-1.5 px-1 py-0.5 rounded bg-black/85 backdrop-blur-sm border border-slate-700/70 flex items-center gap-0.5 z-10 select-none shadow-sm"
+            >
+              <button
+                type="button"
+                disabled={currentChunkIndex === 0}
+                onClick={() => {
+                  if (currentChunkIndex > 0) {
+                    setCurrentChunkIndex((c) => c - 1);
+                    setIsLoading(true);
+                  }
+                }}
+                className="text-slate-400 hover:text-cyan-300 disabled:opacity-20 disabled:hover:text-slate-400 p-0.5 transition-colors"
+                title="Previous chunk"
+              >
+                <ChevronLeft className="w-2.5 h-2.5" />
+              </button>
+              <span className="text-[8px] font-mono font-semibold text-cyan-300">
+                {currentChunkIndex + 1}/{numChunks}
+              </span>
+              <button
+                type="button"
+                disabled={currentChunkIndex + 1 >= numChunks}
+                onClick={() => {
+                  if (currentChunkIndex + 1 < numChunks) {
+                    setCurrentChunkIndex((c) => c + 1);
+                    setIsLoading(true);
+                  }
+                }}
+                className="text-slate-400 hover:text-cyan-300 disabled:opacity-20 disabled:hover:text-slate-400 p-0.5 transition-colors"
+                title="Next chunk"
+              >
+                <ChevronRight className="w-2.5 h-2.5" />
+              </button>
+            </div>
+          )}
+
           {/* Bottom-right Play/Pause & Rewind controls */}
           {!hasError && !isLoading && (
-            <div className="absolute bottom-1.5 right-1.5 flex items-center gap-1 opacity-90 group-hover:opacity-100 transition-opacity">
+            <div className="absolute bottom-1.5 right-1.5 flex items-center gap-1 opacity-90 group-hover:opacity-100 transition-opacity z-10">
               <button
                 type="button"
                 onClick={handleTogglePlay}
@@ -349,6 +453,364 @@ const ActiveStreamThumbnailPreview: React.FC<ActiveStreamThumbnailPreviewProps> 
                 onClick={handleRewindStop}
                 className="p-1 rounded bg-black/75 hover:bg-slate-800 text-slate-200 border border-slate-700/70 transition-colors"
                 title="Rewind to beginning and stop"
+              >
+                <RotateCcw className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
+interface IntervalThumbnailPreviewProps {
+  videoId: string;
+  status?: string;
+  tenant?: TenantConfig;
+  organizationId?: string;
+  startSeconds: number;
+  endSeconds?: number;
+  intervalId: string;
+  onPlayInterval?: () => void;
+}
+
+const IntervalThumbnailPreview: React.FC<IntervalThumbnailPreviewProps> = ({
+  videoId,
+  status,
+  tenant,
+  organizationId,
+  startSeconds,
+  endSeconds,
+  intervalId,
+  onPlayInterval,
+}) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const pendingAutoPlayRef = useRef<boolean>(false);
+
+  const safeStart = Number.isFinite(startSeconds) && startSeconds >= 0 ? startSeconds : 0;
+  const startChunkIndex = Math.floor(safeStart / 600);
+  const localStartSec = Math.max(0, safeStart - startChunkIndex * 600);
+  const hasExplicitEnd =
+    typeof endSeconds === 'number' && Number.isFinite(endSeconds) && endSeconds > safeStart;
+  const safeEnd = hasExplicitEnd ? (endSeconds as number) : undefined;
+  const endChunkIndex = safeEnd !== undefined ? Math.floor(safeEnd / 600) : startChunkIndex;
+
+  const [isVisible, setIsVisible] = useState<boolean>(
+    typeof IntersectionObserver === 'undefined'
+  );
+  const [currentChunkIndex, setCurrentChunkIndex] = useState<number>(startChunkIndex);
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [hasError, setHasError] = useState<boolean>(false);
+  const [retryCount, setRetryCount] = useState<number>(0);
+  const [displayTimeSec, setDisplayTimeSec] = useState<number>(safeStart);
+
+  const isIngesting = status === 'UPLOADING' || status === 'TRANSCODING';
+
+  useEffect(() => {
+    if (typeof IntersectionObserver === 'undefined') {
+      setIsVisible(true);
+      return;
+    }
+    const node = containerRef.current;
+    if (!node) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setIsVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '400px' }
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    pendingAutoPlayRef.current = false;
+    setIsPlaying(false);
+    setHasError(false);
+    setRetryCount(0);
+    setCurrentChunkIndex(startChunkIndex);
+    setDisplayTimeSec(safeStart);
+    setIsLoading(!isIngesting);
+  }, [videoId, safeStart, startChunkIndex, isIngesting]);
+
+  const effectiveCustomerId = organizationId || tenant?.customerId;
+  const tenantParams = new URLSearchParams();
+  tenantParams.set('v', '2');
+  if (effectiveCustomerId) tenantParams.set('customerId', effectiveCustomerId);
+  if (organizationId) tenantParams.set('organizationId', organizationId);
+  if (tenant?.databaseId) tenantParams.set('databaseId', tenant.databaseId);
+  tenantParams.set('chunk', String(currentChunkIndex));
+  if (retryCount > 0) {
+    tenantParams.set('retry', String(retryCount));
+  }
+  const initialLocalOffset = currentChunkIndex === startChunkIndex ? localStartSec : 0;
+  const mediaFragment = initialLocalOffset > 0 ? `#t=${initialLocalOffset.toFixed(2)}` : '';
+  const thumbnailUrl = `/api/videos/${encodeURIComponent(videoId)}/thumbnail?${tenantParams.toString()}${mediaFragment}`;
+
+  const handleLoadedMetadata = () => {
+    const el = videoRef.current;
+    if (!el) return;
+    setHasError(false);
+
+    const maxDur =
+      el.duration && Number.isFinite(el.duration) ? Math.max(0, el.duration - 0.05) : undefined;
+
+    if (pendingAutoPlayRef.current) {
+      pendingAutoPlayRef.current = false;
+      const target =
+        currentChunkIndex === startChunkIndex
+          ? maxDur !== undefined
+            ? Math.min(localStartSec, maxDur)
+            : localStartSec
+          : 0;
+      el.currentTime = target;
+      const playPromise = el.play();
+      if (playPromise && typeof playPromise.then === 'function') {
+        playPromise
+          .then(() => {
+            setIsLoading(false);
+            setIsPlaying(true);
+          })
+          .catch(() => {
+            setIsLoading(false);
+            setIsPlaying(false);
+          });
+      }
+      return;
+    }
+
+    const target = maxDur !== undefined ? Math.min(localStartSec, maxDur) : localStartSec;
+    el.pause();
+    setIsPlaying(false);
+    setDisplayTimeSec(safeStart);
+    if (Math.abs(el.currentTime - target) > 0.03) {
+      try {
+        el.currentTime = target;
+      } catch {
+        setIsLoading(false);
+      }
+    } else {
+      setIsLoading(false);
+    }
+  };
+
+  const handleTimeUpdate = () => {
+    const el = videoRef.current;
+    if (!el) return;
+    const globalTime = currentChunkIndex * 600 + el.currentTime;
+    setDisplayTimeSec(globalTime);
+    if (!el.paused && safeEnd !== undefined && globalTime >= safeEnd) {
+      el.pause();
+      setIsPlaying(false);
+    }
+  };
+
+  const handleEnded = () => {
+    if (safeEnd !== undefined && currentChunkIndex < endChunkIndex) {
+      pendingAutoPlayRef.current = true;
+      setHasError(false);
+      setRetryCount(0);
+      setIsLoading(true);
+      setCurrentChunkIndex((c) => c + 1);
+      return;
+    }
+    setIsPlaying(false);
+  };
+
+  const handleTogglePlay = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isIngesting) return;
+    onPlayInterval?.();
+
+    if (hasError) {
+      setHasError(false);
+      setIsLoading(true);
+      setRetryCount((c) => c + 1);
+      return;
+    }
+
+    const el = videoRef.current;
+    if (!el) return;
+
+    if (el.paused) {
+      const globalTime = currentChunkIndex * 600 + el.currentTime;
+      const reachedEnd =
+        el.ended ||
+        (safeEnd !== undefined && globalTime >= safeEnd - 0.08) ||
+        globalTime < safeStart - 0.25;
+
+      if (reachedEnd) {
+        if (currentChunkIndex !== startChunkIndex) {
+          pendingAutoPlayRef.current = true;
+          setIsLoading(true);
+          setCurrentChunkIndex(startChunkIndex);
+          return;
+        }
+        const maxDur =
+          el.duration && Number.isFinite(el.duration)
+            ? Math.max(0, el.duration - 0.05)
+            : localStartSec;
+        el.currentTime = Math.min(localStartSec, maxDur);
+        setDisplayTimeSec(safeStart);
+      }
+
+      const playPromise = el.play();
+      if (playPromise && typeof playPromise.then === 'function') {
+        playPromise
+          .then(() => setIsPlaying(true))
+          .catch(() => setIsPlaying(false));
+      }
+    } else {
+      el.pause();
+      setIsPlaying(false);
+    }
+  };
+
+  const handleResetToStart = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    pendingAutoPlayRef.current = false;
+    const el = videoRef.current;
+    if (currentChunkIndex !== startChunkIndex) {
+      setIsPlaying(false);
+      setIsLoading(true);
+      setCurrentChunkIndex(startChunkIndex);
+      setDisplayTimeSec(safeStart);
+      return;
+    }
+    if (el) {
+      el.pause();
+      const maxDur =
+        el.duration && Number.isFinite(el.duration)
+          ? Math.max(0, el.duration - 0.05)
+          : localStartSec;
+      el.currentTime = Math.min(localStartSec, maxDur);
+    }
+    setDisplayTimeSec(safeStart);
+    setIsPlaying(false);
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      data-testid={`interval-thumbnail-preview-${intervalId}`}
+      onClick={handleTogglePlay}
+      title={`Interval preview (${formatDuration(safeStart)}${
+        safeEnd !== undefined ? ` – ${formatDuration(safeEnd)}` : ''
+      }) — Click to ${isPlaying ? 'pause' : 'play'}`}
+      className="relative w-44 h-28 sm:w-48 sm:h-32 rounded-xl overflow-hidden bg-slate-950 border border-cyan-500/40 hover:border-cyan-400 shadow-md shadow-cyan-950/30 shrink-0 group select-none cursor-pointer transition-colors"
+    >
+      {isIngesting ? (
+        <div className="w-full h-full flex flex-col items-center justify-center gap-1.5 text-amber-300 bg-slate-950 p-2 text-center">
+          <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
+          <span className="text-[10px] font-mono leading-tight">Generating thumbnail...</span>
+        </div>
+      ) : !isVisible ? (
+        <div className="w-full h-full flex flex-col items-center justify-center gap-1 text-slate-400 bg-slate-950 p-2 text-center">
+          <FileVideo className="w-4 h-4 text-cyan-400/70" />
+          <span className="text-[9px] font-mono">@{formatDuration(safeStart)}</span>
+        </div>
+      ) : (
+        <>
+          <video
+            ref={videoRef}
+            key={`${videoId}-${intervalId}-${currentChunkIndex}-${retryCount}`}
+            src={thumbnailUrl}
+            muted
+            playsInline
+            preload="metadata"
+            onLoadedMetadata={handleLoadedMetadata}
+            onLoadedData={() => {
+              setIsLoading(false);
+              setHasError(false);
+            }}
+            onSeeked={() => {
+              setIsLoading(false);
+              setHasError(false);
+            }}
+            onTimeUpdate={handleTimeUpdate}
+            onPlay={() => setIsPlaying(true)}
+            onPause={() => setIsPlaying(false)}
+            onEnded={handleEnded}
+            onError={() => {
+              if (retryCount < 4) {
+                setTimeout(() => {
+                  setRetryCount((c) => c + 1);
+                }, Math.min(2500, 700 * (retryCount + 1)));
+              } else {
+                setIsLoading(false);
+                setHasError(true);
+              }
+            }}
+            className="w-full h-full object-contain bg-black"
+          />
+
+          {isLoading && !hasError && (
+            <div className="absolute inset-0 bg-slate-950/80 flex flex-col items-center justify-center gap-1 text-cyan-300 p-2 text-center pointer-events-none z-20">
+              <Loader2 className="w-4 h-4 animate-spin text-cyan-400" />
+              <span className="text-[9px] font-mono leading-tight">
+                Frame @{formatDuration(safeStart)}...
+              </span>
+            </div>
+          )}
+
+          {hasError && (
+            <div className="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center gap-1 text-slate-400 p-2 text-center z-20">
+              <FileVideo className="w-4 h-4 text-cyan-400/70" />
+              <span className="text-[9px] font-mono leading-tight">Preview Unavailable</span>
+              <span className="text-[8px] font-mono text-cyan-400/80 underline">Click to retry</span>
+            </div>
+          )}
+
+          {/* Top-left timestamp indicator */}
+          <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black/75 backdrop-blur-sm border border-cyan-500/40 flex items-center gap-1 pointer-events-none z-10">
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                isPlaying ? 'bg-emerald-400 animate-pulse' : 'bg-cyan-400'
+              }`}
+            />
+            <span className="text-[9px] font-mono font-semibold text-cyan-200 tracking-tight">
+              {formatDuration(displayTimeSec)}
+              {safeEnd !== undefined ? ` / ${formatDuration(safeEnd)}` : ''}
+            </span>
+          </div>
+
+          {/* Center Play button overlay when paused on frame */}
+          {!isPlaying && !isLoading && !hasError && (
+            <button
+              type="button"
+              data-testid={`interval-thumbnail-play-${intervalId}`}
+              onClick={handleTogglePlay}
+              aria-label="Play interval video"
+              className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/35 transition-colors z-10"
+            >
+              <span className="w-9 h-9 rounded-full bg-black/75 group-hover:bg-cyan-500 text-cyan-300 group-hover:text-slate-950 border border-cyan-400/70 flex items-center justify-center shadow-lg transition-all">
+                <Play className="w-4 h-4 fill-current ml-0.5" />
+              </span>
+            </button>
+          )}
+
+          {/* Bottom-right Play/Pause & Reset to Start Frame controls */}
+          {!hasError && !isLoading && (isPlaying || Math.abs(displayTimeSec - safeStart) > 0.15) && (
+            <div className="absolute bottom-1.5 right-1.5 flex items-center gap-1 z-20">
+              <button
+                type="button"
+                onClick={handleTogglePlay}
+                className="p-1 rounded bg-black/80 hover:bg-cyan-600/80 text-white border border-slate-700/70 transition-colors"
+                title={isPlaying ? 'Pause video' : 'Play video'}
+              >
+                {isPlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+              </button>
+              <button
+                type="button"
+                onClick={handleResetToStart}
+                className="p-1 rounded bg-black/80 hover:bg-slate-800 text-slate-200 border border-slate-700/70 transition-colors"
+                title={`Reset to start frame (${formatDuration(safeStart)})`}
               >
                 <RotateCcw className="w-3 h-3" />
               </button>
@@ -395,6 +857,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         name: string;
         creatorName: string;
         creationDate: string;
+        purpose?: string;
         showCreateForm?: boolean;
       }
     >
@@ -428,7 +891,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
   const [showRawJsonMap, setShowRawJsonMap] = useState<Record<string, boolean>>({});
   const [activeSeekedActionId, setActiveSeekedActionId] = useState<string | null>(null);
-  const [seekFeedback, setSeekFeedback] = useState<string | null>(null);
   const [inspectionModal, setInspectionModal] = useState<{
     audit: ExecutionAudit;
     title: string;
@@ -542,25 +1004,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
   const [pass3Model, setPass3Model] = useState<string>('gemini-1.5-pro');
   const [pass3Thinking, setPass3Thinking] = useState<string>('MEDIUM');
 
-  const handleSeekToInterval = (seconds: number, actionId?: string, label?: string) => {
-    if (actionId) {
-      setActiveSeekedActionId(actionId);
-    }
-    const displayLabel = label || formatDuration(seconds);
-    setSeekFeedback(`Seeked to ${displayLabel} (${seconds.toFixed(1)}s)`);
-    setTimeout(() => setSeekFeedback(null), 3500);
-
-    onSeekVideo?.(seconds);
-
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(
-        new CustomEvent('sail:seek-video', {
-          detail: { seconds, actionId, videoId: selectedVideoId },
-        })
-      );
-    }
-  };
-
   /**
    * Selects a video as the current active stream and updates parent state.
    */
@@ -647,7 +1090,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
   useEffect(() => {
     fetchVideos();
-  }, [fetchVideos]);
+  }, [fetchVideos, tenant.customerId]);
 
   const loadInventories = useCallback(async () => {
     try {
@@ -695,13 +1138,18 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         '',
       creatorName: video.archiveCreatorName || pass0Data.creatorName || '',
       creationDate: video.archiveCreationDate || pass0Data.creationDate || '',
+      purpose:
+        (video as any).archivePurpose ||
+        pass0Data.purpose ||
+        pass0Data.identificationEvent?.purpose ||
+        '',
       showCreateForm: false,
     };
   };
 
   const updateArchiveDraftForVideo = (
     video: VideoRecord,
-    patch: Partial<{ name: string; creatorName: string; creationDate: string; showCreateForm?: boolean }>
+    patch: Partial<{ name: string; creatorName: string; creationDate: string; purpose?: string; showCreateForm?: boolean }>
   ) => {
     setArchiveDraftMap((prev) => {
       const base = prev[video.videoId] || getArchiveDraftForVideo(video);
@@ -881,6 +1329,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
           name: trimmedName,
           creatorName: draft.creatorName.trim() || null,
           creationDate: draft.creationDate.trim() || null,
+          purpose: (draft.purpose || '').trim() || null,
           videoId: video.videoId,
         },
         {
@@ -899,6 +1348,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 archiveName: created.name,
                 archiveCreatorName: created.creatorName ?? null,
                 archiveCreationDate: created.creationDate ?? null,
+                archivePurpose: created.purpose ?? null,
                 unmatchedArchiveName: null,
                 archiveAssociationType: 'MANUAL',
               }
@@ -919,6 +1369,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 archiveName: created.name,
                 creatorName: created.creatorName ?? curPasses.pass0.data.creatorName ?? null,
                 creationDate: created.creationDate ?? curPasses.pass0.data.creationDate ?? null,
+                purpose: created.purpose ?? curPasses.pass0.data.purpose ?? null,
               },
             },
           },
@@ -1024,8 +1475,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         const activeVid = list.find((v) => v.videoId === currentActiveId);
 
         if (activeVid && activeVid.status === 'TRANSCODING') {
-          const transcodePct = typeof activeVid.transcodeProgress === 'number' ? activeVid.transcodeProgress : 0;
-          setStatusBanner(`Stage 2/2: Normalizing & segmenting video... [${transcodePct}%]`);
+          // Progress is already displayed in the Video Ingestion progress bar
         } else if (activeVid && activeVid.status === 'READY_FOR_ANALYSIS') {
           setTranscodingVideoId(null);
           setUploadStep('SAVED');
@@ -1167,7 +1617,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       setTranscodingVideoId(video.videoId);
       setUploadStep('TRANSCODING');
       setUploadProgress(100);
-      setStatusBanner(`Stage 2/2: Normalizing & segmenting video... [0%]`);
     }
   };
 
@@ -1257,7 +1706,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       setUploadError(null);
       setLatestUploadedVideo(null);
       setUploadStep('UPLOADING');
-      setStatusBanner('Step 1/3: Requesting V4 Signed URL and uploading raw video directly to Cloud Storage...');
+      setStatusBanner(null);
 
       // 1. Request signed URL: POST /api/videos/request-upload-url
       const uploadHeaders = await apiService.getHeaders({
@@ -1283,17 +1732,14 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
       // 2. Upload raw file directly to GCS via PUT to V4 Signed URL with progress tracking
       setUploadProgress(0);
-      setStatusBanner('Stage 1/2: Uploading raw video to Cloud Storage... [0%]');
       await uploadToGcsWithProgress(signedUrl, file, (pct) => {
         setUploadProgress(pct);
-        setStatusBanner(`Stage 1/2: Uploading raw video to Cloud Storage... [${pct}%]`);
       });
       setUploadProgress(100);
 
       // 3. Notify server to process chunks asynchronously: POST /api/videos/finalize-upload
       setUploadStep('TRANSCODING');
       setUploadProgress(100);
-      setStatusBanner(`Stage 2/2: Normalizing & segmenting video... [0%]`);
 
       const browserDuration = await durationPromise;
       const fallbackCapturedAt =
@@ -1734,43 +2180,48 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         }
       : undefined;
 
-    const cachedAnalysis: VideoAnalysisDoc | undefined = hasPassData
-      ? ({
-          videoId: video.videoId,
-          ...rawCached,
-          ...(syncedClassification
-            ? {
-                workflowClassification: syncedClassification,
-                workloadClassification: syncedClassification,
-              }
-            : {}),
-          actions:
-            Array.isArray(rawCached?.actions) && rawCached.actions.length > 0
-              ? rawCached.actions
-              : pass1Actions,
-          events:
-            Array.isArray(rawCached?.events) && rawCached.events.length > 0
-              ? rawCached.events
-              : pass2Events,
-          refinements:
-            Array.isArray(rawCached?.refinements) && rawCached.refinements.length > 0
-              ? rawCached.refinements
-              : pass3Refinements,
-          ...(mergedReagents ? { reagents: mergedReagents } : {}),
-          ...(mergedWorkSteps ? { workSteps: mergedWorkSteps } : {}),
-          ...(mergedTranscriptions ? { labelTranscriptions: mergedTranscriptions } : {}),
-          ...(resolvedArchiveId ? { archiveId: resolvedArchiveId } : {}),
-          ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
-          ...(resolvedCreatorName ? { creatorName: resolvedCreatorName } : {}),
-          ...(resolvedCreationDate ? { creationDate: resolvedCreationDate } : {}),
-          ...(video.inventoryId ? { inventoryId: video.inventoryId } : {}),
-          isSignedOff: Boolean(
-            (video as any).isSignedOff ||
-              rawCached?.isSignedOff ||
-              passes?.hitl?.status === 'COMPLETED'
-          ),
-        } as VideoAnalysisDoc)
-      : undefined;
+    const fallbackClassification = syncedClassification || {
+      workflowType: isArchiveWorkflow
+        ? 'EXPERIMENT_NOTEBOOK_WORKFLOW'
+        : 'INVENTORY_UPDATE_WORKFLOW',
+      transcribedAudio: '',
+      ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
+      ...(resolvedCreatorName ? { creatorName: resolvedCreatorName } : {}),
+      ...(resolvedCreationDate ? { creationDate: resolvedCreationDate } : {}),
+      ...(video.inventoryName ? { inventoryName: video.inventoryName } : {}),
+    };
+
+    const cachedAnalysis: VideoAnalysisDoc = {
+      videoId: video.videoId,
+      ...(rawCached || {}),
+      workflowClassification: fallbackClassification as any,
+      workloadClassification: fallbackClassification as any,
+      actions:
+        Array.isArray(rawCached?.actions) && rawCached.actions.length > 0
+          ? rawCached.actions
+          : pass1Actions,
+      events:
+        Array.isArray(rawCached?.events) && rawCached.events.length > 0
+          ? rawCached.events
+          : pass2Events,
+      refinements:
+        Array.isArray(rawCached?.refinements) && rawCached.refinements.length > 0
+          ? rawCached.refinements
+          : pass3Refinements,
+      ...(mergedReagents ? { reagents: mergedReagents } : {}),
+      ...(mergedWorkSteps ? { workSteps: mergedWorkSteps } : {}),
+      ...(mergedTranscriptions ? { labelTranscriptions: mergedTranscriptions } : {}),
+      ...(resolvedArchiveId ? { archiveId: resolvedArchiveId } : {}),
+      ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
+      ...(resolvedCreatorName ? { creatorName: resolvedCreatorName } : {}),
+      ...(resolvedCreationDate ? { creationDate: resolvedCreationDate } : {}),
+      ...(video.inventoryId ? { inventoryId: video.inventoryId } : {}),
+      isSignedOff: Boolean(
+        (video as any).isSignedOff ||
+          rawCached?.isSignedOff ||
+          passes?.hitl?.status === 'COMPLETED'
+      ),
+    } as VideoAnalysisDoc;
 
     if (cachedAnalysis) {
       setAnalysisCache((prev) => ({ ...prev, [video.videoId]: cachedAnalysis }));
@@ -1859,7 +2310,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
     return (
       <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-950/80 text-emerald-300 border border-emerald-700/60">
         <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-        <span>Ready for Analysis</span>
+        <span>Transcoded</span>
       </span>
     );
   };
@@ -2078,6 +2529,10 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         video.archiveAssociationType === 'AUTOMATIC' ? 'High-Confidence Auto-Match' : 'Confirmed';
       const creatorLabel = video.archiveCreatorName || pass0Data?.creatorName;
       const dateLabel = video.archiveCreationDate || pass0Data?.creationDate;
+      const purposeLabel =
+        (video as any).archivePurpose ||
+        pass0Data?.purpose ||
+        pass0Data?.identificationEvent?.purpose;
 
       return (
         <div
@@ -2099,6 +2554,11 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
           {dateLabel && (
             <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-slate-900 text-slate-300 border border-slate-700">
               Date: {dateLabel}
+            </span>
+          )}
+          {purposeLabel && (
+            <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-slate-900 text-indigo-300 border border-indigo-700/60">
+              Purpose: {purposeLabel}
             </span>
           )}
         </div>
@@ -2254,7 +2714,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
           </span>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
           <div>
             <label className="block text-[10px] font-mono text-slate-300 mb-0.5">
               Archive Name (Required) *
@@ -2291,6 +2751,19 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
               value={draft.creationDate}
               onChange={(e) => updateArchiveDraftForVideo(video, { creationDate: e.target.value })}
               placeholder="Not specified in audio"
+              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-100 focus:border-indigo-400 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="block text-[10px] font-mono text-slate-300 mb-0.5">
+              Purpose (Optional)
+            </label>
+            <input
+              type="text"
+              aria-label={`Purpose for ${video.videoId}`}
+              value={draft.purpose || ''}
+              onChange={(e) => updateArchiveDraftForVideo(video, { purpose: e.target.value })}
+              placeholder="Reason for experiment (optional)"
               className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-100 focus:border-indigo-400 focus:outline-none"
             />
           </div>
@@ -2590,7 +3063,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
         )}
 
         {/* Status Banner */}
-        {statusBanner && (
+        {statusBanner && uploadStep !== 'UPLOADING' && uploadStep !== 'TRANSCODING' && (
           <div className="mt-4 p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-cyan-300 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <Sparkles className="w-4 h-4 text-cyan-400 shrink-0" />
@@ -2883,6 +3356,62 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                         <span className="text-sm font-bold text-slate-100">
                           {group.entityName}
                         </span>
+
+                        {group.entityType === 'inventory' && (
+                          <span
+                            role="link"
+                            tabIndex={0}
+                            data-testid={`group-jump-to-inventory-${group.groupKey}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const repVideo =
+                                (selectedVideo &&
+                                  group.videos.find((v) => v.videoId === selectedVideo.videoId)) ||
+                                group.videos[0];
+                              if (repVideo) {
+                                handleInspectResults(
+                                  {
+                                    ...repVideo,
+                                    inventoryId: group.entityId || repVideo.inventoryId,
+                                    inventoryName: group.entityName || repVideo.inventoryName,
+                                  },
+                                  false
+                                );
+                              } else if (group.entityId) {
+                                onNavigateToInventory?.(group.entityId);
+                              }
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const repVideo =
+                                  (selectedVideo &&
+                                    group.videos.find(
+                                      (v) => v.videoId === selectedVideo.videoId
+                                    )) ||
+                                  group.videos[0];
+                                if (repVideo) {
+                                  handleInspectResults(
+                                    {
+                                      ...repVideo,
+                                      inventoryId: group.entityId || repVideo.inventoryId,
+                                      inventoryName: group.entityName || repVideo.inventoryName,
+                                    },
+                                    false
+                                  );
+                                } else if (group.entityId) {
+                                  onNavigateToInventory?.(group.entityId);
+                                }
+                              }
+                            }}
+                            title={`Jump to Cryo-Inventory: ${group.entityName}`}
+                            className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-[11px] font-mono font-semibold bg-cyan-600/25 hover:bg-cyan-600/45 text-cyan-200 border border-cyan-500/50 transition-colors cursor-pointer"
+                          >
+                            <span>Open Inventory</span>
+                            <ArrowRight className="w-3 h-3 text-cyan-300 shrink-0" />
+                          </span>
+                        )}
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
@@ -2960,6 +3489,11 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                   videoId={video.videoId}
                                   originalName={video.originalName}
                                   status={video.status}
+                                  tenant={tenant}
+                                  organizationId={(video as any).organizationId}
+                                  durationSeconds={video.durationSeconds}
+                                  chunks={video.chunks}
+                                  totalChunks={video.totalChunks}
                                 />
                               ) : (
                                 <div className="w-9 h-9 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-center shrink-0">
@@ -3044,35 +3578,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                     >
                                       <button
                                         type="button"
-                                        disabled={
-                                          isVideoAnalyzing ||
-                                          video.status === 'UPLOADING' ||
-                                          video.status === 'TRANSCODING'
-                                        }
-                                        onClick={() => handleRunAllPasses(video)}
-                                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                                      >
-                                        {isVideoAnalyzing ? (
-                                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                        ) : (
-                                          <Play className="w-3.5 h-3.5" />
-                                        )}
-                                        <span>Run All Passes</span>
-                                      </button>
-
-                                      <button
-                                        type="button"
-                                        disabled={!canInspectResults}
-                                        onClick={() => handleInspectResults(video)}
-                                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                                      >
-                                        <Eye className="w-3.5 h-3.5" />
-                                        <span>Inspect Results</span>
-                                        <ArrowRight className="w-3.5 h-3.5" />
-                                      </button>
-
-                                      <button
-                                        type="button"
                                         disabled={isDeleting}
                                         onClick={() => handleDeleteVideo(video)}
                                         title="Delete video from database"
@@ -3121,9 +3626,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                   {selectedVideo.originalName} ({selectedVideo.videoId})
                 </span>
               </div>
-              <p className="text-xs text-slate-400 font-mono">
-                Execute individual passes (Pass 0 → Pass 3) or all passes sequentially
-              </p>
             </div>
 
             {selectedVideo.status === 'TRANSCODING' && (
@@ -3144,79 +3646,140 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
               </div>
             )}
 
-            <div className="flex items-center gap-3 shrink-0">
-              <button
-                type="button"
-                disabled={
-                  Boolean(analyzingIds[selectedVideo.videoId]) ||
-                  Object.values(runningPassMap[selectedVideo.videoId] || {}).some(Boolean)
-                }
-                onClick={() => handleRunAllPasses(selectedVideo)}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 text-white shadow-lg shadow-indigo-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-              >
-                {analyzingIds[selectedVideo.videoId] ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Running All Passes...</span>
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-4 h-4" />
-                    <span>Run All Passes</span>
-                  </>
-                )}
-              </button>
+            <div className="w-full space-y-2.5">
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  disabled={
+                    Boolean(analyzingIds[selectedVideo.videoId]) ||
+                    Object.values(runningPassMap[selectedVideo.videoId] || {}).some(Boolean)
+                  }
+                  onClick={() => handleRunAllPasses(selectedVideo)}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 text-white shadow-lg shadow-indigo-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                >
+                  {analyzingIds[selectedVideo.videoId] ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Running Passes 1-3...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4" />
+                      <span>Run Passes 1-3</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="review-analysis-button"
+                  onClick={() => setIsReviewAnalysisModalOpen(true)}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-indigo-600/25 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-500/40 transition-colors"
+                >
+                  <Eye className="w-3.5 h-3.5 text-indigo-300" />
+                  <span>View Analysis</span>
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="verify-analysis-button"
+                  onClick={() => handleInspectResults(selectedVideo, true)}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 transition-colors"
+                >
+                  <Eye className="w-3.5 h-3.5 text-emerald-300" />
+                  <span>Verify Analysis</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {(() => {
+                const selectedPass0Data = selectedPasses.pass0?.data;
+                const selectedPass0WorkflowType =
+                  selectedPass0Data?.workflowType ||
+                  analysisCache[selectedVideo.videoId]?.workflowClassification?.workflowType ||
+                  analysisCache[selectedVideo.videoId]?.workloadClassification?.workflowType;
+                const rawSelectedPass1 = selectedPasses.pass1?.data;
+                const selectedPass1Actions = Array.isArray(rawSelectedPass1)
+                  ? rawSelectedPass1
+                  : Array.isArray(rawSelectedPass1?.actions)
+                  ? rawSelectedPass1.actions
+                  : [];
+                const isSelectedArchive =
+                  selectedPass0WorkflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                  Boolean(selectedVideo.archiveId) ||
+                  Boolean(selectedVideo.archiveAssociationType) ||
+                  Boolean(selectedVideo.archiveName) ||
+                  Boolean(selectedVideo.unmatchedArchiveName) ||
+                  Boolean(selectedVideo.originalName?.toLowerCase().includes('archive')) ||
+                  Boolean(selectedVideo.videoId?.toLowerCase().includes('archive')) ||
+                  selectedPass1Actions.some((a: any) => {
+                    const cls = String(a?.actionType || a?.actionClass || '').toUpperCase();
+                    return (
+                      cls.includes('MIX') ||
+                      cls.includes('SEED') ||
+                      cls.includes('INCUBAT') ||
+                      cls.includes('ASPIRAT') ||
+                      cls.includes('ASPRIRAT') ||
+                      cls.includes('HEMOCYTOMETER')
+                    );
+                  });
+
+                if (!isSelectedArchive) return null;
+
+                const candidateName =
+                  selectedVideo.archiveName ||
+                  selectedVideo.unmatchedArchiveName ||
+                  selectedPass0Data?.archiveName ||
+                  '';
+                const matchedArchive = archives.find(
+                  (a) =>
+                    (selectedVideo.archiveId && a.id === selectedVideo.archiveId) ||
+                    (Array.isArray(a.videoIds) && a.videoIds.includes(selectedVideo.videoId)) ||
+                    (candidateName &&
+                      a.name &&
+                      a.name.trim().toLowerCase() === String(candidateName).trim().toLowerCase())
+                );
+                const resolvedArchiveId = selectedVideo.archiveId || matchedArchive?.id;
+                const resolvedArchiveName =
+                  matchedArchive?.name ||
+                  selectedVideo.archiveName ||
+                  selectedVideo.unmatchedArchiveName ||
+                  selectedPass0Data?.archiveName;
+
+                return (
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      data-testid="open-archive-button"
+                      onClick={() =>
+                        handleInspectResults(
+                          {
+                            ...selectedVideo,
+                            archiveId: resolvedArchiveId || selectedVideo.archiveId,
+                            archiveName: resolvedArchiveName || selectedVideo.archiveName,
+                          },
+                          false
+                        )
+                      }
+                      title={
+                        resolvedArchiveName
+                          ? `Jump to Experiment Archive: ${resolvedArchiveName}`
+                          : 'Jump to Experiment Archive'
+                      }
+                      className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-cyan-600/25 hover:bg-cyan-600/40 text-cyan-200 border border-cyan-500/40 transition-colors"
+                    >
+                      <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+                      <span>Open Archive</span>
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                );
+              })()}
             </div>
           </div>
 
-          {/* Video Analysis Passes Summary Card (Opens Wide Pop-up Modal) + HITL Verification Card */}
+          {/* Video Analysis Passes Summary Card (Pass 0-3 + Analysis Verification Status) */}
           <div className="space-y-3">
-            <div
-              data-testid="passes-0-3-panel"
-              className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 space-y-3 transition-all"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="space-y-1">
-                  <div className="text-sm font-bold text-slate-100 flex items-center gap-2.5">
-                    <Cpu className="w-4 h-4 text-indigo-400 shrink-0" />
-                    <span>Video Analysis Passes (Pass 0 – Pass 3)</span>
-                  </div>
-                  <p className="text-xs text-slate-400 font-mono">
-                    Open the wide analysis review window to inspect and execute Pass 0 through Pass 3
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    data-testid="review-analysis-button"
-                    onClick={() => setIsReviewAnalysisModalOpen(true)}
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-indigo-600/25 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-500/40 transition-colors"
-                  >
-                    <Eye className="w-3.5 h-3.5 text-indigo-300" />
-                    <span>Review Analysis</span>
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
-
-              <div className="pt-2.5 border-t border-slate-800/80 flex flex-wrap items-center gap-2.5 text-xs font-mono">
-                {passStepsConfig.map((step) => {
-                  const pState = selectedPasses[step.passKey] || { status: 'PENDING' };
-                  const pRunning =
-                    Boolean(runningPassMap[selectedVideo.videoId]?.[step.passKey]) ||
-                    pState.status === 'RUNNING';
-                  return (
-                    <span key={step.passKey} className="inline-flex items-center gap-1.5">
-                      <span className="text-[11px] text-slate-400">Pass {step.passNumber}:</span>
-                      {renderPassStatusBadge(pState.status, pRunning)}
-                    </span>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Step 5: Human-in-the-Loop (HITL) Verification Card */}
             {(() => {
               const isHitlCommitted =
                 selectedPasses.hitl?.status === 'COMPLETED' ||
@@ -3229,35 +3792,32 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
               return (
                 <div
-                  className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 space-y-4"
-                  data-testid="hitl-verification-card"
+                  data-testid="passes-0-3-panel"
+                  className="rounded-xl bg-slate-950/80 border border-slate-800 p-4 transition-all"
                 >
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="space-y-0.5">
-                      <div className="text-sm font-bold text-slate-100 flex items-center gap-2.5">
-                        <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                        <span>Human-in-the-Loop (HITL) Verification</span>
-                        {renderPassStatusBadge(
-                          isHitlCommitted ? 'COMPLETED' : selectedPasses.hitl?.status || 'PENDING',
-                          isCommittingHitl
-                        )}
-                      </div>
-                      <p className="text-xs text-slate-400 font-mono">
-                        Inspect and edit information generated by video analysis pipeline, then commit to the database
-                      </p>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => handleInspectResults(selectedVideo, true)}
-                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 transition-colors"
-                      >
-                        <Eye className="w-3.5 h-3.5 text-emerald-300" />
-                        <span>Review in Sign-Off Tab</span>
-                        <ArrowRight className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
+                  <div className="flex flex-wrap items-center gap-2.5 text-xs font-mono">
+                    {passStepsConfig.map((step) => {
+                      const pState = selectedPasses[step.passKey] || { status: 'PENDING' };
+                      const pRunning =
+                        Boolean(runningPassMap[selectedVideo.videoId]?.[step.passKey]) ||
+                        pState.status === 'RUNNING';
+                      return (
+                        <span key={step.passKey} className="inline-flex items-center gap-1.5">
+                          <span className="text-[11px] text-slate-400">Pass {step.passNumber}:</span>
+                          {renderPassStatusBadge(pState.status, pRunning)}
+                        </span>
+                      );
+                    })}
+                    <span
+                      data-testid="hitl-verification-card"
+                      className="inline-flex items-center gap-1.5"
+                    >
+                      <span className="text-[11px] text-slate-400">Analysis:</span>
+                      {renderPassStatusBadge(
+                        isHitlCommitted ? 'COMPLETED' : selectedPasses.hitl?.status || 'PENDING',
+                        isCommittingHitl
+                      )}
+                    </span>
                   </div>
                 </div>
               );
@@ -3287,9 +3847,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 </div>
                 <div className="min-w-0 space-y-1">
                   <div className="flex items-center gap-2.5 flex-wrap">
-                    <h3 className="text-base font-bold text-slate-100">
-                      Video Analysis Passes (Pass 0 – Pass 3)
-                    </h3>
                     <span className="inline-block text-xs font-mono px-2.5 py-0.5 rounded-md bg-slate-950 text-cyan-300 border border-slate-800">
                       {selectedVideo.originalName} ({selectedVideo.videoId})
                     </span>
@@ -3324,12 +3881,12 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                   {analyzingIds[selectedVideo.videoId] ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Running All Passes...</span>
+                      <span>Running Passes 1-3...</span>
                     </>
                   ) : (
                     <>
                       <Play className="w-4 h-4" />
-                      <span>Run All Passes</span>
+                      <span>Run Passes 1-3</span>
                     </>
                   )}
                 </button>
@@ -3487,6 +4044,11 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                           {pass0Data.identificationEvent.description && (
                             <span className="text-[11px] text-slate-300 font-sans">
                               {pass0Data.identificationEvent.description}
+                            </span>
+                          )}
+                          {(pass0Data.identificationEvent.purpose || pass0Data.purpose) && (
+                            <span className="px-2 py-0.5 rounded text-[11px] bg-indigo-950/60 text-indigo-200 border border-indigo-700/50">
+                              Purpose: {pass0Data.identificationEvent.purpose || pass0Data.purpose}
                             </span>
                           )}
                         </div>
@@ -3700,14 +4262,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                         )}
                       </div>
 
-                      {/* Seek feedback toast */}
-                      {seekFeedback && step.passKey === 'pass1' && (
-                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-cyan-950/80 border border-cyan-700 text-xs text-cyan-200 font-mono">
-                          <Clock className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
-                          <span>{seekFeedback}</span>
-                        </div>
-                      )}
-
                       {/* Pass 1: Fine-Grained Temporal Interval Cards View */}
                       {step.passKey === 'pass1' && hasJsonData && !showRawJsonMap[drawerKey] ? (
                         (() => {
@@ -3781,8 +4335,14 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                   const isArchiveAct =
                                     actType.toUpperCase().includes('SEED') ||
                                     actType.toUpperCase().includes('MIX') ||
+                                    actType.toUpperCase().includes('INCUBAT') ||
+                                    actType.toUpperCase().includes('ASPIRAT') ||
+                                    actType.toUpperCase().includes('ASPRIRAT') ||
+                                    actType.toUpperCase().includes('HEMOCYTOMETER') ||
                                     Boolean(actionItem.seedReagentsData) ||
-                                    Boolean(actionItem.mixReagentsData);
+                                    Boolean(actionItem.mixReagentsData) ||
+                                    Boolean(actionItem.incubateCellsData || actionItem.incubatorSettings) ||
+                                    Boolean(actionItem.hemocytometerLoadingData || actionItem.hemocytometerLoad);
                                   const targetCoord =
                                     !isArchiveAct && !isArchiveWorkflow
                                       ? actionItem.targetCoordinate ||
@@ -3802,10 +4362,16 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                     typeBadgeColor = 'bg-emerald-950/80 text-emerald-300 border-emerald-800/80';
                                   } else if (actType === 'VIAL_REMOVAL' || actType.includes('REMOVAL')) {
                                     typeBadgeColor = 'bg-amber-950/80 text-amber-300 border-amber-800/80';
-                                  } else if (actType.includes('SEEDING')) {
+                                  } else if (actType.includes('SEED')) {
                                     typeBadgeColor = 'bg-cyan-950/80 text-cyan-300 border-cyan-800/80';
-                                  } else if (actType.includes('MIXING')) {
+                                  } else if (actType.includes('MIX')) {
                                     typeBadgeColor = 'bg-purple-950/80 text-purple-300 border-purple-800/80';
+                                  } else if (actType.includes('INCUBAT')) {
+                                    typeBadgeColor = 'bg-amber-950/80 text-amber-300 border-amber-800/80';
+                                  } else if (actType.includes('ASPIRAT') || actType.includes('ASPRIRAT')) {
+                                    typeBadgeColor = 'bg-sky-950/80 text-sky-300 border-sky-800/80';
+                                  } else if (actType.toUpperCase().includes('HEMOCYTOMETER')) {
+                                    typeBadgeColor = 'bg-teal-950/80 text-teal-300 border-teal-800/80';
                                   }
 
                                   return (
@@ -4002,8 +4568,50 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                         </div>
                                       )}
 
-                                      {/* Bottom Row: Metadata Chips + Seek Button */}
-                                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-800/60 text-xs">
+                                      {(actionItem.incubateCellsData || actionItem.incubatorSettings) && (
+                                        <div className="text-[10px] font-mono bg-amber-950/35 border border-amber-800/50 rounded-lg p-2 space-y-1">
+                                          <div className="text-amber-300 font-semibold">
+                                            Action: Incubate Cells — INCUBATOR_SETTINGS ({`action_${actId}.json`})
+                                          </div>
+                                          <div className="grid grid-cols-2 gap-1 text-slate-300">
+                                            <span>
+                                              Temperature:{' '}
+                                              <strong className="text-amber-200">
+                                                {(actionItem.incubateCellsData || actionItem.incubatorSettings)?.temperature || 'N/A'}
+                                              </strong>
+                                            </span>
+                                            <span>
+                                              CO2 Level:{' '}
+                                              <strong className="text-amber-200">
+                                                {(actionItem.incubateCellsData || actionItem.incubatorSettings)?.co2Level || 'N/A'}
+                                              </strong>
+                                            </span>
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {(actionItem.hemocytometerLoadingData ||
+                                        actionItem.hemocytometerLoad ||
+                                        actionItem.substanceLoaded ||
+                                        actType.toUpperCase().includes('HEMOCYTOMETER')) && (
+                                        <div className="text-[10px] font-mono bg-teal-950/35 border border-teal-800/50 rounded-lg p-2 space-y-1">
+                                          <div className="text-teal-300 font-semibold">
+                                            Action: Hemocytometer Loading — hemocytometer_load ({`action_${actId}.json`})
+                                          </div>
+                                          <div className="text-slate-300">
+                                            Substance Loaded:{' '}
+                                            <strong className="text-teal-200">
+                                              {(actionItem.hemocytometerLoadingData || actionItem.hemocytometerLoad)
+                                                ?.substanceLoaded ||
+                                                actionItem.substanceLoaded ||
+                                                'N/A'}
+                                            </strong>
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {/* Bottom Row: Metadata Chips + Interval Thumbnail Video */}
+                                      <div className="flex flex-wrap items-end justify-between gap-3 pt-2 border-t border-slate-800/60 text-xs">
                                         <div className="flex flex-wrap items-center gap-2">
                                           {targetCoord && !isArchiveAct && !isArchiveWorkflow && (
                                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-mono bg-slate-950 text-indigo-300 border border-slate-800">
@@ -4034,25 +4642,17 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                           </span>
                                         </div>
 
-                                        {/* Seek Video Button */}
-                                        <button
-                                          type="button"
-                                          onClick={() =>
-                                            handleSeekToInterval(
-                                              startSec,
-                                              actId,
-                                              actionItem.startTime || formatDuration(startSec)
-                                            )
-                                          }
-                                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-mono font-medium transition-colors border ${
-                                            isSelected
-                                              ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-bold'
-                                              : 'bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border-cyan-800/70 hover:border-cyan-600'
-                                          }`}
-                                        >
-                                          <Play className="w-3 h-3 fill-current" />
-                                          <span>Seek Video</span>
-                                        </button>
+                                        {/* Interval Thumbnail Video Paused on Start Frame */}
+                                        <IntervalThumbnailPreview
+                                          videoId={selectedVideo.videoId}
+                                          status={selectedVideo.status}
+                                          tenant={tenant}
+                                          organizationId={(selectedVideo as any).organizationId}
+                                          startSeconds={startSec}
+                                          endSeconds={endSec}
+                                          intervalId={actId}
+                                          onPlayInterval={() => setActiveSeekedActionId(actId)}
+                                        />
                                       </div>
                                     </div>
                                   );
@@ -4105,46 +4705,48 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                   ? 'REAGENT_LABEL_PRESENTATION_EVENT'
                                                   : 'VIAL_LABEL_PRESENTATION')}
                                             </span>
-                                            <button
-                                              type="button"
-                                              onClick={() =>
-                                                handleSeekToInterval(
-                                                  evtStart,
-                                                  evtId,
-                                                  `${evtStart.toFixed(1)}s`
-                                                )
-                                              }
-                                              className="text-[11px] text-cyan-300 hover:text-cyan-200 flex items-center gap-1"
-                                            >
+                                            <span className="text-[11px] text-cyan-300 flex items-center gap-1">
                                               <Clock className="w-3 h-3" />
                                               <span>
                                                 {evtStart.toFixed(1)}s–{evtEnd.toFixed(1)}s
                                               </span>
-                                            </button>
+                                            </span>
                                           </div>
                                           {evt.description && (
                                             <p className="text-[11px] text-slate-300 font-sans">
                                               {evt.description}
                                             </p>
                                           )}
-                                          <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                                            <span className="text-slate-400">
-                                              Associated Actions ({assocIds.length}):
-                                            </span>
-                                            {assocIds.length > 0 ? (
-                                              assocIds.map((aid) => (
-                                                <span
-                                                  key={aid}
-                                                  className="px-1.5 py-0.5 rounded bg-indigo-950/70 text-indigo-200 border border-indigo-700/50"
-                                                >
-                                                  {aid}
-                                                </span>
-                                              ))
-                                            ) : (
-                                              <span className="text-slate-500 italic">
-                                                None (standalone event)
+                                          <div className="flex flex-wrap items-end justify-between gap-2 pt-1">
+                                            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                                              <span className="text-slate-400">
+                                                Associated Actions ({assocIds.length}):
                                               </span>
-                                            )}
+                                              {assocIds.length > 0 ? (
+                                                assocIds.map((aid) => (
+                                                  <span
+                                                    key={aid}
+                                                    className="px-1.5 py-0.5 rounded bg-indigo-950/70 text-indigo-200 border border-indigo-700/50"
+                                                  >
+                                                    {aid}
+                                                  </span>
+                                                ))
+                                              ) : (
+                                                <span className="text-slate-500 italic">
+                                                  None (standalone event)
+                                                </span>
+                                              )}
+                                            </div>
+                                            <IntervalThumbnailPreview
+                                              videoId={selectedVideo.videoId}
+                                              status={selectedVideo.status}
+                                              tenant={tenant}
+                                              organizationId={(selectedVideo as any).organizationId}
+                                              startSeconds={evtStart}
+                                              endSeconds={evtEnd}
+                                              intervalId={`p1_${evtId}`}
+                                              onPlayInterval={() => setActiveSeekedActionId(evtId)}
+                                            />
                                           </div>
                                         </div>
                                       );
@@ -4173,6 +4775,8 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                 const cls = String(evt?.eventClass || evt?.actionType || '').toUpperCase();
                                 return (
                                   (cls.includes('REAGENT_LABEL') ||
+                                    cls.includes('INCUBATOR_SETTINGS') ||
+                                    cls.includes('HEMOCYTOMETER_LOAD') ||
                                     cls.includes('SEEDING') ||
                                     cls.includes('WELL_SEEDING')) &&
                                   !cls.includes('AUDIO_UTTERANCE') &&
@@ -4268,6 +4872,10 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                             >
                                               {isBoxLabel
                                                 ? '📦 BOX LABEL PRESENTATION'
+                                                : evtClass.toUpperCase().includes('INCUBATOR_SETTINGS')
+                                                ? '🌡 INCUBATOR SETTINGS'
+                                                : evtClass.toUpperCase().includes('HEMOCYTOMETER_LOAD')
+                                                ? '🔬 HEMOCYTOMETER LOAD (hemocytometer_load)'
                                                 : evtClass.toUpperCase().includes('REAGENT_LABEL')
                                                 ? '🧪 REAGENT LABEL PRESENTATION'
                                                 : evtClass.toUpperCase().includes('MIXING_AMOUNT')
@@ -4281,6 +4889,23 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 ? '🧪 REAGENT LABEL PRESENTATION'
                                                 : '🧪 VIAL LABEL PRESENTATION'}
                                             </span>
+                                            {(evt.incubatorSettings || evt.temperature || evt.co2Level) && (
+                                              <span className="text-xs font-mono text-amber-300 bg-amber-950/60 px-2 py-0.5 rounded border border-amber-800/60 font-semibold">
+                                                Temp: {evt.incubatorSettings?.temperature || evt.temperature || 'N/A'} • CO2: {evt.incubatorSettings?.co2Level || evt.co2Level || 'N/A'}
+                                              </span>
+                                            )}
+                                            {(evt.hemocytometerLoadingData ||
+                                              evt.hemocytometerLoad ||
+                                              evt.substanceLoaded ||
+                                              evtClass.toUpperCase().includes('HEMOCYTOMETER_LOAD')) && (
+                                              <span className="text-xs font-mono text-teal-300 bg-teal-950/60 px-2 py-0.5 rounded border border-teal-800/60 font-semibold">
+                                                Substance Loaded:{' '}
+                                                {(evt.hemocytometerLoadingData || evt.hemocytometerLoad)
+                                                  ?.substanceLoaded ||
+                                                  evt.substanceLoaded ||
+                                                  'N/A'}
+                                              </span>
+                                            )}
                                             {(evt.seededColumn != null ||
                                               evt.metadata?.seededColumn != null ||
                                               evt.targetLocation) && (
@@ -4298,21 +4923,17 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                             </span>
                                           </div>
 
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              handleSeekToInterval(
-                                                startSec,
-                                                evtId,
-                                                `${startSec.toFixed(1)}s`
-                                              )
-                                            }
-                                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-mono font-medium bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border border-cyan-800/70 transition-colors"
-                                          >
-                                            <Play className="w-3 h-3 fill-current" />
-                                            <span>Seek Event</span>
-                                          </button>
-                                        </div>
+                                            <IntervalThumbnailPreview
+                                              videoId={selectedVideo.videoId}
+                                              status={selectedVideo.status}
+                                              tenant={tenant}
+                                              organizationId={(selectedVideo as any).organizationId}
+                                              startSeconds={startSec}
+                                              endSeconds={endSec}
+                                              intervalId={`p2_${evtId}`}
+                                              onPlayInterval={() => setActiveSeekedActionId(evtId)}
+                                            />
+                                          </div>
 
                                         {/* Associated Actions & Spoken Context */}
                                         <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
@@ -4377,19 +4998,9 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                       ? '1. Highest Contrast Frame'
                                                       : '2. Minimal Blur Frame'}
                                                   </span>
-                                                  <button
-                                                    type="button"
-                                                    onClick={() =>
-                                                      handleSeekToInterval(
-                                                        frameTs,
-                                                        `${evtId}_${fIdx}`,
-                                                        `${frameTs.toFixed(2)}s`
-                                                      )
-                                                    }
-                                                    className="text-cyan-400 hover:underline"
-                                                  >
+                                                  <span className="text-cyan-400">
                                                     @{frameTs.toFixed(2)}s
-                                                  </button>
+                                                  </span>
                                                 </div>
 
                                                 <div className="w-full rounded bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center">
@@ -4481,20 +5092,16 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 {ra.startTime && ra.endTime ? ` (${ra.startTime} – ${ra.endTime})` : ''}
                                               </span>
                                             </div>
-                                            <button
-                                              type="button"
-                                              onClick={() =>
-                                                handleSeekToInterval(
-                                                  refStart,
-                                                  ra.actionId,
-                                                  `${refStart.toFixed(2)}s`
-                                                )
-                                              }
-                                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] font-mono font-medium bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border border-cyan-800/70 transition-colors"
-                                            >
-                                              <Play className="w-3 h-3 fill-current" />
-                                              <span>Seek Action</span>
-                                            </button>
+                                            <IntervalThumbnailPreview
+                                              videoId={selectedVideo.videoId}
+                                              status={selectedVideo.status}
+                                              tenant={tenant}
+                                              organizationId={(selectedVideo as any).organizationId}
+                                              startSeconds={refStart}
+                                              endSeconds={refEnd}
+                                              intervalId={`p2_ref_${ra.actionId}`}
+                                              onPlayInterval={() => setActiveSeekedActionId(ra.actionId)}
+                                            />
                                           </div>
                                           <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400">
                                             <span>
@@ -4926,7 +5533,13 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                               {/* 3. Appended Inventory Update Action JSONs (action_{id}.json) */}
                               {!isArchiveWorkflow && pass1ActionsList.filter((a: any) => {
                                 const cls = String(a.actionType || a.actionClass || '').toUpperCase();
-                                return !cls.includes('MIX') && !cls.includes('SEED');
+                                return (
+                                  !cls.includes('MIX') &&
+                                  !cls.includes('SEED') &&
+                                  !cls.includes('INCUBAT') &&
+                                  !cls.includes('ASPIRAT') &&
+                                  !cls.includes('ASPRIRAT')
+                                );
                               }).length > 0 && (
                                 <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-2.5">
                                   <div className="text-xs font-mono font-semibold text-emerald-300 flex items-center justify-between">
@@ -4941,7 +5554,13 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                     {pass1ActionsList
                                       .filter((a: any) => {
                                         const cls = String(a.actionType || a.actionClass || '').toUpperCase();
-                                        return !cls.includes('MIX') && !cls.includes('SEED');
+                                        return (
+                                          !cls.includes('MIX') &&
+                                          !cls.includes('SEED') &&
+                                          !cls.includes('INCUBAT') &&
+                                          !cls.includes('ASPIRAT') &&
+                                          !cls.includes('ASPRIRAT')
+                                        );
                                       })
                                       .map((act: any, idx: number) => {
                                         const actId = act.actionId || `act_${idx + 1}`;
@@ -5090,6 +5709,16 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               <pre className="bg-slate-900/90 p-2 rounded border border-slate-800 text-[9px] font-mono text-emerald-300 overflow-x-auto whitespace-pre">
                                                 {render96WellPlateMarkdown(ws.seedReagentsData.seededColumns, ws.seedReagentsData.seededWells)}
                                               </pre>
+                                            </div>
+                                          )}
+                                          {(ws.incubateCellsData || ws.incubatorSettings) && (
+                                            <div className="text-slate-300 pt-1">
+                                              Incubator Settings (INCUBATOR_SETTINGS): Temperature: <strong className="text-amber-300">{(ws.incubateCellsData || ws.incubatorSettings)?.temperature || 'N/A'}</strong> • CO2 Level: <strong className="text-amber-300">{(ws.incubateCellsData || ws.incubatorSettings)?.co2Level || 'N/A'}</strong>
+                                            </div>
+                                          )}
+                                          {(ws.hemocytometerLoadingData || ws.hemocytometerLoad || ws.substanceLoaded) && (
+                                            <div className="text-slate-300 pt-1">
+                                              Hemocytometer Load (hemocytometer_load): Substance Loaded: <strong className="text-teal-300">{(ws.hemocytometerLoadingData || ws.hemocytometerLoad)?.substanceLoaded || ws.substanceLoaded || 'N/A'}</strong>
                                             </div>
                                           )}
                                         </div>

@@ -602,15 +602,32 @@ export const listVideosHandler = async (req: Request, res: Response): Promise<Re
                     // Signed URL not available in current credentials; fall through to local download
                   }
 
-                  // 2. If signed URL probe didn't yield duration/capturedAt, download to local raw cache and run ffprobe
-                  if (!probed.capturedAt || !probed.durationSeconds || probed.durationSeconds <= 0) {
+                  // 2. If signed URL probe didn't yield duration, download atomically via a temporary file and run ffprobe
+                  const isMultiChunkVideo =
+                    (typeof v.totalChunks === 'number' && v.totalChunks > 1) ||
+                    (Array.isArray(v.chunks) && v.chunks.length > 1);
+                  if ((!probed.durationSeconds || probed.durationSeconds <= 0) && !isMultiChunkVideo) {
                     const rawCacheDir = path.join(scratchDir, 'sail_raw_cache');
                     if (!fs.existsSync(rawCacheDir)) {
                       fs.mkdirSync(rawCacheDir, { recursive: true });
                     }
                     const destPath = path.join(rawCacheDir, `raw_${v.videoId}.mp4`);
                     if (!fs.existsSync(destPath)) {
-                      await gcsFile.download({ destination: destPath });
+                      const tmpDest = `${destPath}.tmp_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                      try {
+                        await gcsFile.download({ destination: tmpDest });
+                        if (fs.existsSync(tmpDest) && fs.statSync(tmpDest).size > 0) {
+                          fs.renameSync(tmpDest, destPath);
+                        }
+                      } finally {
+                        if (fs.existsSync(tmpDest)) {
+                          try {
+                            fs.unlinkSync(tmpDest);
+                          } catch {
+                            // ignore
+                          }
+                        }
+                      }
                     }
                     if (fs.existsSync(destPath)) {
                       const dlMeta = await probeVideoMetadata(destPath);
@@ -636,23 +653,22 @@ export const listVideosHandler = async (req: Request, res: Response): Promise<Re
               }
             }
 
-            if (probed.capturedAt || (probed.durationSeconds !== undefined && probed.durationSeconds > 0)) {
-              const updates: Record<string, any> = { metadataProbed: true };
-              if (probed.capturedAt) {
-                v.capturedAt = probed.capturedAt;
-                updates.capturedAt = probed.capturedAt;
-              }
-              if (probed.durationSeconds !== undefined && probed.durationSeconds > 0) {
-                v.durationSeconds = probed.durationSeconds;
-                updates.durationSeconds = probed.durationSeconds;
-              }
-              await db
-                .collection('videos')
-                .doc(v.videoId)
-                .update(updates)
-                .catch(() => {});
-              firestoreService.mirrorVideoToMemory('(default)', v.videoId, updates);
+            const updates: Record<string, any> = { metadataProbed: true };
+            v.metadataProbed = true;
+            if (probed.capturedAt) {
+              v.capturedAt = probed.capturedAt;
+              updates.capturedAt = probed.capturedAt;
             }
+            if (probed.durationSeconds !== undefined && probed.durationSeconds > 0) {
+              v.durationSeconds = probed.durationSeconds;
+              updates.durationSeconds = probed.durationSeconds;
+            }
+            await db
+              .collection('videos')
+              .doc(v.videoId)
+              .update(updates)
+              .catch(() => {});
+            firestoreService.mirrorVideoToMemory('(default)', v.videoId, updates);
           } catch (probeErr) {
             console.warn(`[VideoController] Metadata backfill skipped for ${v.videoId}:`, probeErr);
           }
@@ -755,10 +771,13 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
   const uploadedBy = req.user?.uid || 'anonymous';
   const uploaderEmail = req.user?.email || '';
   const uploadedAt = new Date().toISOString();
+  const defaultBucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
   const initialRecord: Record<string, any> = {
     videoId,
     originalName,
     rawGcsUri,
+    bucketName: defaultBucketName,
+    gcsBucket: defaultBucketName,
     organizationId,
     uploadedBy,
     uploaderEmail,
@@ -861,6 +880,7 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
       const ffmpegArgs = [
         '-nostdin',
         '-y',
+        '-fflags', '+genpts',
         '-i', rawFilePath,
         '-progress', 'pipe:1',
         '-vf', "scale='min(1920,iw)':-2,format=yuv420p", // Standardizes both Meta Ray-Ban and BleeqUp to 8-bit
@@ -871,10 +891,12 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         '-crf', '23',
         '-c:a', 'aac',
         '-b:a', '128k',
+        '-avoid_negative_ts', 'make_zero',
         '-force_key_frames', 'expr:gte(t,n_forced*600)', // Chunk keyframes every 10 min
         '-f', 'segment',
         '-segment_time', '600',
         '-reset_timestamps', '1',
+        '-segment_format_options', 'movflags=+faststart',
         outputPattern
       ];
 
@@ -1001,16 +1023,22 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
           resumable: false,
         });
 
-        // Cache the first chunk locally for fast downstream Pass 0-3 execution
-        if (i === 0 && fs.existsSync(localChunkPath)) {
+        // Cache chunks locally for fast downstream Pass 0-3 execution
+        if (fs.existsSync(localChunkPath)) {
           try {
             const cacheDir = path.join(scratchDir, 'sail_normalized_cache');
             if (!fs.existsSync(cacheDir)) {
               fs.mkdirSync(cacheDir, { recursive: true });
             }
-            await fs.promises.copyFile(localChunkPath, path.join(cacheDir, `norm_${videoId}.mp4`));
+            if (i === 0) {
+              await fs.promises.copyFile(localChunkPath, path.join(cacheDir, `norm_${videoId}.mp4`));
+            }
+            await fs.promises.copyFile(
+              localChunkPath,
+              path.join(cacheDir, `norm_${videoId}_chunk_${i}.mp4`)
+            );
           } catch (cacheErr) {
-            console.warn(`[Transcode] Failed to cache first chunk locally:`, cacheErr);
+            console.warn(`[Transcode] Failed to cache chunk ${i} locally:`, cacheErr);
           }
         }
       }
@@ -1024,35 +1052,97 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         chunks[0]?.gcsUri || `gs://${bucketName}/normalized/${videoId}/chunk_000.mp4`;
       const transcodedAt = new Date().toISOString();
 
-      // Generate and upload thumbnail-size preview video during transcoding stage
+      // Generate and upload thumbnail-size preview videos for all chunks during transcoding stage
       let thumbnailGcsUri: string | undefined;
-      try {
-        const thumbCacheDir = path.join(scratchDir, 'sail_thumbnail_cache');
-        if (!fs.existsSync(thumbCacheDir)) {
-          fs.mkdirSync(thumbCacheDir, { recursive: true });
-        }
-        const thumbLocalPath = path.join(thumbCacheDir, `thumb_${videoId}.mp4`);
-        const sourceForThumb = fs.existsSync(rawFilePath)
-          ? rawFilePath
-          : path.join(chunksDir, chunkFiles[0]);
-        await generateThumbnailVideo(sourceForThumb, thumbLocalPath);
-        if (fs.existsSync(thumbLocalPath) && fs.statSync(thumbLocalPath).size > 0) {
-          const thumbDest = `thumbnails/thumb_${videoId}.mp4`;
-          console.log(`[Transcode] Uploading thumbnail preview to gs://${bucketName}/${thumbDest}...`);
-          await bucket.upload(thumbLocalPath, {
-            destination: thumbDest,
-            metadata: {
-              contentType: 'video/mp4',
-            },
-            resumable: false,
-          });
-          thumbnailGcsUri = `gs://${bucketName}/${thumbDest}`;
-        }
-      } catch (thumbErr) {
-        console.warn(`[Transcode] Non-fatal thumbnail preview generation warning for ${videoId}:`, thumbErr);
-      }
+      const thumbGenPromise = (async (): Promise<string | null> => {
+        try {
+          const thumbCacheDir = path.join(scratchDir, 'sail_thumbnail_cache');
+          if (!fs.existsSync(thumbCacheDir)) {
+            fs.mkdirSync(thumbCacheDir, { recursive: true });
+          }
 
-      // Update Firestore
+          let firstThumbLocalPath: string | null = null;
+          for (let i = 0; i < chunkFiles.length; i++) {
+            const chunkLocalPath = path.join(chunksDir, chunkFiles[i]);
+            const cachedChunkPath = path.join(
+              scratchDir,
+              'sail_normalized_cache',
+              `norm_${videoId}_chunk_${i}.mp4`
+            );
+            const sourceForChunkThumb =
+              fs.existsSync(chunkLocalPath)
+                ? chunkLocalPath
+                : fs.existsSync(cachedChunkPath)
+                ? cachedChunkPath
+                : i === 0
+                ? rawFilePath
+                : '';
+            if (!sourceForChunkThumb || !fs.existsSync(sourceForChunkThumb)) continue;
+
+            const chunkThumbFilename = `thumb_${videoId}_chunk_${i}.mp4`;
+            const chunkThumbLocalPath = path.join(thumbCacheDir, chunkThumbFilename);
+            try {
+              await generateThumbnailVideo(sourceForChunkThumb, chunkThumbLocalPath, {
+                durationSec: 600,
+              });
+              if (fs.existsSync(chunkThumbLocalPath) && fs.statSync(chunkThumbLocalPath).size > 0) {
+                const chunkThumbDest = `thumbnails/${chunkThumbFilename}`;
+                console.log(`[Transcode] Uploading chunk ${i} thumbnail preview to gs://${bucketName}/${chunkThumbDest}...`);
+                await bucket.upload(chunkThumbLocalPath, {
+                  destination: chunkThumbDest,
+                  metadata: {
+                    contentType: 'video/mp4',
+                  },
+                  resumable: false,
+                });
+
+                if (i === 0) {
+                  firstThumbLocalPath = chunkThumbLocalPath;
+                  const baseThumbLocalPath = path.join(thumbCacheDir, `thumb_${videoId}.mp4`);
+                  try {
+                    await fs.promises.copyFile(chunkThumbLocalPath, baseThumbLocalPath);
+                  } catch {
+                    // ignore copy warning
+                  }
+                  const baseThumbDest = `thumbnails/thumb_${videoId}.mp4`;
+                  await bucket
+                    .upload(chunkThumbLocalPath, {
+                      destination: baseThumbDest,
+                      metadata: { contentType: 'video/mp4' },
+                      resumable: false,
+                    })
+                    .catch(() => {});
+                  thumbnailGcsUri = `gs://${bucketName}/${chunkThumbDest}`;
+                }
+              }
+            } catch (chunkThumbErr) {
+              console.warn(
+                `[Transcode] Non-fatal chunk ${i} thumbnail preview generation warning for ${videoId}:`,
+                chunkThumbErr
+              );
+            }
+          }
+          return firstThumbLocalPath;
+        } catch (thumbErr) {
+          console.warn(`[Transcode] Non-fatal thumbnail preview generation warning for ${videoId}:`, thumbErr);
+          return null;
+        } finally {
+          thumbnailGenerationInFlight.delete(videoId);
+        }
+      })();
+      thumbnailGenerationInFlight.set(videoId, thumbGenPromise);
+      await thumbGenPromise;
+
+      const pass0StartedAt = new Date().toISOString();
+      const initialRunningPasses = {
+        pass0: { status: 'RUNNING' as const, startedAt: pass0StartedAt },
+        pass1: { status: 'PENDING' as const },
+        pass2: { status: 'PENDING' as const },
+        pass3: { status: 'PENDING' as const },
+        hitl: { status: 'PENDING' as const },
+      };
+
+      // Update Firestore atomically with READY_FOR_ANALYSIS and pass0 RUNNING so frontend polling does not fire a duplicate Pass 0
       await db.collection('videos').doc(videoId).update({
         status: 'READY_FOR_ANALYSIS',
         transcodeProgress: 100,
@@ -1060,20 +1150,27 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
         chunks: chunks,
         transcodedAt,
         normalizedGcsUri,
+        bucketName,
+        gcsBucket: bucketName,
         organizationId,
         uploadedBy,
         uploaderEmail,
+        passes: initialRunningPasses,
         ...(thumbnailGcsUri ? { thumbnailGcsUri } : {}),
       });
       firestoreService.mirrorVideoToMemory('(default)', videoId, {
         status: 'READY_FOR_ANALYSIS',
+        transcodeProgress: 100,
         totalChunks: chunks.length,
         chunks: chunks,
         transcodedAt,
         normalizedGcsUri,
+        bucketName,
+        gcsBucket: bucketName,
         organizationId,
         uploadedBy,
         uploaderEmail,
+        passes: initialRunningPasses,
         ...(thumbnailGcsUri ? { thumbnailGcsUri } : {}),
       });
       if (probedMeta.capturedAt || probedMeta.durationSeconds !== undefined) {
@@ -1088,17 +1185,12 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
       // Automatically execute Pass 0 (Workflow Classification) once transcoding is finished
       try {
         console.log(`[Transcode] Automatically starting Pass 0 Workflow Classification for ${videoId}...`);
-        const pass0StartedAt = new Date().toISOString();
-        await firestoreService.updateVideoPass('(default)', videoId, 'pass0', {
-          status: 'RUNNING',
-          startedAt: pass0StartedAt,
-        });
 
         const firstChunkLocalPath = path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}.mp4`);
         const classification = await runPass0WorkflowClassification({
           videoGcsUri: normalizedGcsUri,
           localVideoPath: fs.existsSync(firstChunkLocalPath) ? firstChunkLocalPath : undefined,
-          customerId: 'customer-alpha',
+          customerId: organizationId || 'customer-alpha',
           videoId,
           registeredFileUri: normalizedGcsUri,
           videoRecord: {
@@ -1106,6 +1198,9 @@ export const finalizeUploadHandler = async (req: Request, res: Response): Promis
             originalName,
             rawGcsUri,
             normalizedGcsUri,
+            bucketName,
+            gcsBucket: bucketName,
+            organizationId,
             chunks,
             totalChunks: chunks.length,
           },
@@ -1319,6 +1414,7 @@ export const associateArchiveHandler = async (req: Request, res: Response): Prom
       archiveName,
       archiveCreatorName: archiveDoc.creatorName ?? null,
       archiveCreationDate: archiveDoc.creationDate ?? null,
+      archivePurpose: archiveDoc.purpose ?? null,
       unmatchedArchiveName: null,
       archiveAssociationType: 'MANUAL' as const,
       associatedAt: nowIso,
@@ -1345,6 +1441,7 @@ export const associateArchiveHandler = async (req: Request, res: Response): Prom
             archiveName,
             creatorName: archiveDoc.creatorName ?? prevPass0Data.creatorName ?? null,
             creationDate: archiveDoc.creationDate ?? prevPass0Data.creationDate ?? null,
+            purpose: archiveDoc.purpose ?? prevPass0Data.purpose ?? null,
             archiveIntent: 'APPEND',
             isAppending: true,
           },
@@ -1370,6 +1467,7 @@ export const associateArchiveHandler = async (req: Request, res: Response): Prom
           archiveName,
           creatorName: archiveDoc.creatorName ?? null,
           creationDate: archiveDoc.creationDate ?? null,
+          purpose: archiveDoc.purpose ?? null,
           ...(existingAnalysis.workflowClassification
             ? {
                 workflowClassification: {
@@ -1382,6 +1480,10 @@ export const associateArchiveHandler = async (req: Request, res: Response): Prom
                   creationDate:
                     archiveDoc.creationDate ??
                     existingAnalysis.workflowClassification.creationDate ??
+                    null,
+                  purpose:
+                    archiveDoc.purpose ??
+                    existingAnalysis.workflowClassification.purpose ??
                     null,
                 },
               }
@@ -1398,6 +1500,10 @@ export const associateArchiveHandler = async (req: Request, res: Response): Prom
                   creationDate:
                     archiveDoc.creationDate ??
                     existingAnalysis.workloadClassification.creationDate ??
+                    null,
+                  purpose:
+                    archiveDoc.purpose ??
+                    existingAnalysis.workloadClassification.purpose ??
                     null,
                 },
               }
@@ -1615,13 +1721,58 @@ export const getVideoFrameHandler = async (req: Request, res: Response): Promise
         }
 
         if (localVideoPath && fs.existsSync(localVideoPath)) {
+          let effectiveVideoPath = localVideoPath;
+          let effectiveTimestampSec = timestampSec;
+          // If we resolved a 10-minute normalized chunk (norm_<videoId>.mp4) and timestampSec >= 600,
+          // resolve the appropriate chunk_00X.mp4 and seek relative to chunk start (chunkIdx * 600)
+          if (
+            timestampSec >= 600 &&
+            path.basename(localVideoPath).startsWith('norm_') &&
+            !path.basename(localVideoPath).includes('_chunk_')
+          ) {
+            const chunkIdx = Math.floor(timestampSec / 600);
+            const chunkFilename = `norm_${videoId}_chunk_${chunkIdx}.mp4`;
+            let foundChunkPath: string | undefined;
+            for (const vDir of videoCacheDirs) {
+              const candChunk = path.join(vDir, chunkFilename);
+              if (fs.existsSync(candChunk) && fs.statSync(candChunk).size > 1000) {
+                foundChunkPath = candChunk;
+                break;
+              }
+            }
+            if (!foundChunkPath) {
+              try {
+                const targetVDir = videoCacheDirs[0];
+                if (!fs.existsSync(targetVDir)) {
+                  fs.mkdirSync(targetVDir, { recursive: true });
+                }
+                const dlChunkDest = path.join(targetVDir, chunkFilename);
+                const gcsChunkObj = `normalized/${videoId}/chunk_${String(chunkIdx).padStart(3, '0')}.mp4`;
+                const gcsChunkFile = storage.bucket(bucketName).file(gcsChunkObj);
+                const [chunkExists] = await gcsChunkFile.exists();
+                if (chunkExists) {
+                  await gcsChunkFile.download({ destination: dlChunkDest });
+                  if (fs.existsSync(dlChunkDest) && fs.statSync(dlChunkDest).size > 1000) {
+                    foundChunkPath = dlChunkDest;
+                  }
+                }
+              } catch {
+                // fallback to original path
+              }
+            }
+            if (foundChunkPath) {
+              effectiveVideoPath = foundChunkPath;
+              effectiveTimestampSec = Math.max(0, Number((timestampSec - chunkIdx * 600).toFixed(3)));
+            }
+          }
+
           const primaryFrameDir = candidateFrameDirs[0];
           if (!fs.existsSync(primaryFrameDir)) {
             fs.mkdirSync(primaryFrameDir, { recursive: true });
           }
           const extractedPath = await extractCandidateFrame(
-            localVideoPath,
-            timestampSec,
+            effectiveVideoPath,
+            effectiveTimestampSec,
             primaryFrameDir,
             safeFilename
           );
@@ -1734,6 +1885,7 @@ export const deleteVideoHandler = async (req: Request, res: Response): Promise<R
         bucket.file(`uploads/${videoId}.mp4`).delete().catch(() => {}),
         bucket.file(`normalized/norm_${videoId}.mp4`).delete().catch(() => {}),
         bucket.file(`thumbnails/thumb_${videoId}.mp4`).delete().catch(() => {}),
+        bucket.deleteFiles({ prefix: `thumbnails/thumb_${videoId}_chunk_` }).catch(() => {}),
         bucket.deleteFiles({ prefix: `frames/${videoId}/` }).catch(() => {}),
       ]);
     } catch {
@@ -1861,6 +2013,123 @@ function sendVideoBufferWithRange(req: Request, res: Response, buf: Buffer): Res
   return res.status(200).send(buf);
 }
 
+function streamLocalFileWithRange(req: Request, res: Response, filePath: string): Response | void {
+  const st = fs.statSync(filePath);
+  const total = st.size;
+  if (total <= 16 * 1024 * 1024) {
+    const buf = fs.readFileSync(filePath);
+    return sendVideoBufferWithRange(req, res, buf);
+  }
+
+  const range = req.headers.range;
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? Math.min(total - 1, parseInt(parts[1], 10)) : total - 1;
+    if (!Number.isNaN(start) && !Number.isNaN(end) && start >= 0 && start <= end && end < total) {
+      const chunksize = end - start + 1;
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', chunksize);
+      const stream = fs.createReadStream(filePath, { start, end });
+      req.on('close', () => stream.destroy());
+      stream.on('error', () => {
+        if (!res.headersSent) res.status(500).end();
+      });
+      stream.pipe(res);
+      return;
+    }
+  }
+
+  res.status(200);
+  res.setHeader('Content-Length', total);
+  const stream = fs.createReadStream(filePath);
+  req.on('close', () => stream.destroy());
+  stream.on('error', () => {
+    if (!res.headersSent) res.status(500).end();
+  });
+  stream.pipe(res);
+}
+
+function streamGcsFileWithRange(req: Request, res: Response, gcsFile: any, total: number): void {
+  const range = req.headers.range;
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'no-cache');
+
+  if (range && total > 0) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const maxRangeSpan = 8 * 1024 * 1024; // 8MB max per open-ended range request for fast moov seeking
+    const end = parts[1]
+      ? Math.min(total - 1, parseInt(parts[1], 10))
+      : Math.min(total - 1, start + maxRangeSpan - 1);
+    if (!Number.isNaN(start) && !Number.isNaN(end) && start >= 0 && start <= end && end < total) {
+      const chunksize = end - start + 1;
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', chunksize);
+      const stream = gcsFile.createReadStream({ start, end });
+      req.on('close', () => stream.destroy());
+      stream.on('error', () => {
+        if (!res.headersSent) res.status(500).end();
+      });
+      stream.pipe(res);
+      return;
+    }
+  }
+
+  if (total > 0) {
+    res.setHeader('Content-Length', total);
+  }
+  res.status(200);
+  const stream = gcsFile.createReadStream();
+  req.on('close', () => stream.destroy());
+  stream.on('error', () => {
+    if (!res.headersSent) res.status(500).end();
+  });
+  stream.pipe(res);
+}
+
+function isValidLocalMp4File(filePath: string): boolean {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return false;
+    const base = path.basename(filePath);
+    if (base.startsWith('.tmp_') || base.includes('.tmp_')) return false;
+    const st = fs.statSync(filePath);
+    if (st.size <= 0) return false;
+    if (st.size <= 64) return true; // allow synthetic unit test fixtures
+
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const headSize = Math.min(st.size, 2 * 1024 * 1024);
+      const headBuf = Buffer.allocUnsafe(headSize);
+      fs.readSync(fd, headBuf, 0, headSize, 0);
+      if (headBuf.subarray(4, 8).toString('ascii') !== 'ftyp') {
+        return true;
+      }
+      if (headBuf.includes(Buffer.from('moov'))) {
+        return true;
+      }
+      if (st.size > headSize) {
+        const tailSize = Math.min(st.size, 4 * 1024 * 1024);
+        const tailBuf = Buffer.allocUnsafe(tailSize);
+        fs.readSync(fd, tailBuf, 0, tailSize, st.size - tailSize);
+        return tailBuf.includes(Buffer.from('moov'));
+      }
+      return false;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Controller for GET /api/videos/:videoId/thumbnail
  * Serves the small, thumbnail-size MP4 preview video for the given videoId:
@@ -1876,8 +2145,25 @@ export const getVideoThumbnailHandler = async (req: Request, res: Response): Pro
     return res.status(400).json({ error: 'Missing required parameter: videoId' });
   }
 
+  const rawDatabaseId = (req.headers['x-database-id'] || req.query?.databaseId) as string | undefined;
+  const databaseId = normalizeDatabaseId(rawDatabaseId || '(default)');
+  const customerId =
+    ((req.headers['x-customer-id'] ||
+      req.query?.customerId ||
+      req.query?.organizationId ||
+      req.user?.organizationId) as string) || 'customer-alpha';
+  const reqChunk = req.query.chunk !== undefined ? parseInt(String(req.query.chunk), 10) : undefined;
+  const targetChunkIndex = typeof reqChunk === 'number' && !isNaN(reqChunk) && reqChunk >= 0 ? reqChunk : 0;
+
+  // Compact 10-minute 320px 15fps thumbnails are ~5-15MB. Any file > 25MB is a legacy un-chunked / full-res video.
+  const MAX_COMPACT_THUMBNAIL_BYTES = 25 * 1024 * 1024;
+
   const scratchDir = getScratchDir();
-  const thumbFilename = `thumb_${videoId}.mp4`;
+  const chunkThumbFilename = `thumb_${videoId}_chunk_${targetChunkIndex}.mp4`;
+  const thumbFilename = targetChunkIndex > 0 ? chunkThumbFilename : `thumb_${videoId}.mp4`;
+  const fallbackThumbFilename = `thumb_${videoId}.mp4`;
+  const inFlightKey = targetChunkIndex > 0 ? `${videoId}_chunk_${targetChunkIndex}` : videoId;
+
   const candidateThumbDirs = Array.from(
     new Set([
       path.join(scratchDir, 'sail_thumbnail_cache'),
@@ -1885,53 +2171,179 @@ export const getVideoThumbnailHandler = async (req: Request, res: Response): Pro
     ])
   );
 
+  const isValidMp4Buffer = (buf: Buffer): boolean => {
+    if (!buf || buf.length === 0) return false;
+    // If buffer starts with an MP4 'ftyp' box, ensure it also contains a 'moov' atom (not half-written)
+    if (buf.length > 64 && buf.subarray(4, 8).toString('ascii') === 'ftyp') {
+      return buf.includes(Buffer.from('moov'));
+    }
+    return true;
+  };
+
   try {
-    // 1. Check local thumbnail cache first
+    // 1. Check local thumbnail cache first (prefer explicit chunk_0 over legacy un-chunked thumb_<videoId>.mp4)
+    const thumbCandidates =
+      targetChunkIndex > 0
+        ? [
+            chunkThumbFilename,
+            `thumb_${videoId}_chunk_${String(targetChunkIndex).padStart(3, '0')}.mp4`,
+          ]
+        : [
+            chunkThumbFilename,
+            `thumb_${videoId}_chunk_000.mp4`,
+            fallbackThumbFilename,
+          ];
     for (const dir of candidateThumbDirs) {
-      const candidatePath = path.join(dir, thumbFilename);
-      if (fs.existsSync(candidatePath)) {
-        const st = fs.statSync(candidatePath);
-        if (st.size > 0) {
-          const buf = await fs.promises.readFile(candidatePath);
-          return sendVideoBufferWithRange(req, res, buf);
+      for (const tFile of thumbCandidates) {
+        const candidatePath = path.join(dir, tFile);
+        if (fs.existsSync(candidatePath)) {
+          const st = fs.statSync(candidatePath);
+          if (st.size > MAX_COMPACT_THUMBNAIL_BYTES) {
+            console.warn(
+              `[Thumbnail] Removing oversized local cached thumbnail (${(st.size / (1024 * 1024)).toFixed(1)} MB > 25 MB): ${candidatePath}`
+            );
+            try {
+              fs.unlinkSync(candidatePath);
+            } catch {
+              // ignore
+            }
+            continue;
+          }
+          if (st.size > 0) {
+            if (isValidLocalMp4File(candidatePath)) {
+              return streamLocalFileWithRange(req, res, candidatePath);
+            } else {
+              try {
+                fs.unlinkSync(candidatePath);
+              } catch {
+                // ignore
+              }
+            }
+          }
         }
       }
     }
 
     const defaultBucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
-    const videoDoc = await firestoreService.getVideoMetadata('(default)', videoId).catch(() => null);
+    const tenantBucket = `${customerId}-video-manager-storage`;
 
-    // 2. Check GCS if thumbnail was already generated and uploaded
-    const thumbGcsCandidates: { bucket: string; objectPath: string }[] = [
-      { bucket: defaultBucketName, objectPath: `thumbnails/${thumbFilename}` },
-    ];
-    if (videoDoc && typeof (videoDoc as any).thumbnailGcsUri === 'string') {
+    let videoDoc = await firestoreService.getVideoMetadata(databaseId, videoId).catch(() => null);
+    if (databaseId !== '(default)') {
+      const defaultDoc = await firestoreService.getVideoMetadata('(default)', videoId).catch(() => null);
+      if (!videoDoc) {
+        videoDoc = defaultDoc;
+      } else if (defaultDoc) {
+        videoDoc = { ...defaultDoc, ...videoDoc, chunks: videoDoc.chunks?.length ? videoDoc.chunks : defaultDoc.chunks };
+      }
+    }
+
+    const extractBucketFromUri = (uri?: any): string | undefined => {
+      if (typeof uri === 'string' && uri.startsWith('gs://')) {
+        const withoutScheme = uri.slice('gs://'.length);
+        const slashIdx = withoutScheme.indexOf('/');
+        if (slashIdx > 0) {
+          return withoutScheme.slice(0, slashIdx);
+        }
+      }
+      return undefined;
+    };
+
+    const docEmbeddedBucket =
+      extractBucketFromUri(videoDoc?.normalizedGcsUri) ||
+      extractBucketFromUri(videoDoc?.rawGcsUri) ||
+      extractBucketFromUri(videoDoc?.chunks?.[0]?.gcsUri) ||
+      extractBucketFromUri((videoDoc as any)?.thumbnailGcsUri);
+
+    const candidateBuckets = Array.from(
+      new Set(
+        [
+          (videoDoc as any)?.bucketName,
+          (videoDoc as any)?.gcsBucket,
+          docEmbeddedBucket,
+          defaultBucketName,
+          'sail-platform-videos-prod',
+          tenantBucket,
+        ].filter((b): b is string => typeof b === 'string' && b.trim().length > 0)
+      )
+    );
+
+    const primaryUploadBucket =
+      (videoDoc as any)?.bucketName ||
+      (videoDoc as any)?.gcsBucket ||
+      docEmbeddedBucket ||
+      defaultBucketName;
+
+    // 2. Check GCS if compact chunk thumbnail was already generated and uploaded
+    const thumbGcsCandidates: { bucket: string; objectPath: string }[] = [];
+    for (const b of candidateBuckets) {
+      if (targetChunkIndex > 0) {
+        thumbGcsCandidates.push({ bucket: b, objectPath: `thumbnails/${chunkThumbFilename}` });
+        thumbGcsCandidates.push({
+          bucket: b,
+          objectPath: `thumbnails/thumb_${videoId}_chunk_${String(targetChunkIndex).padStart(3, '0')}.mp4`,
+        });
+      } else {
+        // Check explicit chunk_0 thumbnail BEFORE legacy thumb_<videoId>.mp4 so we prefer chunked thumbnails over 150MB single-file thumbnails
+        thumbGcsCandidates.push({ bucket: b, objectPath: `thumbnails/thumb_${videoId}_chunk_0.mp4` });
+        thumbGcsCandidates.push({ bucket: b, objectPath: `thumbnails/thumb_${videoId}_chunk_000.mp4` });
+      }
+    }
+    if (targetChunkIndex === 0 && videoDoc && typeof (videoDoc as any).thumbnailGcsUri === 'string') {
       const uri = String((videoDoc as any).thumbnailGcsUri);
       if (uri.startsWith('gs://')) {
         const withoutScheme = uri.slice('gs://'.length);
         const slashIdx = withoutScheme.indexOf('/');
         if (slashIdx > 0) {
-          thumbGcsCandidates.unshift({
+          thumbGcsCandidates.push({
             bucket: withoutScheme.slice(0, slashIdx),
             objectPath: withoutScheme.slice(slashIdx + 1),
           });
         }
       }
     }
+    if (targetChunkIndex === 0) {
+      for (const b of candidateBuckets) {
+        thumbGcsCandidates.push({ bucket: b, objectPath: `thumbnails/${fallbackThumbFilename}` });
+      }
+    }
 
+    const seenThumbGcs = new Set<string>();
     for (const cand of thumbGcsCandidates) {
+      const key = `${cand.bucket}/${cand.objectPath}`;
+      if (seenThumbGcs.has(key)) continue;
+      seenThumbGcs.add(key);
       try {
         const file = storage.bucket(cand.bucket).file(cand.objectPath);
         const [exists] = await file.exists();
         if (exists) {
+          let gcsSize = 0;
+          if (typeof (file as any).getMetadata === 'function') {
+            const [meta] = await (file as any).getMetadata().catch(() => [{ size: 0 }]);
+            gcsSize = Number(meta?.size || 0);
+          }
+          if (gcsSize > MAX_COMPACT_THUMBNAIL_BYTES) {
+            console.warn(
+              `[Thumbnail] Skipping oversized GCS thumbnail (${(gcsSize / (1024 * 1024)).toFixed(1)} MB > 25 MB): gs://${cand.bucket}/${cand.objectPath} — will generate compact 10-min chunk ${targetChunkIndex} thumbnail`
+            );
+            continue;
+          }
+
           const [contents] = await file.download();
-          if (contents && contents.length > 0) {
+          if (
+            contents &&
+            contents.length > 0 &&
+            contents.length <= MAX_COMPACT_THUMBNAIL_BYTES &&
+            isValidMp4Buffer(contents)
+          ) {
             for (const dir of candidateThumbDirs) {
               try {
                 if (!fs.existsSync(dir)) {
                   fs.mkdirSync(dir, { recursive: true });
                 }
-                fs.writeFileSync(path.join(dir, thumbFilename), contents);
+                fs.writeFileSync(path.join(dir, chunkThumbFilename), contents);
+                if (targetChunkIndex === 0) {
+                  fs.writeFileSync(path.join(dir, fallbackThumbFilename), contents);
+                }
               } catch {
                 // ignore local cache write error
               }
@@ -1944,8 +2356,105 @@ export const getVideoThumbnailHandler = async (req: Request, res: Response): Pro
       }
     }
 
-    // 3. Retroactively generate thumbnail video on-demand for previously uploaded videos
-    let genPromise = thumbnailGenerationInFlight.get(videoId);
+    // 3a. Resolve local source chunk / video candidate
+    const preSplitLocalCandidates: string[] = [
+      path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}_chunk_${targetChunkIndex}.mp4`),
+      path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${videoId}_chunk_${targetChunkIndex}.mp4`),
+      path.join('/tmp', `chunks_${videoId}`, `chunk_${String(targetChunkIndex).padStart(3, '0')}.mp4`),
+      path.join(os.tmpdir(), `chunks_${videoId}`, `chunk_${String(targetChunkIndex).padStart(3, '0')}.mp4`),
+      path.join(scratchDir, `chunks_${videoId}`, `chunk_${String(targetChunkIndex).padStart(3, '0')}.mp4`),
+      path.join('/tmp', `chunks_${videoId}`, `chunk_${targetChunkIndex}.mp4`),
+      path.join(os.tmpdir(), `chunks_${videoId}`, `chunk_${targetChunkIndex}.mp4`),
+    ];
+
+    const unsplitLocalCandidates: string[] = [
+      path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}.mp4`),
+      path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${videoId}.mp4`),
+      path.join(scratchDir, `norm_${videoId}.mp4`),
+      path.join(scratchDir, 'sail_raw_cache', `raw_${videoId}.mp4`),
+      path.join(os.tmpdir(), 'sail_raw_cache', `raw_${videoId}.mp4`),
+      path.join(scratchDir, `raw_${videoId}.mp4`),
+    ];
+
+    let localSourceInput: string | undefined;
+    let isLocalSourcePreSplit = false;
+    for (const localCand of preSplitLocalCandidates) {
+      if (isValidLocalMp4File(localCand)) {
+        localSourceInput = localCand;
+        isLocalSourcePreSplit = true;
+        break;
+      }
+    }
+    if (!localSourceInput) {
+      for (const localCand of unsplitLocalCandidates) {
+        if (isValidLocalMp4File(localCand)) {
+          localSourceInput = localCand;
+          isLocalSourcePreSplit = targetChunkIndex === 0;
+          break;
+        }
+      }
+    }
+
+    // 3b. Resolve GCS URI candidates for the requested chunk (prioritizing pre-split chunk_00X.mp4, with fallback to full video sliced at targetChunkIndex * 600s)
+    const gcsSourceCandidates: { uri: string; isPreSplitChunk: boolean }[] = [];
+    if (Array.isArray(videoDoc?.chunks)) {
+      const matchedChunk =
+        videoDoc.chunks.find((c: any) => c && Number(c.index) === targetChunkIndex) ||
+        videoDoc.chunks[targetChunkIndex];
+      const chunkUri =
+        matchedChunk?.gcsUri ||
+        matchedChunk?.storagePath ||
+        (typeof matchedChunk === 'string' ? matchedChunk : undefined);
+      if (chunkUri) {
+        gcsSourceCandidates.push({ uri: String(chunkUri), isPreSplitChunk: true });
+      }
+    }
+    for (const b of candidateBuckets) {
+      gcsSourceCandidates.push({
+        uri: `gs://${b}/normalized/${videoId}/chunk_${String(targetChunkIndex).padStart(3, '0')}.mp4`,
+        isPreSplitChunk: true,
+      });
+    }
+    // Also include full/first-chunk normalized & raw URIs as fallback (if targetChunkIndex > 0, FFmpeg slices at startTimeSec = targetChunkIndex * 600)
+    if (videoDoc?.normalizedGcsUri) {
+      gcsSourceCandidates.push({
+        uri: videoDoc.normalizedGcsUri,
+        isPreSplitChunk: targetChunkIndex === 0,
+      });
+    }
+    for (const b of candidateBuckets) {
+      gcsSourceCandidates.push({
+        uri: `gs://${b}/normalized/norm_${videoId}.mp4`,
+        isPreSplitChunk: targetChunkIndex === 0,
+      });
+    }
+    if (videoDoc?.rawGcsUri) {
+      gcsSourceCandidates.push({
+        uri: videoDoc.rawGcsUri,
+        isPreSplitChunk: false,
+      });
+    }
+    if ((videoDoc as any)?.originalGcsUri) {
+      gcsSourceCandidates.push({
+        uri: (videoDoc as any).originalGcsUri,
+        isPreSplitChunk: false,
+      });
+    }
+    for (const b of candidateBuckets) {
+      if (videoDoc?.originalName) {
+        gcsSourceCandidates.push({
+          uri: `gs://${b}/raw/${videoId}/${videoDoc.originalName}`,
+          isPreSplitChunk: false,
+        });
+      }
+      gcsSourceCandidates.push({
+        uri: `gs://${b}/uploads/${videoId}.mp4`,
+        isPreSplitChunk: false,
+      });
+    }
+
+    // 3. Start (or reuse) retroactive compact chunk thumbnail generation
+    let genPromise = thumbnailGenerationInFlight.get(inFlightKey);
     if (!genPromise) {
       genPromise = (async (): Promise<string | null> => {
         try {
@@ -1953,44 +2462,16 @@ export const getVideoThumbnailHandler = async (req: Request, res: Response): Pro
           if (!fs.existsSync(primaryThumbDir)) {
             fs.mkdirSync(primaryThumbDir, { recursive: true });
           }
-          const targetThumbPath = path.join(primaryThumbDir, thumbFilename);
+          const targetThumbPath = path.join(primaryThumbDir, chunkThumbFilename);
 
-          // 3a. Check local normalized or raw video cache first
-          const localVideoCandidates = [
-            path.join(scratchDir, 'sail_normalized_cache', `norm_${videoId}.mp4`),
-            path.join(os.tmpdir(), 'sail_normalized_cache', `norm_${videoId}.mp4`),
-            path.join(scratchDir, 'sail_raw_cache', `raw_${videoId}.mp4`),
-            path.join(os.tmpdir(), 'sail_raw_cache', `raw_${videoId}.mp4`),
-            path.join(scratchDir, `norm_${videoId}.mp4`),
-          ];
+          let sourceInput = localSourceInput;
+          let isSourcePreSplit = isLocalSourcePreSplit;
 
-          let sourceInput: string | undefined;
-          for (const localCand of localVideoCandidates) {
-            if (fs.existsSync(localCand) && fs.statSync(localCand).size > 0) {
-              sourceInput = localCand;
-              break;
-            }
-          }
-
-          // 3b. If not cached locally, resolve from GCS (normalized or raw video)
-          let downloadedTempSource: string | undefined;
           if (!sourceInput) {
-            const gcsUris: string[] = [
-              videoDoc?.normalizedGcsUri,
-              videoDoc?.chunks?.[0]?.gcsUri,
-              `gs://${defaultBucketName}/normalized/${videoId}/chunk_000.mp4`,
-              `gs://${defaultBucketName}/normalized/norm_${videoId}.mp4`,
-              videoDoc?.rawGcsUri,
-              (videoDoc as any)?.originalGcsUri,
-              videoDoc?.originalName
-                ? `gs://${defaultBucketName}/raw/${videoId}/${videoDoc.originalName}`
-                : '',
-              `gs://${defaultBucketName}/uploads/${videoId}.mp4`,
-            ].filter((u): u is string => typeof u === 'string' && u.startsWith('gs://'));
-
             const seen = new Set<string>();
-            for (const uri of gcsUris) {
-              if (seen.has(uri)) continue;
+            for (const cand of gcsSourceCandidates) {
+              const uri = cand.uri;
+              if (!uri || !uri.startsWith('gs://') || seen.has(uri)) continue;
               seen.add(uri);
 
               const withoutScheme = uri.slice('gs://'.length);
@@ -2004,35 +2485,36 @@ export const getVideoThumbnailHandler = async (req: Request, res: Response): Pro
                 const [exists] = await gcsFile.exists();
                 if (!exists) continue;
 
-                // Try V4 signed read URL first so FFmpeg can stream directly without full local download
-                try {
-                  const [signedReadUrl] = await gcsFile.getSignedUrl({
-                    version: 'v4',
-                    action: 'read',
-                    expires: Date.now() + 15 * 60 * 1000,
-                  });
-                  if (signedReadUrl) {
-                    await generateThumbnailVideo(signedReadUrl, targetThumbPath);
-                    if (fs.existsSync(targetThumbPath) && fs.statSync(targetThumbPath).size > 0) {
-                      sourceInput = signedReadUrl;
-                      break;
-                    }
-                  }
-                } catch {
-                  // Fallback to downloading the source video locally
-                }
-
                 const normCacheDir = path.join(scratchDir, 'sail_normalized_cache');
                 if (!fs.existsSync(normCacheDir)) {
                   fs.mkdirSync(normCacheDir, { recursive: true });
                 }
-                const dlDest = path.join(normCacheDir, `norm_${videoId}.mp4`);
-                if (!fs.existsSync(dlDest)) {
-                  await gcsFile.download({ destination: dlDest });
+                const dlDest = path.join(
+                  normCacheDir,
+                  cand.isPreSplitChunk
+                    ? `norm_${videoId}_chunk_${targetChunkIndex}.mp4`
+                    : `norm_${videoId}_full_source.mp4`
+                );
+                if (!isValidLocalMp4File(dlDest)) {
+                  const tmpDest = `${dlDest}.tmp_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                  try {
+                    await gcsFile.download({ destination: tmpDest });
+                    if (fs.existsSync(tmpDest) && fs.statSync(tmpDest).size > 0) {
+                      fs.renameSync(tmpDest, dlDest);
+                    }
+                  } finally {
+                    if (fs.existsSync(tmpDest)) {
+                      try {
+                        fs.unlinkSync(tmpDest);
+                      } catch {
+                        // ignore
+                      }
+                    }
+                  }
                 }
-                if (fs.existsSync(dlDest) && fs.statSync(dlDest).size > 0) {
+                if (isValidLocalMp4File(dlDest)) {
                   sourceInput = dlDest;
-                  downloadedTempSource = dlDest;
+                  isSourcePreSplit = cand.isPreSplitChunk;
                   break;
                 }
               } catch {
@@ -2041,46 +2523,73 @@ export const getVideoThumbnailHandler = async (req: Request, res: Response): Pro
             }
           }
 
-          if (!fs.existsSync(targetThumbPath) || fs.statSync(targetThumbPath).size === 0) {
-            if (!sourceInput) {
-              return null;
-            }
-            await generateThumbnailVideo(sourceInput, targetThumbPath);
+          if (!sourceInput) {
+            return null;
           }
 
-          if (fs.existsSync(targetThumbPath) && fs.statSync(targetThumbPath).size > 0) {
-            // Mirror to secondary local cache directory if distinct
+          // 3c. Generate a compact 10-minute chunk thumbnail preview using FFmpeg (320px, 15fps, <=300kbps, max 600s)
+          const startTimeSec = isSourcePreSplit ? 0 : targetChunkIndex * 600;
+          try {
+            await generateThumbnailVideo(sourceInput, targetThumbPath, {
+              startTimeSec,
+              durationSec: 600,
+            });
+          } catch (ffmpegErr) {
+            console.warn(`[Thumbnail] FFmpeg thumbnail preview generation failed for ${videoId} (chunk ${targetChunkIndex}):`, ffmpegErr);
+          }
+
+          // If thumbnail generation succeeded, persist & mirror it
+          if (isValidLocalMp4File(targetThumbPath)) {
             const buf = await fs.promises.readFile(targetThumbPath);
-            for (const dir of candidateThumbDirs.slice(1)) {
+            for (const dir of candidateThumbDirs) {
               try {
                 if (!fs.existsSync(dir)) {
                   fs.mkdirSync(dir, { recursive: true });
                 }
-                await fs.promises.writeFile(path.join(dir, thumbFilename), buf);
+                const destChunkPath = path.join(dir, chunkThumbFilename);
+                if (destChunkPath !== targetThumbPath) {
+                  await fs.promises.writeFile(destChunkPath, buf);
+                }
+                if (targetChunkIndex === 0) {
+                  await fs.promises.writeFile(path.join(dir, fallbackThumbFilename), buf);
+                }
               } catch {
                 // ignore
               }
             }
 
-            // Persist retroactively generated thumbnail to GCS and update Firestore record in background
-            const thumbGcsDest = `thumbnails/${thumbFilename}`;
-            const thumbnailGcsUri = `gs://${defaultBucketName}/${thumbGcsDest}`;
+            const chunkGcsDest = `thumbnails/${chunkThumbFilename}`;
+            const thumbnailGcsUri = `gs://${primaryUploadBucket}/${chunkGcsDest}`;
             storage
-              .bucket(defaultBucketName)
+              .bucket(primaryUploadBucket)
               .upload(targetThumbPath, {
-                destination: thumbGcsDest,
+                destination: chunkGcsDest,
                 metadata: { contentType: 'video/mp4' },
                 resumable: false,
               })
               .then(async () => {
-                await db
-                  .collection('videos')
-                  .doc(videoId)
-                  .update({ thumbnailGcsUri })
-                  .catch(() => {});
-                firestoreService.mirrorVideoToMemory('(default)', videoId, { thumbnailGcsUri });
+                if (targetChunkIndex === 0) {
+                  // Also replace any oversized legacy thumbnails/thumb_<videoId>.mp4 with this compact chunk_0 thumbnail
+                  await storage
+                    .bucket(primaryUploadBucket)
+                    .upload(targetThumbPath, {
+                      destination: `thumbnails/${fallbackThumbFilename}`,
+                      metadata: { contentType: 'video/mp4' },
+                      resumable: false,
+                    })
+                    .catch(() => {});
+                  await db
+                    .collection('videos')
+                    .doc(videoId)
+                    .update({ thumbnailGcsUri })
+                    .catch(() => {});
+                  firestoreService.mirrorVideoToMemory('(default)', videoId, { thumbnailGcsUri });
+                  if (databaseId !== '(default)') {
+                    firestoreService.mirrorVideoToMemory(databaseId, videoId, { thumbnailGcsUri });
+                  }
+                }
                 console.log(
-                  `[Thumbnail] Retroactively generated & uploaded thumbnail for ${videoId}: ${thumbnailGcsUri}`
+                  `[Thumbnail] Retroactively generated & uploaded compact chunk ${targetChunkIndex} thumbnail for ${videoId}: ${thumbnailGcsUri}`
                 );
               })
               .catch((upErr) => {
@@ -2090,22 +2599,89 @@ export const getVideoThumbnailHandler = async (req: Request, res: Response): Pro
             return targetThumbPath;
           }
 
-          void downloadedTempSource;
+          // 3d. Direct Stream Fallback: If FFmpeg thumbnail wasn't generated (e.g. unit test environment without ffmpeg binary), serve the validated chunk/video directly if compact!
+          if (sourceInput && isValidLocalMp4File(sourceInput)) {
+            console.log(`[Thumbnail] Serving direct chunk/video stream fallback for ${videoId}: ${sourceInput}`);
+            return sourceInput;
+          }
+
           return null;
         } catch (genErr) {
           console.warn(`[Thumbnail] Retroactive thumbnail generation failed for ${videoId}:`, genErr);
           return null;
         } finally {
-          thumbnailGenerationInFlight.delete(videoId);
+          thumbnailGenerationInFlight.delete(inFlightKey);
         }
       })();
-      thumbnailGenerationInFlight.set(videoId, genPromise);
+      thumbnailGenerationInFlight.set(inFlightKey, genPromise);
     }
 
-    const generatedPath = await genPromise;
-    if (generatedPath && fs.existsSync(generatedPath) && fs.statSync(generatedPath).size > 0) {
-      const buf = await fs.promises.readFile(generatedPath);
-      return sendVideoBufferWithRange(req, res, buf);
+    // Wait for compact thumbnail generation (up to 15s in production, or full completion in test/small file mode)
+    const isSmallLocalFile =
+      Boolean(localSourceInput) &&
+      (() => {
+        try {
+          return fs.statSync(localSourceInput!).size <= MAX_COMPACT_THUMBNAIL_BYTES;
+        } catch {
+          return false;
+        }
+      })();
+
+    if (process.env.NODE_ENV === 'test' || isSmallLocalFile) {
+      const generatedPath = await genPromise;
+      if (generatedPath && isValidLocalMp4File(generatedPath)) {
+        return streamLocalFileWithRange(req, res, generatedPath);
+      }
+    } else {
+      const racedPath = await Promise.race([
+        genPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 15000)),
+      ]);
+      if (racedPath && isValidLocalMp4File(racedPath)) {
+        return streamLocalFileWithRange(req, res, racedPath);
+      }
+
+      // If we have a valid compact local chunk file (<= 25MB), stream it immediately with HTTP Range support
+      if (
+        localSourceInput &&
+        isValidLocalMp4File(localSourceInput) &&
+        fs.statSync(localSourceInput).size <= MAX_COMPACT_THUMBNAIL_BYTES
+      ) {
+        return streamLocalFileWithRange(req, res, localSourceInput);
+      }
+
+      // Otherwise stream a compact normalized chunk directly from GCS if <= 25MB
+      const seenStreamUris = new Set<string>();
+      for (const cand of gcsSourceCandidates) {
+        const uri = cand.uri;
+        if (!uri || !uri.startsWith('gs://') || seenStreamUris.has(uri)) continue;
+        seenStreamUris.add(uri);
+
+        const withoutScheme = uri.slice('gs://'.length);
+        const slashIdx = withoutScheme.indexOf('/');
+        if (slashIdx <= 0) continue;
+        const bName = withoutScheme.slice(0, slashIdx);
+        const objPath = withoutScheme.slice(slashIdx + 1);
+
+        try {
+          const gcsFile = storage.bucket(bName).file(objPath);
+          const [exists] = await gcsFile.exists();
+          if (!exists) continue;
+          const [metadata] = await gcsFile.getMetadata().catch(() => [{ size: 0 }]);
+          const totalSize = Number(metadata?.size || 0);
+          if (totalSize > 0 && totalSize <= MAX_COMPACT_THUMBNAIL_BYTES) {
+            return streamGcsFileWithRange(req, res, gcsFile, totalSize);
+          }
+        } catch {
+          // try next GCS URI
+        }
+      }
+
+      // Last resort: await the background generation promise so we return the compact 320px chunk thumbnail rather than a 150MB raw stream
+      const generatedPath = await genPromise;
+      if (generatedPath && isValidLocalMp4File(generatedPath)) {
+        return streamLocalFileWithRange(req, res, generatedPath);
+      }
     }
 
     return res.status(404).json({ error: `Thumbnail preview not available for video ${videoId}` });

@@ -928,6 +928,7 @@ export function formatArchiveMarkdown(
     | {
         markdownDoc?: string;
         description?: string;
+        purpose?: string | null;
         reagents?: Array<string | ArchiveReagent | Record<string, any>>;
         labelTranscriptions?: string[];
         workSteps?: Array<ArchiveWorkStep | Record<string, any>>;
@@ -983,12 +984,29 @@ export function formatArchiveMarkdown(
     ? source.refinements
     : [];
 
-  const descriptionText =
+  const purposeText =
+    typeof input.purpose === 'string' && input.purpose.trim()
+      ? input.purpose.trim()
+      : typeof (source as any).purpose === 'string' && (source as any).purpose.trim()
+      ? (source as any).purpose.trim()
+      : typeof classification.purpose === 'string' && classification.purpose.trim()
+      ? classification.purpose.trim()
+      : typeof classification.identificationEvent?.purpose === 'string' &&
+        classification.identificationEvent.purpose.trim()
+      ? classification.identificationEvent.purpose.trim()
+      : '';
+
+  const baseDescriptionText =
     input.description ||
     (input as any).archiveName ||
     classification.transcribedAudio ||
     classification.archiveName ||
     'Automated experiment archive generated from SAIL video analysis.';
+
+  const descriptionText =
+    purposeText && !baseDescriptionText.includes(purposeText)
+      ? `${baseDescriptionText}\n- **Purpose**: ${purposeText}`
+      : baseDescriptionText;
 
   const reagentLines: string[] = [];
   const rawReagents = Array.isArray(input.reagents) && input.reagents.length > 0
@@ -1066,6 +1084,38 @@ export function formatArchiveMarkdown(
         stepLines.push(
           `${stepNo}. **Seed Reagents**: Seeded ${s.cellsSeeded || 'N/A'} (${s.cellsPerWell || 'N/A'}) into ${s.plateType || 'N/A'} using ${s.pipetteType || 'N/A'} — Seeding Events: ${countStatus}.\n\n${plateMap}`
         );
+      } else if (
+        ws.actionType === 'INCUBATE_CELLS' ||
+        ws.actionType === 'INCUBATE_CELLS_ACTION' ||
+        ws.incubateCellsData ||
+        ws.incubatorSettings
+      ) {
+        const inc = ws.incubateCellsData || ws.incubatorSettings || {};
+        const tempStr = inc.temperature || 'N/A';
+        const co2Str = inc.co2Level || 'N/A';
+        stepLines.push(
+          `${stepNo}. **Incubate Cells**: ${ws.description || 'Inserting cell container into incubator'} — Incubator Settings: Temperature: ${tempStr}, CO2 Level: ${co2Str}.`
+        );
+      } else if (
+        ws.actionType === 'ASPIRATE_MEDIA' ||
+        ws.actionType === 'ASPRIRATE_MEDIA' ||
+        ws.actionType === 'ASPIRATE_MEDIA_ACTION'
+      ) {
+        stepLines.push(
+          `${stepNo}. **Aspirate Media**: ${ws.description || 'Aspirating media from container using pipette'}`
+        );
+      } else if (
+        ws.actionType === 'HEMOCYTOMETER_LOADING' ||
+        ws.actionType === 'HEMOCYTOMETER_LOADING_ACTION' ||
+        ws.actionType === 'hemocytometer_loading' ||
+        ws.hemocytometerLoadingData ||
+        ws.hemocytometerLoad
+      ) {
+        const hemo = ws.hemocytometerLoadingData || ws.hemocytometerLoad || {};
+        const substanceStr = hemo.substanceLoaded || ws.substanceLoaded || 'N/A';
+        stepLines.push(
+          `${stepNo}. **Hemocytometer Loading**: ${ws.description || 'Loading cells into the two squares of the hemocytometer slide'} — Substance Loaded: ${substanceStr}.`
+        );
       } else {
         stepLines.push(`${stepNo}. **${ws.actionType || 'Work Step'}**: ${ws.description || 'Executed step.'}`);
       }
@@ -1073,6 +1123,7 @@ export function formatArchiveMarkdown(
   } else {
     let stepNum = 1;
     for (const act of actions) {
+      const actCls = String(act.actionType || act.actionClass || '').toUpperCase();
       if (act.mixReagentsData) {
         const m = act.mixReagentsData;
         stepLines.push(
@@ -1083,6 +1134,21 @@ export function formatArchiveMarkdown(
         const plateMap = render96WellPlateMarkdown(s.seededColumns, s.seededWells);
         stepLines.push(
           `${stepNum}. **Seed Reagents** (${act.actionId}): Seeded ${s.cellsSeeded} (${s.cellsPerWell}) into ${s.plateType} with ${s.pipetteType} (${s.seedingEventsCount} seeding events)\n\n${plateMap}`
+        );
+      } else if (act.incubateCellsData || act.incubatorSettings || actCls.includes('INCUBAT')) {
+        const inc = act.incubateCellsData || act.incubatorSettings || {};
+        stepLines.push(
+          `${stepNum}. **Incubate Cells** (${act.actionId}): ${act.description || 'Inserting cell container into incubator'} — Temperature: ${inc.temperature || 'N/A'}, CO2 Level: ${inc.co2Level || 'N/A'}`
+        );
+      } else if (/ASPIRAT|ASPRIRAT/i.test(actCls)) {
+        stepLines.push(
+          `${stepNum}. **Aspirate Media** (${act.actionId}): ${act.description || 'Aspirating media from container using pipette'}`
+        );
+      } else if (act.hemocytometerLoadingData || act.hemocytometerLoad || actCls.includes('HEMOCYTOMETER')) {
+        const hemo = act.hemocytometerLoadingData || act.hemocytometerLoad || {};
+        const substanceStr = hemo.substanceLoaded || act.substanceLoaded || 'N/A';
+        stepLines.push(
+          `${stepNum}. **Hemocytometer Loading** (${act.actionId}): ${act.description || 'Loading cells into the two squares of the hemocytometer slide'} — Substance Loaded: ${substanceStr}`
         );
       } else {
         const relatedRefs = refinements.filter((r) =>
@@ -1672,6 +1738,7 @@ export async function commitArchiveSignOff(
         archiveName?: string;
         creatorName?: string | null;
         creationDate?: string | null;
+        purpose?: string | null;
         replaceArchiveContent?: boolean;
       })
     | string,
@@ -1685,6 +1752,7 @@ export async function commitArchiveSignOff(
   videoId: string;
   archiveId: string;
   archiveName?: string;
+  purpose?: string | null;
   documentPath: string;
   markdownDoc: string;
   reagents: ArchiveReagent[];
@@ -1705,6 +1773,7 @@ export async function commitArchiveSignOff(
   let archiveName: string | undefined;
   let creatorName: string | null | undefined;
   let creationDate: string | null | undefined;
+  let purpose: string | null | undefined;
   let replaceArchiveContent = false;
   let hasExplicitReagents = false;
   let hasExplicitTranscriptions = false;
@@ -1724,6 +1793,7 @@ export async function commitArchiveSignOff(
     archiveName = payloadOrDatabaseId.archiveName;
     creatorName = payloadOrDatabaseId.creatorName;
     creationDate = payloadOrDatabaseId.creationDate;
+    purpose = payloadOrDatabaseId.purpose;
     replaceArchiveContent = Boolean(payloadOrDatabaseId.replaceArchiveContent);
 
     const rawReagentsInput =
@@ -1806,6 +1876,7 @@ export async function commitArchiveSignOff(
     ...(archiveName ? { archiveName } : {}),
     ...(creatorName !== undefined ? { creatorName } : {}),
     ...(creationDate !== undefined ? { creationDate } : {}),
+    ...(purpose !== undefined ? { purpose } : {}),
     ...(structuredReagents.length > 0 ? { reagents: structuredReagents } : {}),
     ...(structuredLabelTranscriptions.length > 0 ? { labelTranscriptions: structuredLabelTranscriptions } : {}),
     ...(structuredWorkSteps.length > 0 ? { workSteps: structuredWorkSteps } : {}),
@@ -2121,21 +2192,61 @@ export async function commitArchiveSignOff(
         for (let idx = 0; idx < src.actions.length; idx++) {
           const act = src.actions[idx];
           const cls = String(act?.actionType || act?.actionClass || '').toUpperCase();
-          if (!cls.includes('MIX') && !cls.includes('SEED')) continue;
+          const isMix = cls.includes('MIX');
           const isSeed = cls.includes('SEED');
+          const isIncubate = cls.includes('INCUBAT');
+          const isAspirate = /ASPIRAT|ASPRIRAT/.test(cls);
+          const isHemocytometer = cls.includes('HEMOCYTOMETER');
+          if (!isMix && !isSeed && !isIncubate && !isAspirate && !isHemocytometer) continue;
           const stepNo = structuredWorkSteps.length + 1;
+          const resolvedActionType = isIncubate
+            ? 'INCUBATE_CELLS'
+            : isAspirate
+            ? cls.includes('ASPRIRAT')
+              ? 'ASPRIRATE_MEDIA'
+              : 'ASPIRATE_MEDIA'
+            : isHemocytometer
+            ? 'HEMOCYTOMETER_LOADING'
+            : isSeed
+            ? 'SEED_REAGENTS'
+            : 'MIX_REAGENTS';
           const candidateStep = {
             id: act.actionId || `step_${stepNo}`,
             stepId: act.actionId || `step_${stepNo}`,
             stepNumber: stepNo,
-            actionType: isSeed ? 'SEED_REAGENTS' : 'MIX_REAGENTS',
+            actionType: resolvedActionType,
             startTimeSeconds: Number(act.startTimestampSeconds ?? act.startTime ?? 0),
             endTimeSeconds: Number(act.endTimestampSeconds ?? act.endTime ?? 0),
             description:
               act.description ||
-              (isSeed ? 'Seed reagents into plate' : 'Mix two reagents'),
+              (isIncubate
+                ? 'Inserting cell container into incubator'
+                : isAspirate
+                ? 'Aspirating media from container using pipette'
+                : isHemocytometer
+                ? 'Loading cells into the two squares of the hemocytometer slide'
+                : isSeed
+                ? 'Seed reagents into plate'
+                : 'Mix two reagents'),
             ...(act.mixReagentsData ? { mixReagentsData: act.mixReagentsData } : {}),
             ...(act.seedReagentsData ? { seedReagentsData: act.seedReagentsData } : {}),
+            ...(act.incubateCellsData || act.incubatorSettings
+              ? {
+                  incubateCellsData: act.incubateCellsData || act.incubatorSettings,
+                  incubatorSettings: act.incubateCellsData || act.incubatorSettings,
+                }
+              : {}),
+            ...(act.hemocytometerLoadingData || act.hemocytometerLoad || act.substanceLoaded
+              ? {
+                  hemocytometerLoadingData: act.hemocytometerLoadingData ||
+                    act.hemocytometerLoad || { substanceLoaded: act.substanceLoaded },
+                  hemocytometerLoad: act.hemocytometerLoadingData ||
+                    act.hemocytometerLoad || { substanceLoaded: act.substanceLoaded },
+                  substanceLoaded:
+                    (act.hemocytometerLoadingData || act.hemocytometerLoad || {}).substanceLoaded ||
+                    act.substanceLoaded,
+                }
+              : {}),
             ...(videoId && videoId !== archiveId ? { videoId } : {}),
           };
           const parsedWs = ArchiveWorkStepSchema.safeParse(candidateStep);
@@ -2334,11 +2445,13 @@ export async function commitArchiveSignOff(
   let resolvedArchiveName: string | undefined;
   let resolvedCreatorName: string | null | undefined;
   let resolvedCreationDate: string | null | undefined;
+  let resolvedPurpose: string | null | undefined;
 
   if (isFullArchiveDirectEdit) {
     resolvedArchiveName = archiveName || existingData.name;
     resolvedCreatorName = creatorName !== undefined ? creatorName : existingData.creatorName;
     resolvedCreationDate = creationDate !== undefined ? creationDate : existingData.creationDate;
+    resolvedPurpose = purpose !== undefined ? purpose : existingData.purpose;
   } else {
     resolvedArchiveName =
       existingData.name && !isPlaceholderMeta(existingData.name)
@@ -2356,6 +2469,12 @@ export async function commitArchiveSignOff(
         : !isPlaceholderMeta(creationDate)
         ? creationDate
         : existingData.creationDate ?? creationDate;
+    resolvedPurpose =
+      existingData.purpose && !isPlaceholderMeta(existingData.purpose)
+        ? existingData.purpose
+        : !isPlaceholderMeta(purpose)
+        ? purpose
+        : existingData.purpose ?? purpose;
   }
 
   // 6. Recompile markdownDoc when merging existing and incoming archive content
@@ -2410,6 +2529,7 @@ export async function commitArchiveSignOff(
         combinedDesc ||
         resolvedArchiveName ||
         'Automated experiment archive generated from SAIL video analysis.',
+      purpose: resolvedPurpose,
       reagents: mergedReagents,
       workSteps: mergedWorkSteps,
     });
@@ -2425,6 +2545,7 @@ export async function commitArchiveSignOff(
         ...(resolvedArchiveName ? { name: resolvedArchiveName } : {}),
         ...(resolvedCreatorName !== undefined ? { creatorName: resolvedCreatorName } : {}),
         ...(resolvedCreationDate !== undefined ? { creationDate: resolvedCreationDate } : {}),
+        ...(resolvedPurpose !== undefined ? { purpose: resolvedPurpose } : {}),
         videoIds: mergedVideoIds,
         reagents: mergedReagents,
         labelTranscriptions: mergedTranscriptions,
@@ -2462,6 +2583,7 @@ export async function commitArchiveSignOff(
           ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
           ...(resolvedCreatorName !== undefined ? { creatorName: resolvedCreatorName } : {}),
           ...(resolvedCreationDate !== undefined ? { creationDate: resolvedCreationDate } : {}),
+          ...(resolvedPurpose !== undefined ? { purpose: resolvedPurpose } : {}),
           ...(structuredReagents.length > 0 ? { reagents: structuredReagents } : {}),
           ...(structuredWorkSteps.length > 0 ? { workSteps: structuredWorkSteps } : {}),
           isSignedOff: true,
@@ -2521,6 +2643,7 @@ export async function commitArchiveSignOff(
     videoId,
     archiveId,
     ...(resolvedArchiveName ? { archiveName: resolvedArchiveName } : {}),
+    ...(resolvedPurpose !== undefined ? { purpose: resolvedPurpose } : {}),
     documentPath: `/databases/${dbId}/documents/archives/${archiveId}`,
     markdownDoc: finalMarkdownDoc,
     reagents: mergedReagents,

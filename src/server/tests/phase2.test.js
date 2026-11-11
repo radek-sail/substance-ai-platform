@@ -622,9 +622,106 @@ describe('Phase 2: Multi-Tenant Data & Media Engine', () => {
         assert.ok(Array.isArray(data.inventories));
         const smurfInv = data.inventories.find((inv) => inv.id === smurfId || inv.name === 'smurf');
         assert.ok(smurfInv, 'smurf inventory must be returned for substance-ai organization');
-        assert.strictEqual(smurfInv.organizationId, 'substance-ai');
+        assert.strictEqual( smurfInv.organizationId, 'substance-ai');
       } finally {
         server.close();
+      }
+    });
+
+    it('should skip oversized (>25MB / 150MB) single-file GCS thumbnails and generate a compact chunked thumbnail under a new organizationId', async () => {
+      const firestoreService = require('../dist/services/firestore.service');
+      const ffmpegService = require('../dist/services/ffmpeg.service');
+      const videoId = `vid_oversized_${Date.now()}`;
+      const scratchDir = getScratchDir();
+      const normCacheDir = path.join(scratchDir, 'sail_normalized_cache');
+      const thumbCacheDir = path.join(scratchDir, 'sail_thumbnail_cache');
+      fs.mkdirSync(normCacheDir, { recursive: true });
+      fs.mkdirSync(thumbCacheDir, { recursive: true });
+
+      const chunk0Source = path.join(normCacheDir, `norm_${videoId}_chunk_0.mp4`);
+      fs.writeFileSync(chunk0Source, 'compact-chunk-0-source-mp4');
+
+      await firestoreService.saveVideoMetadata('(default)', videoId, {
+        videoId,
+        originalName: 'long_experiment_recording.mp4',
+        bucketName: 'sail-platform-videos-prod',
+        gcsBucket: 'sail-platform-videos-prod',
+        rawGcsUri: `gs://sail-platform-videos-prod/raw/${videoId}/long_experiment_recording.mp4`,
+        normalizedGcsUri: `gs://sail-platform-videos-prod/normalized/${videoId}/chunk_000.mp4`,
+        thumbnailGcsUri: `gs://sail-platform-videos-prod/thumbnails/thumb_${videoId}.mp4`,
+        organizationId: 'org-new-lab-99',
+        totalChunks: 3,
+        chunks: [
+          { index: 0, gcsUri: `gs://sail-platform-videos-prod/normalized/${videoId}/chunk_000.mp4` },
+          { index: 1, gcsUri: `gs://sail-platform-videos-prod/normalized/${videoId}/chunk_001.mp4` },
+          { index: 2, gcsUri: `gs://sail-platform-videos-prod/normalized/${videoId}/chunk_002.mp4` },
+        ],
+        status: 'READY_FOR_ANALYSIS',
+        uploadedAt: new Date().toISOString(),
+      });
+
+      const origBucket = storage.bucket.bind(storage);
+      let oversizedDownloadCalled = false;
+      storage.bucket = (bName) => ({
+        name: bName,
+        file: (objPath) => ({
+          exists: async () => {
+            if (objPath === `thumbnails/thumb_${videoId}.mp4`) {
+              return [true]; // Legacy 150MB single-file thumbnail exists in GCS
+            }
+            return [false];
+          },
+          getMetadata: async () => {
+            if (objPath === `thumbnails/thumb_${videoId}.mp4`) {
+              return [{ size: 150 * 1024 * 1024 }]; // 150MB oversized file
+            }
+            return [{ size: 0 }];
+          },
+          download: async () => {
+            if (objPath === `thumbnails/thumb_${videoId}.mp4`) {
+              oversizedDownloadCalled = true;
+            }
+            return [Buffer.from('should-not-download-150mb')];
+          },
+        }),
+        upload: async () => [{}],
+      });
+
+      const origGenThumb = ffmpegService.generateThumbnailVideo;
+      let passedOptions = null;
+      ffmpegService.generateThumbnailVideo = async (_inPath, outPath, opts) => {
+        passedOptions = opts;
+        fs.writeFileSync(outPath, 'compact-chunk-0-thumbnail-mp4');
+        return outPath;
+      };
+
+      const server = app.listen(0);
+      const port = server.address().port;
+
+      try {
+        const res = await fetch(
+          `http://127.0.0.1:${port}/api/videos/${videoId}/thumbnail?v=2&customerId=org-new-lab-99&organizationId=org-new-lab-99&chunk=0`
+        );
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(
+          oversizedDownloadCalled,
+          false,
+          'Must NOT download 150MB legacy single-file thumbnail into memory'
+        );
+        assert.ok(passedOptions && passedOptions.durationSec === 600, 'Must cap thumbnail chunk duration to 600s');
+        const body = Buffer.from(await res.arrayBuffer()).toString();
+        assert.strictEqual(body, 'compact-chunk-0-thumbnail-mp4');
+      } finally {
+        storage.bucket = origBucket;
+        ffmpegService.generateThumbnailVideo = origGenThumb;
+        server.close();
+        for (const f of [
+          chunk0Source,
+          path.join(thumbCacheDir, `thumb_${videoId}_chunk_0.mp4`),
+          path.join(thumbCacheDir, `thumb_${videoId}.mp4`),
+        ]) {
+          if (fs.existsSync(f)) fs.unlinkSync(f);
+        }
       }
     });
   });

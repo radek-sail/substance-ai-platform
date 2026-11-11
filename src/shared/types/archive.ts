@@ -820,6 +820,215 @@ export const SeedReagentsActionDataSchema = z.object({
 });
 export type SeedReagentsActionData = z.infer<typeof SeedReagentsActionDataSchema>;
 
+/**
+ * Structured data extracted for Action: Incubate Cells (`INCUBATE_CELLS` / `INCUBATE_CELLS_ACTION`)
+ * and its associated Event: Incubator Settings (`INCUBATOR_SETTINGS` / `INCUBATOR_SETTINGS_EVENT`).
+ * Extracts temperature and CO2 level from the incubator settings panel.
+ */
+export const IncubateCellsActionDataSchema = z.preprocess(
+  (val) => {
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      const obj = val as Record<string, any>;
+      const temperature =
+        obj.temperature ?? obj.temp ?? obj.incubatorTemperature ?? 'N/A';
+      const co2Level =
+        obj.co2Level ?? obj.co2 ?? obj.co2_level ?? obj.co2Percentage ?? 'N/A';
+      return {
+        ...obj,
+        temperature: String(temperature || 'N/A'),
+        co2Level: String(co2Level || 'N/A'),
+      };
+    }
+    return val;
+  },
+  z.object({
+    temperature: z.string().default('N/A'),
+    co2Level: z.string().default('N/A'),
+    rawPanelText: z.string().optional(),
+    notes: z.string().optional(),
+  })
+);
+export type IncubateCellsActionData = z.infer<typeof IncubateCellsActionDataSchema>;
+export const IncubatorSettingsDataSchema = IncubateCellsActionDataSchema;
+export type IncubatorSettingsData = IncubateCellsActionData;
+
+/**
+ * Parses incubator settings (`temperature` and `co2Level`) from incubator panel OCR text,
+ * spoken context, or explicit candidate fields.
+ * Defaults any missing field to `'N/A'`.
+ */
+export function parseIncubatorSettingsFields(
+  rawText?: string | null,
+  explicitFields?: Partial<IncubateCellsActionData> | Record<string, any> | null
+): IncubateCellsActionData {
+  const isValidVal = (v?: any): v is string => {
+    const s = String(v ?? '').trim();
+    return Boolean(s && s.toUpperCase() !== 'N/A' && s.toUpperCase() !== 'UNKNOWN');
+  };
+
+  let temperature = isValidVal(explicitFields?.temperature ?? (explicitFields as any)?.temp)
+    ? String(explicitFields?.temperature ?? (explicitFields as any)?.temp).trim()
+    : '';
+  let co2Level = isValidVal(
+    explicitFields?.co2Level ?? (explicitFields as any)?.co2 ?? (explicitFields as any)?.co2_level
+  )
+    ? String(
+        explicitFields?.co2Level ?? (explicitFields as any)?.co2 ?? (explicitFields as any)?.co2_level
+      ).trim()
+    : '';
+
+  const text = String(rawText || '').trim();
+  if (text) {
+    if (!temperature) {
+      const tempWithUnit = text.match(
+        /\b(\d{2}(?:\.\d+)?)\s*(?:°\s*[CFcf]|deg(?:rees?)?\s*[CFcf]?|[°º]|(?=\s*[CF]\b)[CF])\b/
+      );
+      const tempLabeled = text.match(
+        /\b(?:temp(?:erature)?)\s*[:=]?\s*(\d{2}(?:\.\d+)?(?:\s*°?\s*[CFcf])?)\b/i
+      );
+      if (tempWithUnit) {
+        const raw = tempWithUnit[0].trim();
+        temperature = /c|f/i.test(raw) ? raw.replace(/\s+/g, '') : `${tempWithUnit[1]}°C`;
+      } else if (tempLabeled) {
+        const val = tempLabeled[1].trim();
+        temperature = /[°cf]/i.test(val) ? val : `${val}°C`;
+      }
+    }
+
+    if (!co2Level) {
+      const co2LabeledBefore = text.match(
+        /\bCO2(?:\s+level)?\s*[:=]?\s*(\d{1,2}(?:\.\d+)?)\s*%?/i
+      );
+      const co2LabeledAfter = text.match(
+        /\b(\d{1,2}(?:\.\d+)?)\s*%\s*CO2\b/i
+      );
+      const standalonePercent = text.match(/\b(\d{1,2}(?:\.\d+)?)\s*%/);
+      if (co2LabeledAfter) {
+        co2Level = `${co2LabeledAfter[1]}%`;
+      } else if (co2LabeledBefore) {
+        co2Level = `${co2LabeledBefore[1]}%`;
+      } else if (standalonePercent) {
+        co2Level = `${standalonePercent[1]}%`;
+      }
+    }
+  }
+
+  return {
+    temperature: temperature || 'N/A',
+    co2Level: co2Level || 'N/A',
+    ...(text ? { rawPanelText: text } : {}),
+  };
+}
+
+/**
+ * Structured data extracted for Action: Hemocytometer Loading (`HEMOCYTOMETER_LOADING` / `hemocytometer_loading`)
+ * and its associated Event: Hemocytometer Load (`HEMOCYTOMETER_LOAD` / `hemocytometer_load`).
+ * Records information about the substance (cells, cell suspension, or cell + Trypan Blue mixture)
+ * loaded into the two squares of the hemocytometer slide.
+ */
+export const HemocytometerLoadingActionDataSchema = z.preprocess(
+  (val) => {
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      const obj = val as Record<string, any>;
+      const substanceLoaded =
+        obj.substanceLoaded ??
+        obj.substance ??
+        obj.cellsLoaded ??
+        obj.cellLineName ??
+        obj.reagentName ??
+        'N/A';
+      return {
+        ...obj,
+        substanceLoaded: String(substanceLoaded || 'N/A'),
+      };
+    }
+    return val;
+  },
+  z.object({
+    substanceLoaded: z.string().default('N/A'),
+    chambersLoaded: z.number().int().nonnegative().optional(),
+    volumePerSquare: z.string().optional(),
+    notes: z.string().optional(),
+  })
+);
+export type HemocytometerLoadingActionData = z.infer<typeof HemocytometerLoadingActionDataSchema>;
+export const HemocytometerLoadDataSchema = HemocytometerLoadingActionDataSchema;
+export type HemocytometerLoadData = HemocytometerLoadingActionData;
+
+/**
+ * Parses `substanceLoaded` (and optional volume/chamber metadata) from a `hemocytometer_load` event,
+ * spoken context, or explicit candidate fields.
+ * Defaults missing `substanceLoaded` to `'N/A'`.
+ */
+export function parseHemocytometerLoadingFields(
+  rawText?: string | null,
+  explicitFields?: Partial<HemocytometerLoadingActionData> | Record<string, any> | null
+): HemocytometerLoadingActionData {
+  const isValidVal = (v?: any): v is string => {
+    const s = String(v ?? '').trim();
+    return Boolean(s && s.toUpperCase() !== 'N/A' && s.toUpperCase() !== 'UNKNOWN');
+  };
+
+  const nested =
+    explicitFields && typeof explicitFields === 'object'
+      ? (explicitFields as any).hemocytometerLoadingData ||
+        (explicitFields as any).hemocytometerLoad ||
+        undefined
+      : undefined;
+
+  let substanceLoaded = '';
+  const explicitCandidates = [
+    explicitFields?.substanceLoaded,
+    nested?.substanceLoaded,
+    (explicitFields as any)?.substance,
+    nested?.substance,
+    (explicitFields as any)?.cellsLoaded,
+    (explicitFields as any)?.cellsSeeded,
+    (explicitFields as any)?.cellLineName,
+    (explicitFields as any)?.reagentName,
+  ];
+  for (const cand of explicitCandidates) {
+    if (isValidVal(cand)) {
+      substanceLoaded = String(cand).trim();
+      break;
+    }
+  }
+
+  const text = String(rawText || '').trim();
+  if (!substanceLoaded && text) {
+    const loadPattern =
+      text.match(
+        /\b(?:load(?:ing|ed|s)?|pipett(?:ing|ed|es)?|dispens(?:ing|ed|es)?|transfer(?:ring|red|s)?|add(?:ing|ed|s)?)\s+(?:\d+(?:\.\d+)?\s*(?:µl|ul|ml|microliters?)\s+of\s+)?([A-Za-z0-9][A-Za-z0-9\-+/\s()]{1,65}?)\s+(?:into|onto|to|in)\s+(?:the\s+)?(?:two\s+squares\s+of\s+(?:the\s+)?|both\s+(?:squares|chambers)\s+of\s+(?:the\s+)?)?(?:hemocytometer|counting\s+slide|counting\s+chamber|slide\s+squares|slide)\b/i
+      ) ||
+      text.match(
+        /\b(?:hemocytometer|counting\s+slide)\s+(?:is\s+)?loaded\s+with\s+([A-Za-z0-9][A-Za-z0-9\-+/\s()]{1,65}?)(?=[.,;]|$)/i
+      ) ||
+      text.match(
+        /\bsubstance(?:\s+loaded)?\s*[:=]\s*([^.,;\n]+)/i
+      );
+    if (loadPattern?.[1]) {
+      const cleaned = loadPattern[1]
+        .replace(/^(?:the|a|an|some|our)\s+/i, '')
+        .replace(/\s+(?:into|onto|to)\s+.*$/i, '')
+        .trim();
+      if (isValidVal(cleaned)) {
+        substanceLoaded = cleaned;
+      }
+    }
+  }
+
+  return {
+    substanceLoaded: substanceLoaded || 'N/A',
+    ...(typeof (explicitFields as any)?.chambersLoaded === 'number'
+      ? { chambersLoaded: (explicitFields as any).chambersLoaded }
+      : {}),
+    ...(isValidVal((explicitFields as any)?.volumePerSquare)
+      ? { volumePerSquare: String((explicitFields as any).volumePerSquare).trim() }
+      : {}),
+    ...(isValidVal(explicitFields?.notes) ? { notes: String(explicitFields?.notes).trim() } : {}),
+  };
+}
+
 const NON_CELL_MEDIA_REAGENT_NAMES = new Set([
   'N/A',
   'NA',
@@ -1537,6 +1746,22 @@ const OPERATOR_VERB_TO_GERUND: Record<string, string> = {
   aspirates: 'Aspirating',
   aspirated: 'Aspirating',
   aspirating: 'Aspirating',
+  incubate: 'Incubating',
+  incubates: 'Incubating',
+  incubated: 'Incubating',
+  incubating: 'Incubating',
+  empty: 'Emptying',
+  empties: 'Emptying',
+  emptied: 'Emptying',
+  emptying: 'Emptying',
+  insert: 'Inserting',
+  inserts: 'Inserting',
+  inserted: 'Inserting',
+  inserting: 'Inserting',
+  place: 'Placing',
+  places: 'Placing',
+  placed: 'Placing',
+  placing: 'Placing',
   present: 'Presenting',
   presents: 'Presenting',
   presented: 'Presenting',
@@ -1577,6 +1802,10 @@ const OPERATOR_VERB_TO_GERUND: Record<string, string> = {
   vortexes: 'Vortexing',
   vortexed: 'Vortexing',
   vortexing: 'Vortexing',
+  load: 'Loading',
+  loads: 'Loading',
+  loaded: 'Loading',
+  loading: 'Loading',
   perform: 'Performing',
   performs: 'Performing',
   performed: 'Performing',
@@ -1638,7 +1867,7 @@ export function toActiveVoiceDescription(description?: string | null): string {
 
   // Match leading bare/past verbs like "Pours ...", "Seeds ...", "Seeded ...", "Mixed ...", "Pour ...", "Seed ...", "Mix ..."
   const leadingVerbMatch = trimmed.match(
-    /^(pours?|poured|seeds?|seeded|mix(?:es|ed)?|dispenses?|dispensed|transfers?|transferred|adds?|added|pipettes?|pipetted)\b(.*)$/i
+    /^(pours?|poured|seeds?|seeded|mix(?:es|ed)?|dispenses?|dispensed|transfers?|transferred|adds?|added|pipettes?|pipetted|incubates?|incubated|aspirates?|aspirated|empt(?:y|ies|ied)|inserts?|inserted|places?|placed|loads?|loaded)\b(.*)$/i
   );
   if (leadingVerbMatch) {
     const gerund = verbToGerund(leadingVerbMatch[1]);
@@ -1647,14 +1876,19 @@ export function toActiveVoiceDescription(description?: string | null): string {
 
   // Also replace any mid-sentence "operator <verb>s" occurrences
   return trimmed.replace(
-    /\b(?:the\s+)?operator\s+(?:(?:is|was)\s+)?(pours?|poured|seeds?|seeded|mix(?:es|ed)?|dispenses?|dispensed|transfers?|transferred|adds?|added|pipettes?|pipetted)\b/gi,
+    /\b(?:the\s+)?operator\s+(?:(?:is|was)\s+)?(pours?|poured|seeds?|seeded|mix(?:es|ed)?|dispenses?|dispensed|transfers?|transferred|adds?|added|pipettes?|pipetted|incubates?|incubated|aspirates?|aspirated|empt(?:y|ies|ied)|inserts?|inserted|places?|placed|loads?|loaded)\b/gi,
     (_full, verb: string) => verbToGerund(verb).toLowerCase()
   );
 }
 
 /**
  * Structured Work Step entry in the Experiment Archive Notebook.
- * Supports 'MIX_REAGENTS' (`REAGENT_MIXING_ACTION`) and 'SEED_REAGENTS' (`REAGENT_SEEDING_ACTION`).
+ * Supports:
+ * - 'MIX_REAGENTS' (`REAGENT_MIXING_ACTION`)
+ * - 'SEED_REAGENTS' (`REAGENT_SEEDING_ACTION`)
+ * - 'INCUBATE_CELLS' (`INCUBATE_CELLS_ACTION`)
+ * - 'ASPIRATE_MEDIA' / 'ASPRIRATE_MEDIA' (`ASPIRATE_MEDIA_ACTION`)
+ * - 'HEMOCYTOMETER_LOADING' / 'hemocytometer_loading' (`HEMOCYTOMETER_LOADING_ACTION`)
  */
 export const ArchiveWorkStepSchema = z.object({
   id: z.string().optional(),
@@ -1666,6 +1900,14 @@ export const ArchiveWorkStepSchema = z.object({
     'SEED_REAGENTS',
     'REAGENT_MIXING_ACTION',
     'REAGENT_SEEDING_ACTION',
+    'INCUBATE_CELLS',
+    'INCUBATE_CELLS_ACTION',
+    'ASPIRATE_MEDIA',
+    'ASPRIRATE_MEDIA',
+    'ASPIRATE_MEDIA_ACTION',
+    'HEMOCYTOMETER_LOADING',
+    'HEMOCYTOMETER_LOADING_ACTION',
+    'hemocytometer_loading',
   ]),
   description: z.string().optional(),
   startTime: z.union([z.string(), z.number()]).optional(),
@@ -1674,6 +1916,11 @@ export const ArchiveWorkStepSchema = z.object({
   endTimeSeconds: z.number().optional(),
   mixReagentsData: MixReagentsActionDataSchema.optional(),
   seedReagentsData: SeedReagentsActionDataSchema.optional(),
+  incubateCellsData: IncubateCellsActionDataSchema.optional(),
+  incubatorSettings: IncubateCellsActionDataSchema.optional(),
+  hemocytometerLoadingData: HemocytometerLoadingActionDataSchema.optional(),
+  hemocytometerLoad: HemocytometerLoadingActionDataSchema.optional(),
+  substanceLoaded: z.string().optional(),
   videoId: z.string().optional(),
 });
 export type ArchiveWorkStep = z.infer<typeof ArchiveWorkStepSchema>;
@@ -1684,6 +1931,7 @@ export const ArchiveRecordSchema = z.object({
   organizationId: z.string().optional(),
   creatorName: z.string().nullable().optional(),
   creationDate: z.string().nullable().optional(),
+  purpose: z.string().nullable().optional(),
   markdownDoc: z.string().default(''),
   videoIds: z.array(z.string()).default([]),
   reagents: z.array(ArchiveReagentSchema).default([]),
@@ -1700,6 +1948,7 @@ export const CreateArchiveInputSchema = z.object({
   name: z.string().min(1),
   creatorName: z.string().nullable().optional(),
   creationDate: z.string().nullable().optional(),
+  purpose: z.string().nullable().optional(),
   markdownDoc: z.string().optional(),
   videoId: z.string().optional(),
   reagents: z.array(ArchiveReagentSchema).optional(),

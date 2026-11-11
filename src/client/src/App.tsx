@@ -426,7 +426,14 @@ export const App: React.FC = () => {
       (Array.isArray(analysisDoc?.actions) &&
         analysisDoc.actions.some((a: any) => {
           const cls = String(a?.actionType || a?.actionClass || '').toUpperCase();
-          return cls.includes('MIX') || cls.includes('SEED');
+          return (
+            cls.includes('MIX') ||
+            cls.includes('SEED') ||
+            cls.includes('INCUBAT') ||
+            cls.includes('ASPIRAT') ||
+            cls.includes('ASPRIRAT') ||
+            cls.includes('HEMOCYTOMETER')
+          );
         })) ||
       videoId.toLowerCase().includes('archive');
 
@@ -942,6 +949,7 @@ export const App: React.FC = () => {
         archiveName={derivedArchiveData.archiveName}
         creatorName={derivedArchiveData.creatorName}
         creationDate={derivedArchiveData.creationDate}
+        purpose={derivedArchiveData.purpose}
         reagents={derivedArchiveData.reagents}
         labelTranscriptions={derivedArchiveData.labelTranscriptions}
         workSteps={derivedArchiveData.workSteps}

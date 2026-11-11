@@ -6,7 +6,6 @@ import {
   Lock,
   AlertCircle,
   Loader2,
-  ShieldCheck,
   ArrowRight,
   Sun,
   Moon,
@@ -117,14 +116,9 @@ export const Login: React.FC<LoginProps> = ({
           </div>
 
           <div>
-            <div className="flex items-center justify-center gap-2">
-              <h1 className="font-bold text-2xl tracking-wider bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 via-indigo-300 to-emerald-400 font-mono">
-                SAIL
-              </h1>
-              <span className="text-[11px] uppercase tracking-widest text-slate-400 bg-slate-800/80 border border-slate-700 px-2 py-0.5 rounded-md font-semibold">
-                v1.0 HITL
-              </span>
-            </div>
+            <h1 className="font-bold text-2xl tracking-wider bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 via-indigo-300 to-emerald-400 font-mono">
+              SAIL
+            </h1>
             <p className="text-xs text-slate-400 mt-1">
               Substance AI Lab Automation • Operator Sign-In
             </p>
@@ -200,21 +194,12 @@ export const Login: React.FC<LoginProps> = ({
               </>
             ) : (
               <>
-                <span>Sign In to SAIL</span>
+                <span>Sign In</span>
                 <ArrowRight className="w-4 h-4" />
               </>
             )}
           </button>
         </form>
-
-        {/* Compliance Footer */}
-        <div className="pt-4 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-500 font-mono">
-          <span className="flex items-center gap-1.5 text-emerald-400/90">
-            <ShieldCheck className="w-3.5 h-3.5" />
-            <span>Firebase Auth • sail-platform-prod</span>
-          </span>
-          <span>ISO-9001 HITL</span>
-        </div>
       </div>
     </div>
   );

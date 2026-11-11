@@ -25,12 +25,13 @@ Classify the procedure into exactly one of the following classes:
 - **archiveName**: If the workflow is `EXPERIMENT_NOTEBOOK_WORKFLOW`, determine the name of the archive, experiment, or notebook (required for `EXPERIMENT_NOTEBOOK_WORKFLOW`, e.g., "Experiment-402", "Cell Seeding Protocol B", "CRISPR Knockout Archive"). Extract it from the spoken audio track or visible title.
 - **creatorName**: (Optional) If the workflow is `EXPERIMENT_NOTEBOOK_WORKFLOW` and the operator states their name, creator name, researcher name, or initials in the audio track (e.g., "Dr. Jane Smith", "Created by Alex Rivera", "Operator: R.K."), extract it. Otherwise return null.
 - **creationDate**: (Optional) If the workflow is `EXPERIMENT_NOTEBOOK_WORKFLOW` and a creation date or experiment date is spoken in the audio track (e.g., "2026-11-04", "November 4th, 2026"), extract it (prefer ISO `YYYY-MM-DD` when unambiguous, or the spoken date string). Otherwise return null.
+- **purpose**: (Optional) When `workflowType` is `EXPERIMENT_NOTEBOOK_WORKFLOW` and the operator identifies the archive by giving it a name, they might optionally give a reason or purpose for why this experiment is done (e.g., "to test cell proliferation under serum starvation", "for dose-response IC50 screening", "for routine cell passaging and viability check"). Extract that reason/purpose into the `purpose` field (both at the root level and inside `identificationEvent.purpose`). If the operator does not state the purpose of the experiment during the archive identification, leave `purpose` empty (`""` or `null`).
 - **archiveIntent**: If the workflow is `EXPERIMENT_NOTEBOOK_WORKFLOW`, determine from the spoken audio track whether the operator is appending to / continuing an existing archive (`"APPEND"`) or creating / starting / initializing a new archive (`"CREATE"`). Examples of `"APPEND"`: "appending to archive...", "continuing experiment...", "adding to existing notebook...", "updating archive...". Examples of `"CREATE"`: "creating a new archive...", "starting new experiment...", "initializing archive...". If the workflow is not `EXPERIMENT_NOTEBOOK_WORKFLOW`, return null.
 - **isAppending**: Boolean corresponding to `archiveIntent` (`true` when `archiveIntent` is `"APPEND"`, `false` when `archiveIntent` is `"CREATE"`, or `null` when not `EXPERIMENT_NOTEBOOK_WORKFLOW`).
 - **identificationEvent**: Detect the workflow identification event in Pass 0:
   - `INVENTORY_IDENTIFICATION`: When `workflowType` is `INVENTORY_UPDATE_WORKFLOW` and the operator announces or visually identifies the target cryogenic storage unit / inventory (e.g., `"Tank Alpha"`, `"Cryo-Tank 2"`).
-  - `ARCHIVE_IDENTIFICATION`: When `workflowType` is `EXPERIMENT_NOTEBOOK_WORKFLOW` and the operator announces or visually identifies the experiment archive / notebook title, researcher/creator name, creation date, or create/append intent (e.g., `"Operator announces experiment title, researcher name, date, and A549 cell proliferation protocol"`).
-  - Populate `eventId` (`"evt_id_001"`), `eventClass` (`"INVENTORY_IDENTIFICATION"` or `"ARCHIVE_IDENTIFICATION"`), `eventTrack` (`"audio"` or `"video"`), `startTime` (seconds), `endTime` (seconds), `description`, and `spokenContext`. Once detected in Pass 0, this identification event MUST NOT be repeated in Pass 1.
+  - `ARCHIVE_IDENTIFICATION`: When `workflowType` is `EXPERIMENT_NOTEBOOK_WORKFLOW` and the operator announces or visually identifies the experiment archive / notebook title, researcher/creator name, creation date, optional purpose/reason for the experiment, or create/append intent (e.g., `"Operator announces experiment title, researcher name, date, and A549 cell proliferation protocol"`).
+  - Populate `eventId` (`"evt_id_001"`), `eventClass` (`"INVENTORY_IDENTIFICATION"` or `"ARCHIVE_IDENTIFICATION"`), `eventTrack` (`"audio"` or `"video"`), `startTime` (seconds), `endTime` (seconds), `description`, `spokenContext`, and (for `ARCHIVE_IDENTIFICATION`) `purpose` (the stated reason/purpose for why the experiment is done, or `""` / `null` if not stated during archive identification). Once detected in Pass 0, this identification event MUST NOT be repeated in Pass 1.
 
 ## Output Format
 Return a single JSON object conforming strictly to `WorkflowClassificationSchema`:
@@ -41,6 +42,7 @@ Return a single JSON object conforming strictly to `WorkflowClassificationSchema
   "archiveName": "string or null (required when workflowType is EXPERIMENT_NOTEBOOK_WORKFLOW)",
   "creatorName": "string or null (optional)",
   "creationDate": "string or null (optional)",
+  "purpose": "string or null (optional — reason why this experiment is done, if stated during archive identification; empty or null if not stated)",
   "archiveIntent": "CREATE" | "APPEND" | null,
   "isAppending": true | false | null,
   "identificationEvent": {
@@ -50,7 +52,8 @@ Return a single JSON object conforming strictly to `WorkflowClassificationSchema
     "startTime": 1.0,
     "endTime": 11.0,
     "description": "Concise summary of the inventory or archive identification announcement",
-    "spokenContext": "Verbatim identification utterance"
+    "spokenContext": "Verbatim identification utterance",
+    "purpose": "string or null (optional — reason why this experiment is done, or empty/null if not stated)"
   },
   "transcribedAudio": "string"
 }

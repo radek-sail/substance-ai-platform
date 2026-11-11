@@ -579,9 +579,9 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
-      {/* 1. Left Column (Half Width): Inventory Sidebar & Creation Panel */}
-      <div className="w-full">
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+      {/* 1. Left Column (Narrower): Inventory Sidebar & Creation Panel */}
+      <div className="w-full lg:col-span-4 xl:col-span-4">
         <InventorySidebar
           inventories={inventories}
           activeInventoryId={activeInventory?.id || null}
@@ -599,8 +599,8 @@ export const CryoInventory: React.FC<CryoInventoryProps> = ({
         />
       </div>
 
-      {/* 2. Center Column (Half Width): Search Bar, Tower & Box Architecture + Cryo-Box Matrix */}
-      <div className="w-full space-y-6">
+      {/* 2. Center/Right Column (Wider): Search Bar, Tower & Box Architecture + Cryo-Box Matrix */}
+      <div className="w-full lg:col-span-8 xl:col-span-8 space-y-6">
         {/* Top Search Bar: Search Vials by Cell Line Name */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="relative flex-1">

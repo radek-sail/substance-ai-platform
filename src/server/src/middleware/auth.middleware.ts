@@ -42,11 +42,18 @@ export async function authMiddleware(
       req.method === 'GET' &&
       /^\/api\/videos\/[^/]+\/(frames\/[^/?#]+|thumbnail)(?:[?#].*)?$/.test(urlPath)
     ) {
+      const mediaOrgId = String(
+        (req.query?.organizationId as string) ||
+          (req.query?.customerId as string) ||
+          (req.headers['x-organization-id'] as string) ||
+          (req.headers['x-customer-id'] as string) ||
+          DEFAULT_FALLBACK_ORG_ID
+      ).trim();
       req.user = {
         uid: 'media-reader',
         email: '',
         role: 'viewer',
-        organizationId: DEFAULT_FALLBACK_ORG_ID,
+        organizationId: mediaOrgId || DEFAULT_FALLBACK_ORG_ID,
       };
       return next();
     }

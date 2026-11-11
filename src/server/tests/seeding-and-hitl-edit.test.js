@@ -19,6 +19,8 @@ const {
   extractCellsSeededFromText,
   resolveSeedReagentsDataFromContext,
   toActiveVoiceDescription,
+  parseIncubatorSettingsFields,
+  ActionClassSchema,
 } = require('@sail/shared');
 
 const {
@@ -562,6 +564,375 @@ describe('96-Well Plate Seeding Event Detection, Column Mapping & Sign-Off Verif
         toActiveVoiceDescription('The operator dispenses media into columns 1 to 12'),
         'Dispensing media into columns 1 to 12'
       );
+      assert.strictEqual(
+        toActiveVoiceDescription('Operator inserts container containing cells into incubator'),
+        'Inserting container containing cells into incubator'
+      );
+      assert.strictEqual(
+        toActiveVoiceDescription('Operator aspirates media from flask using pipette'),
+        'Aspirating media from flask using pipette'
+      );
+    });
+  });
+
+  describe('6. INCUBATE_CELLS, INCUBATOR_SETTINGS Event, and ASPIRATE_MEDIA / ASPRIRATE_MEDIA Actions & Video Manager UI', () => {
+    it('should parse incubator settings temperature and CO2 level from panel text and validate action schemas', () => {
+      const parsed = parseIncubatorSettingsFields('Incubator panel: 37.0°C and 5.0% CO2');
+      assert.strictEqual(parsed.temperature, '37.0°C');
+      assert.strictEqual(parsed.co2Level, '5.0%');
+
+      assert.strictEqual(ActionClassSchema.parse('INCUBATE_CELLS'), 'INCUBATE_CELLS');
+      assert.strictEqual(ActionClassSchema.parse('ASPIRATE_MEDIA'), 'ASPIRATE_MEDIA');
+      assert.strictEqual(ActionClassSchema.parse('ASPRIRATE_MEDIA'), 'ASPRIRATE_MEDIA');
+    });
+
+    it('should detect and propagate INCUBATE_CELLS, INCUBATOR_SETTINGS, and ASPRIRATE_MEDIA across Pass 1, Pass 2, Pass 3, and Markdown', async () => {
+      const classification = {
+        workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+        confidence: 0.99,
+        reasoning: 'Cell culture media aspiration and incubation',
+      };
+
+      setGenAIClient({
+        models: {
+          generateContent: async () => ({
+            text: JSON.stringify({
+              actions: [
+                {
+                  actionId: 'act_aspirate_1',
+                  actionClass: 'ASPRIRATE_MEDIA',
+                  actionType: 'ASPRIRATE_MEDIA',
+                  startTime: 5.0,
+                  endTime: 18.0,
+                  description: 'Operator empties media from flask using aspirator pipette.',
+                },
+                {
+                  actionId: 'act_incubate_1',
+                  actionClass: 'INCUBATE_CELLS',
+                  actionType: 'INCUBATE_CELLS',
+                  startTime: 22.0,
+                  endTime: 38.0,
+                  description: 'Operator inserts cell container into incubator.',
+                },
+              ],
+              events: [
+                {
+                  eventId: 'evt_inc_settings_1',
+                  actionId: 'act_incubate_1',
+                  actionIds: ['act_incubate_1'],
+                  eventClass: 'INCUBATOR_SETTINGS',
+                  startTime: 25.0,
+                  endTime: 30.0,
+                  description: 'Operator looks at incubator settings panel showing 37.0°C and 5.0% CO2.',
+                  temperature: '37.0°C',
+                  co2Level: '5.0%',
+                },
+              ],
+            }),
+          }),
+        },
+      });
+
+      const pass1Actions = await runPass1ActionDetection({
+        videoGcsUri: 'gs://test-bucket/videos/incubate_and_aspirate.mp4',
+        classification,
+      });
+
+      assert.strictEqual(pass1Actions.length, 2);
+      assert.ok(
+        pass1Actions[0].actionType === 'ASPIRATE_MEDIA' ||
+          pass1Actions[0].actionType === 'ASPRIRATE_MEDIA'
+      );
+      assert.strictEqual(pass1Actions[1].actionType, 'INCUBATE_CELLS');
+      assert.strictEqual(pass1Actions[1].incubateCellsData.temperature, '37.0°C');
+      assert.strictEqual(pass1Actions[1].incubateCellsData.co2Level, '5.0%');
+
+      setGenAIClient({
+        models: {
+          generateContent: async () => ({
+            text: JSON.stringify({
+              events: [
+                {
+                  eventId: 'evt_inc_settings_1',
+                  actionId: 'act_incubate_1',
+                  actionIds: ['act_incubate_1'],
+                  eventClass: 'INCUBATOR_SETTINGS',
+                  startTimeSeconds: 25.0,
+                  endTimeSeconds: 30.0,
+                  bestShotTimestampSeconds: 26.5,
+                  secondBestShotTimestampSeconds: 27.25,
+                  description: 'Incubator display showing 37.0°C and 5.0% CO2',
+                  temperature: '37.0°C',
+                  co2Level: '5.0%',
+                },
+              ],
+            }),
+          }),
+        },
+      });
+
+      const pass2Events = await runPass2EventDetection({
+        videoGcsUri: 'gs://test-bucket/videos/incubate_and_aspirate.mp4',
+        classification,
+        actions: pass1Actions,
+        events: pass1Actions.events,
+      });
+
+      const incEvt = pass2Events.find((e) => e.eventClass === 'INCUBATOR_SETTINGS');
+      assert.ok(incEvt, 'INCUBATOR_SETTINGS event must be preserved and refined in Pass 2');
+      assert.strictEqual(incEvt.incubatorSettings.temperature, '37.0°C');
+      assert.strictEqual(incEvt.incubatorSettings.co2Level, '5.0%');
+
+      setGenAIClient({
+        models: {
+          generateContent: async () => ({
+            text: JSON.stringify({
+              refinements: [
+                {
+                  refinementId: 'ref_inc_1',
+                  eventId: 'evt_inc_settings_1',
+                  actionId: 'act_incubate_1',
+                  refinementClass: 'OCR_CONFLATION',
+                  transcriptionText: 'Temperature: 37.0°C | CO2: 5.0%',
+                  incubatorSettings: {
+                    temperature: '37.0°C',
+                    co2Level: '5.0%',
+                  },
+                },
+              ],
+            }),
+          }),
+        },
+      });
+
+      const pass3Result = await runPass3AnalysisRefinement({
+        videoGcsUri: 'gs://test-bucket/videos/incubate_and_aspirate.mp4',
+        classification,
+        actions: pass1Actions,
+        events: pass2Events,
+      });
+
+      assert.strictEqual(pass3Result.workSteps.length, 2);
+      assert.ok(
+        pass3Result.workSteps[0].actionType === 'ASPIRATE_MEDIA' ||
+          pass3Result.workSteps[0].actionType === 'ASPRIRATE_MEDIA'
+      );
+      assert.strictEqual(pass3Result.workSteps[1].actionType, 'INCUBATE_CELLS');
+      assert.strictEqual(pass3Result.workSteps[1].incubateCellsData.temperature, '37.0°C');
+      assert.strictEqual(pass3Result.workSteps[1].incubateCellsData.co2Level, '5.0%');
+
+      const md = formatArchiveMarkdown({
+        archiveName: 'Incubation & Aspiration Test',
+        creatorName: 'Radek S',
+        creationDate: '2026-11-09',
+        reagents: [],
+        labelTranscriptions: [],
+        workSteps: pass3Result.workSteps,
+      });
+      assert.ok(md.includes('Aspirate Media'));
+      assert.ok(md.includes('Incubate Cells'));
+      assert.ok(md.includes('37.0°C'));
+      assert.ok(md.includes('5.0%'));
+    });
+
+    it('should enforce requested VideoManager UI updates', () => {
+      const vmSource = fs.readFileSync(
+        path.join(__dirname, '../../client/src/components/VideoManager.tsx'),
+        'utf-8'
+      );
+      assert.ok(vmSource.includes('<span>Transcoded</span>'));
+      assert.ok(!vmSource.includes('<span>Ready for Analysis</span>'));
+      assert.ok(vmSource.includes('<span>Run Passes 1-3</span>'));
+      assert.ok(vmSource.includes('<span>View Analysis</span>'));
+      assert.ok(!vmSource.includes('<span>Open Analysis Window</span>'));
+      assert.ok(vmSource.includes('<span>Verify Analysis</span>'));
+      assert.ok(vmSource.includes('<span>Open Archive</span>'));
+      assert.ok(!vmSource.includes('<span>Open Experiment Archive</span>'));
+      assert.ok(vmSource.includes('data-testid="open-archive-button"'));
+      assert.ok(!vmSource.includes('group-jump-to-archive-'));
+      assert.ok(!vmSource.includes('<span>Seek Video</span>'));
+      assert.ok(vmSource.includes('IntervalThumbnailPreview'));
+      assert.ok(vmSource.includes('interval-thumbnail-preview-'));
+      assert.ok(vmSource.includes('interval-thumbnail-play-'));
+      assert.ok(!vmSource.includes('Execute individual passes (Pass 0 → Pass 3) or all passes sequentially'));
+      assert.ok(!vmSource.includes('Open the wide analysis review window to inspect and execute Pass 0 through Pass 3'));
+      assert.ok(!vmSource.includes('Inspect and edit information generated by video analysis pipeline, then commit to the database'));
+      // Grouping-level jump link to Inventory remains in Video Registry
+      assert.ok(vmSource.includes('group-jump-to-inventory-'));
+      // Analysis: COMPLETED combined with Pass 0-3
+      assert.ok(vmSource.includes('<span className="text-[11px] text-slate-400">Analysis:</span>'));
+
+      const signOffSource = fs.readFileSync(
+        path.join(__dirname, '../../client/src/components/review/SignOffModal.tsx'),
+        'utf-8'
+      );
+      assert.ok(signOffSource.includes('<span>Analysis Verification</span>'));
+      assert.ok(!signOffSource.includes('Atomic HITL Sign-Off & Multi-Tenant Commit'));
+      assert.ok(!signOffSource.includes('Signing Operator Initials:'));
+      assert.ok(!signOffSource.includes('I certify as the responsible laboratory operator'));
+      assert.ok(signOffSource.includes('<span>Write to Archive Notebook</span>'));
+
+      const archiveSource = fs.readFileSync(
+        path.join(__dirname, '../../client/src/components/archive/ExperimentArchive.tsx'),
+        'utf-8'
+      );
+      assert.ok(archiveSource.includes('<span>Review / Edit</span>'));
+      assert.ok(!archiveSource.includes('<span>HITL Review / Edit</span>'));
+      assert.ok(archiveSource.includes('<span>Generate PDF</span>'));
+      assert.ok(archiveSource.includes('buildArchiveNotebookPdfBytes'));
+    });
+
+    it('should process all 10-minute chunks of a 24-minute multi-chunk video across Pass 1, Pass 2, and Pass 3 with global timestamp offsets', async () => {
+      const videoId = 'vid_24min_multichunk';
+      const chunks = [
+        { index: 0, gcsUri: `gs://test-bucket/normalized/${videoId}/chunk_000.mp4` },
+        { index: 1, gcsUri: `gs://test-bucket/normalized/${videoId}/chunk_001.mp4` },
+        { index: 2, gcsUri: `gs://test-bucket/normalized/${videoId}/chunk_002.mp4` },
+      ];
+      const videoRecord = {
+        videoId,
+        durationSeconds: 1440, // 24 minutes
+        normalizedGcsUri: chunks[0].gcsUri,
+        chunks,
+      };
+      const classification = {
+        workflowType: 'EXPERIMENT_NOTEBOOK_WORKFLOW',
+        confidence: 0.99,
+        reasoning: '24-minute multi-chunk cell culture workflow',
+      };
+
+      const pass1CalledUris = [];
+      let chunkCallIdx = 0;
+      setGenAIClient({
+        models: {
+          generateContent: async (req) => {
+            const parts = req?.contents?.[0]?.parts || [];
+            const filePart = parts.find((p) => p?.fileData?.fileUri);
+            if (filePart) {
+              pass1CalledUris.push(filePart.fileData.fileUri);
+            }
+            const cIdx = chunkCallIdx++;
+            if (cIdx === 0) {
+              // Chunk 0 (0 - 600s): Mix reagents at 120s-150s
+              return {
+                text: JSON.stringify({
+                  totalActionsDetected: 1,
+                  actions: [
+                    {
+                      actionId: 'act_001',
+                      actionType: 'MIX_REAGENTS',
+                      actionClass: 'REAGENT_MIXING_ACTION',
+                      description: 'Pouring 5 mL FBS into 45 mL DMEM',
+                      startTime: '02:00',
+                      endTime: '02:30',
+                      startTimestampSeconds: 120,
+                      endTimestampSeconds: 150,
+                      confidenceScore: 0.95,
+                    },
+                  ],
+                  events: [
+                    {
+                      eventId: 'evt_001',
+                      actionId: 'act_001',
+                      actionIds: ['act_001'],
+                      eventClass: 'REAGENT_LABEL_PRESENTATION_EVENT',
+                      startTimestampSeconds: 110,
+                      endTimestampSeconds: 118,
+                      description: 'Showing FBS bottle label',
+                      reagentName: 'Fetal Bovine Serum',
+                      reagentAcronym: 'FBS',
+                    },
+                  ],
+                }),
+              };
+            }
+            if (cIdx === 1) {
+              // Chunk 1 (600 - 1200s): chunk-local timestamps 50s-90s -> global 650s-690s
+              return {
+                text: JSON.stringify({
+                  totalActionsDetected: 1,
+                  actions: [
+                    {
+                      actionId: 'act_001',
+                      actionType: 'ASPIRATE_MEDIA',
+                      actionClass: 'ASPIRATE_MEDIA',
+                      description: 'Aspirating spent media from T75 flask',
+                      startTime: '00:50',
+                      endTime: '01:30',
+                      startTimestampSeconds: 50,
+                      endTimestampSeconds: 90,
+                      confidenceScore: 0.96,
+                    },
+                  ],
+                  events: [],
+                }),
+              };
+            }
+            // Chunk 2 (1200 - 1440s): chunk-local timestamps 100s-140s -> global 1300s-1340s
+            return {
+              text: JSON.stringify({
+                totalActionsDetected: 1,
+                actions: [
+                  {
+                    actionId: 'act_001',
+                    actionType: 'INCUBATE_CELLS',
+                    actionClass: 'INCUBATE_CELLS',
+                    description: 'Inserting cell flask into incubator',
+                    startTime: '01:40',
+                    endTime: '02:20',
+                    startTimestampSeconds: 100,
+                    endTimestampSeconds: 140,
+                    confidenceScore: 0.98,
+                  },
+                ],
+                events: [
+                  {
+                    eventId: 'evt_001',
+                    actionId: 'act_001',
+                    actionIds: ['act_001'],
+                    eventClass: 'INCUBATOR_SETTINGS',
+                    startTimestampSeconds: 105,
+                    endTimestampSeconds: 115,
+                    description: 'Incubator display showing 37.0°C and 5.0% CO2',
+                    temperature: '37.0°C',
+                    co2Level: '5.0%',
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      });
+
+      const pass1Result = await runPass1ActionDetection({
+        videoId,
+        videoGcsUri: chunks[0].gcsUri,
+        videoRecord,
+        classification,
+      });
+
+      // Verify all 3 chunks were scanned in Pass 1
+      assert.deepStrictEqual(pass1CalledUris, [
+        chunks[0].gcsUri,
+        chunks[1].gcsUri,
+        chunks[2].gcsUri,
+      ]);
+      assert.strictEqual(pass1Result.length, 3, 'All 3 actions across the 24-minute video chunks must be detected');
+      assert.strictEqual(pass1Result[0].actionId, 'act_001');
+      assert.strictEqual(pass1Result[0].startTimestampSeconds, 120);
+      assert.strictEqual(pass1Result[1].actionId, 'act_002');
+      assert.strictEqual(pass1Result[1].startTimestampSeconds, 650, 'Chunk 1 action at 50s must be offset to 650s');
+      assert.strictEqual(pass1Result[1].endTimestampSeconds, 690);
+      assert.strictEqual(pass1Result[2].actionId, 'act_003');
+      assert.strictEqual(pass1Result[2].startTimestampSeconds, 1300, 'Chunk 2 action at 100s must be offset to 1300s');
+      assert.strictEqual(pass1Result[2].endTimestampSeconds, 1340);
+
+      // Verify Pass 1 events in Chunk 2 were also offset to global timestamps and linked to act_003
+      const incEventP1 = pass1Result.events.find((e) => e.eventClass === 'INCUBATOR_SETTINGS');
+      assert.ok(incEventP1);
+      assert.strictEqual(incEventP1.startTime, 1305);
+      assert.strictEqual(incEventP1.endTime, 1315);
+      assert.strictEqual(incEventP1.actionId, 'act_003');
     });
   });
 });

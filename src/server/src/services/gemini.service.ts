@@ -52,6 +52,14 @@ import {
   ArchiveWorkStepSchema,
   MixReagentsActionData,
   SeedReagentsActionData,
+  IncubateCellsActionData,
+  IncubateCellsActionDataSchema,
+  parseIncubatorSettingsFields,
+  HemocytometerLoadingActionData,
+  HemocytometerLoadingActionDataSchema,
+  HemocytometerLoadData,
+  HemocytometerLoadDataSchema,
+  parseHemocytometerLoadingFields,
   deduplicateReagentLabelPresentationEvents,
   isReagentLabelPresentationEvent,
   computeLabelVisibilityScore,
@@ -64,6 +72,8 @@ export {
   areSameReagent,
   mergeReagentRecords,
   parseReagentLabelFields,
+  parseIncubatorSettingsFields,
+  parseHemocytometerLoadingFields,
   deduplicateReagentLabelPresentationEvents,
   isReagentLabelPresentationEvent,
   computeLabelVisibilityScore,
@@ -347,7 +357,8 @@ export function extractJsonFromText(rawText: string): any {
 }
 
 /**
- * Extracts text from various Google Gen AI response formats.
+ * Extracts text from various Google Gen AI response formats, including multi-part
+ * Gemini 2.5 / 3.x responses where thinking parts (`thought: true`) precede the JSON text part.
  */
 export function extractTextFromResponse(response: any): string {
   if (!response) {
@@ -358,31 +369,113 @@ export function extractTextFromResponse(response: any): string {
     return response;
   }
 
-  if (typeof response.text === 'function') {
-    try {
-      return response.text();
-    } catch {
-      // ignore, fall back to checking candidates
+  const candidates = Array.isArray(response.candidates)
+    ? response.candidates
+    : Array.isArray(response.response?.candidates)
+    ? response.response.candidates
+    : [];
+
+  const allParts: any[] = [];
+  for (const cand of candidates) {
+    const parts = cand?.content?.parts ?? (Array.isArray(cand?.content) ? cand.content : []);
+    if (Array.isArray(parts)) {
+      allParts.push(...parts);
     }
   }
 
-  if (typeof response.text === 'string') {
+  // 1. Prefer non-thought text parts from candidates (handles Gemini 2.5/3.x where parts[0] is { thought: true } and parts[1] is the JSON text)
+  const nonThoughtTexts = allParts
+    .filter((p) => p && !p.thought && typeof p.text === 'string' && p.text.trim().length > 0)
+    .map((p) => p.text);
+  if (nonThoughtTexts.length > 0) {
+    return nonThoughtTexts.join('\n');
+  }
+
+  // 2. Check functionCall / structured args in parts
+  for (const p of allParts) {
+    if (p?.functionCall?.args) {
+      return typeof p.functionCall.args === 'string'
+        ? p.functionCall.args
+        : JSON.stringify(p.functionCall.args);
+    }
+  }
+
+  // 3. Check response.text() method or string getter (if non-empty)
+  if (typeof response.text === 'function') {
+    try {
+      const t = response.text();
+      if (typeof t === 'string' && t.trim().length > 0) {
+        return t;
+      }
+    } catch {
+      // ignore, fall back to checking other fields
+    }
+  }
+
+  if (typeof response.text === 'string' && response.text.trim().length > 0) {
     return response.text;
   }
 
-  if (response.output_text && typeof response.output_text === 'string') {
+  if (typeof response.response?.text === 'function') {
+    try {
+      const t = response.response.text();
+      if (typeof t === 'string' && t.trim().length > 0) {
+        return t;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (typeof response.response?.text === 'string' && response.response.text.trim().length > 0) {
+    return response.response.text;
+  }
+
+  if (response.output_text && typeof response.output_text === 'string' && response.output_text.trim().length > 0) {
     return response.output_text;
   }
 
-  if (response.candidates?.[0]?.content?.parts?.[0]?.text) {
-    return response.candidates[0].content.parts[0].text;
+  // 4. Fallback to any part with non-empty text (including thought parts if the model emitted JSON inside a thought part)
+  const anyPartTexts = allParts
+    .filter((p) => p && typeof p.text === 'string' && p.text.trim().length > 0)
+    .map((p) => p.text);
+  if (anyPartTexts.length > 0) {
+    return anyPartTexts.join('\n');
+  }
+
+  // 5. Check candidate-level text/output properties or structured/parsed output fields
+  for (const cand of candidates) {
+    if (typeof cand?.text === 'string' && cand.text.trim().length > 0) {
+      return cand.text;
+    }
+    if (typeof cand?.output === 'string' && cand.output.trim().length > 0) {
+      return cand.output;
+    }
+  }
+
+  if (response.parsed && typeof response.parsed === 'object') {
+    return JSON.stringify(response.parsed);
+  }
+  if (response.structuredOutput && typeof response.structuredOutput === 'object') {
+    return JSON.stringify(response.structuredOutput);
   }
 
   // If response is already an object or array representation
-  if (typeof response === 'object' && (response.workflowType || Array.isArray(response) || response.actions)) {
+  if (
+    typeof response === 'object' &&
+    (response.workflowType ||
+      Array.isArray(response) ||
+      response.actions ||
+      response.events ||
+      response.refinements)
+  ) {
     return JSON.stringify(response);
   }
 
+  const finishReason = candidates[0]?.finishReason || response?.promptFeedback?.blockReason || 'UNKNOWN';
+  console.warn(
+    `[GenAI] extractTextFromResponse failed (finishReason=${finishReason}, candidates=${candidates.length}, parts=${allParts.length})`
+  );
   throw new Error('Unable to extract text content from GenAI response object');
 }
 
@@ -699,6 +792,7 @@ export function normalizePass0ArchiveMetadata(
   if (!isExperimentWorkflow) {
     parsedJson.creatorName = parsedJson.creatorName ?? null;
     parsedJson.creationDate = parsedJson.creationDate ?? null;
+    parsedJson.purpose = parsedJson.purpose ?? null;
     parsedJson.archiveIntent = parsedJson.archiveIntent ?? null;
     parsedJson.isAppending =
       typeof parsedJson.isAppending === 'boolean' ? parsedJson.isAppending : null;
@@ -796,6 +890,32 @@ export function normalizePass0ArchiveMetadata(
   }
   parsedJson.creationDate = creationDate || null;
 
+  // Normalize purpose (optional — OK to leave empty/null if operator does not state purpose)
+  const rawPurpose =
+    parsedJson.purpose ??
+    parsedJson.archivePurpose ??
+    parsedJson.identificationEvent?.purpose ??
+    null;
+  let purpose = typeof rawPurpose === 'string' ? rawPurpose.trim() : '';
+  if (
+    purpose &&
+    (purpose.toUpperCase() === 'N/A' ||
+      purpose.toUpperCase() === 'NONE' ||
+      purpose.toUpperCase() === 'UNKNOWN' ||
+      purpose.toUpperCase() === 'NULL')
+  ) {
+    purpose = '';
+  }
+  if (!purpose && transcript) {
+    const purposeMatch = transcript.match(
+      /(?:purpose(?:\s+of\s+(?:this|the)\s+(?:experiment|archive|study|run))?\s+(?:is|was)\s+|reason(?:\s+for\s+(?:doing\s+)?(?:this|the)\s+(?:experiment|archive|study))?\s+(?:is|was)\s+|this\s+experiment\s+is\s+(?:done|performed|conducted|run|being\s+done)\s+(?:to|for|in\s+order\s+to|because)\s+|we\s+are\s+(?:doing|running|performing)\s+this\s+experiment\s+(?:to|for|in\s+order\s+to|because)\s+)([^.;\n]+)/i
+    );
+    if (purposeMatch?.[1]) {
+      purpose = purposeMatch[1].replace(/\.+$/, '').trim();
+    }
+  }
+  parsedJson.purpose = purpose || null;
+
   // Normalize archiveIntent ('CREATE' | 'APPEND') & isAppending (boolean)
   const rawIntent =
     typeof parsedJson.archiveIntent === 'string'
@@ -863,11 +983,12 @@ export function normalizePass0ArchiveMetadata(
     endTime: endSec,
     startTimestampSeconds: startSec,
     endTimestampSeconds: endSec,
+    purpose: purpose || null,
     description:
       rawIdEvt?.description ||
       `Operator identifies experiment archive "${archiveName}"${
         creatorName ? ` by ${creatorName}` : ''
-      }${creationDate ? ` (${creationDate})` : ''}`,
+      }${creationDate ? ` (${creationDate})` : ''}${purpose ? ` — Purpose: ${purpose}` : ''}`,
     ...(rawIdEvt?.spokenContext || transcript
       ? { spokenContext: rawIdEvt?.spokenContext || transcript }
       : {}),
@@ -979,7 +1100,22 @@ export async function runPass0WorkflowClassification(
 
   const systemInstruction = loadGuideline('classification-agent-guidelines.md');
   const client = getGenAIClient();
-  const gcsUri = resolveNormalizedGcsUri(registeredFileUri || videoGcsUri, videoId);
+  if (!videoRecord && videoId) {
+    try {
+      videoRecord =
+        (await getVideoMetadata(databaseId, videoId)) ||
+        (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null) ||
+        undefined;
+    } catch {
+      // ignore lookup error
+    }
+  }
+  const baseGcsUri = resolveNormalizedGcsUri(
+    registeredFileUri || videoGcsUri || (videoRecord as any)?.normalizedGcsUri || (videoRecord as any)?.rawGcsUri,
+    videoId
+  );
+  const sortedPass0Chunks = getSortedVideoChunks(videoRecord, videoId, baseGcsUri);
+  const gcsUri = sortedPass0Chunks[0]?.gcsUri || baseGcsUri;
 
   const promptText = `You are analyzing video recording: ${gcsUri}.
 Transcribe audible speech and classify the workflow strictly according to the system instructions.
@@ -1002,15 +1138,26 @@ Return a valid JSON object matching WorkflowClassificationSchema.`;
   const pass0Candidates = Array.from(
     new Set(
       targetModel.toLowerCase().includes('flash')
-        ? [targetModel, DEFAULT_FLASH_MODEL]
-        : [targetModel, 'gemini-1.5-pro-002', 'gemini-1.5-pro', 'gemini-4-argon', 'gemini-3.1-pro-preview']
+        ? [targetModel, DEFAULT_FLASH_MODEL, 'gemini-4-argon']
+        : [
+            targetModel,
+            'gemini-1.5-pro-002',
+            'gemini-1.5-pro',
+            'gemini-4-argon',
+            DEFAULT_FLASH_MODEL,
+          ]
     )
   );
   let response: any;
+  let supplementaryTranscript = '';
+  let supplementaryDate: string | null = null;
+  let supplementaryCreator: string | null = null;
+  let usedModel = targetModel;
+  let lastPass0Err: any;
   for (let mIdx = 0; mIdx < pass0Candidates.length; mIdx++) {
     const candidateModel = pass0Candidates[mIdx];
     try {
-      response = await generateContentWithRetry(client, {
+      const candidateResp = await generateContentWithRetry(client, {
         model: candidateModel,
         contents: [
           {
@@ -1020,9 +1167,147 @@ Return a valid JSON object matching WorkflowClassificationSchema.`;
         ],
         config: {
           systemInstruction,
+          temperature: 0.1,
+          maxOutputTokens: 8192,
           responseMimeType: 'application/json',
         },
       });
+      // Verify text can be extracted before accepting response; if empty (e.g. SAFETY block or MAX_TOKENS on a long chunk), retry with bounded clips
+      try {
+        const checkText = extractTextFromResponse(candidateResp);
+        if (checkText && checkText.trim().length > 0) {
+          response = candidateResp;
+          usedModel = candidateModel;
+          break;
+        }
+      } catch (extractErr: any) {
+        lastPass0Err = extractErr;
+        if (gcsUri) {
+          const blockOrFinishReason = String(
+            candidateResp?.promptFeedback?.blockReason ||
+              candidateResp?.candidates?.[0]?.finishReason ||
+              ''
+          ).toUpperCase();
+          const isSafetyBlocked = blockOrFinishReason.includes('SAFETY');
+          const fallbackWindows = isSafetyBlocked
+            ? [
+                { startOffset: '5s', endOffset: '25s' },
+                { startOffset: '0s', endOffset: '20s' },
+                { startOffset: '0s', endOffset: '15s' },
+                { startOffset: '25s', endOffset: '60s' },
+                { startOffset: '60s', endOffset: '180s' },
+                { startOffset: '0s', endOffset: '180s' },
+              ]
+            : [
+                { startOffset: '0s', endOffset: '180s' },
+                { startOffset: '5s', endOffset: '25s' },
+                { startOffset: '0s', endOffset: '20s' },
+                { startOffset: '25s', endOffset: '60s' },
+              ];
+
+          let matchedWindow: { startOffset: string; endOffset: string } | null = null;
+          for (const win of fallbackWindows) {
+            try {
+              const boundedParts = [
+                {
+                  fileData: {
+                    fileUri: gcsUri,
+                    mimeType: 'video/mp4',
+                  },
+                  videoMetadata: {
+                    fps: 1,
+                    startOffset: win.startOffset,
+                    endOffset: win.endOffset,
+                  },
+                },
+                { text: promptText },
+              ];
+              const boundedResp = await generateContentWithRetry(client, {
+                model: candidateModel,
+                contents: [{ role: 'user', parts: boundedParts }],
+                config: {
+                  systemInstruction,
+                  temperature: 0.1,
+                  maxOutputTokens: 8192,
+                  responseMimeType: 'application/json',
+                },
+              });
+              const boundedText = extractTextFromResponse(boundedResp);
+              if (boundedText && boundedText.trim().length > 0) {
+                response = boundedResp;
+                usedModel = candidateModel;
+                matchedWindow = win;
+                break;
+              }
+            } catch {
+              // continue to next bounded window
+            }
+          }
+
+          // When a safety block forced an early opening clip (<=25s), also sample 25s-60s to capture additional opening transcript/date context
+          if (
+            response &&
+            isSafetyBlocked &&
+            matchedWindow &&
+            (matchedWindow.endOffset === '25s' ||
+              matchedWindow.endOffset === '20s' ||
+              matchedWindow.endOffset === '15s')
+          ) {
+            try {
+              const suppParts = [
+                {
+                  fileData: {
+                    fileUri: gcsUri,
+                    mimeType: 'video/mp4',
+                  },
+                  videoMetadata: {
+                    fps: 1,
+                    startOffset: '25s',
+                    endOffset: '60s',
+                  },
+                },
+                { text: promptText },
+              ];
+              const suppResp = await generateContentWithRetry(client, {
+                model: candidateModel,
+                contents: [{ role: 'user', parts: suppParts }],
+                config: {
+                  systemInstruction,
+                  temperature: 0.1,
+                  maxOutputTokens: 8192,
+                  responseMimeType: 'application/json',
+                },
+              });
+              const suppJson = extractJsonFromText(extractTextFromResponse(suppResp));
+              if (typeof suppJson?.transcribedAudio === 'string' && suppJson.transcribedAudio.trim()) {
+                supplementaryTranscript = suppJson.transcribedAudio.trim();
+              }
+              if (typeof suppJson?.creationDate === 'string' && suppJson.creationDate.trim()) {
+                supplementaryDate = suppJson.creationDate.trim();
+              }
+              if (typeof suppJson?.creatorName === 'string' && suppJson.creatorName.trim()) {
+                supplementaryCreator = suppJson.creatorName.trim();
+              }
+            } catch {
+              // ignore supplementary window error
+            }
+          }
+
+          if (response) {
+            break;
+          }
+        }
+        if (mIdx < pass0Candidates.length - 1) {
+          console.warn(
+            `[Pass 0] Model ${candidateModel} returned empty/unextractable text response, falling back to next candidate...`
+          );
+          continue;
+        }
+      }
+      if (!response) {
+        response = candidateResp;
+        usedModel = candidateModel;
+      }
       break;
     } catch (err: any) {
       const isNotFound =
@@ -1032,13 +1317,24 @@ Return a valid JSON object matching WorkflowClassificationSchema.`;
         err?.code === 'NOT_FOUND' ||
         err?.message?.includes('404') ||
         err?.message?.includes('NOT_FOUND') ||
-        err?.message?.includes('not found');
+        err?.message?.includes('not found') ||
+        err?.message?.includes('does not have access');
+      if (!isNotFound || !lastPass0Err) {
+        lastPass0Err = err;
+      }
       if (isNotFound && mIdx < pass0Candidates.length - 1) {
         console.warn(`[Pass 0] Model ${candidateModel} not found, falling back to next candidate...`);
         continue;
       }
-      throw err;
+      if (isNotFound && response) {
+        break;
+      }
+      throw lastPass0Err || err;
     }
+  }
+
+  if (!response && lastPass0Err) {
+    throw lastPass0Err;
   }
 
   const rawText = extractTextFromResponse(response);
@@ -1046,13 +1342,14 @@ Return a valid JSON object matching WorkflowClassificationSchema.`;
 
   const pass0Audit = {
     model: targetModel,
-    modelUsed: targetModel,
+    modelUsed: usedModel,
     endpoint: process.env.GOOGLE_CLOUD_API_ENDPOINT || 'us',
     calledAt: new Date().toISOString(),
     promptText,
     systemInstruction: systemInstruction || null,
     generationConfig: {
       temperature: 0.1,
+      maxOutputTokens: 8192,
       responseMimeType: 'application/json',
     },
     schema: null,
@@ -1068,6 +1365,21 @@ Return a valid JSON object matching WorkflowClassificationSchema.`;
 
   // Sanitize and normalize archive metadata before schema validation
   if (parsedJson && typeof parsedJson === 'object') {
+    if (supplementaryTranscript) {
+      const existingTranscript =
+        typeof parsedJson.transcribedAudio === 'string' ? parsedJson.transcribedAudio.trim() : '';
+      if (!existingTranscript.includes(supplementaryTranscript)) {
+        parsedJson.transcribedAudio = existingTranscript
+          ? `${existingTranscript} ${supplementaryTranscript}`
+          : supplementaryTranscript;
+      }
+    }
+    if (!parsedJson.creationDate && supplementaryDate) {
+      parsedJson.creationDate = supplementaryDate;
+    }
+    if (!parsedJson.creatorName && supplementaryCreator) {
+      parsedJson.creatorName = supplementaryCreator;
+    }
     parsedJson.executionAudit = pass0Audit;
     parsedJson.modelUsed = targetModel;
     if (!parsedJson.archiveName && !videoRecord && videoId) {
@@ -1184,7 +1496,7 @@ export async function runPass1ActionDetection(
   const temporalScanningInstructions = isArchiveWorkflow
     ? `CRITICAL TEMPORAL SCANNING INSTRUCTIONS:
 - Analyze the full video timeline from 00:00 through completion (${durationSeconds}s), across both the FIRST HALF and the SECOND HALF using both visual and audio tracks.
-- Segment physical experimental work steps in "actions" (REAGENT_MIXING_ACTION / MIX_REAGENTS for physical reagent mixing/transfers, and REAGENT_SEEDING_ACTION / SEED_REAGENTS for physical plate seeding) ONLY when they actually occur in the video. A video may have zero actions (actions: []) and only contain events that contribute to actions in subsequent videos.`
+- Segment physical experimental work steps in "actions" (REAGENT_MIXING_ACTION / MIX_REAGENTS for physical reagent mixing/transfers, REAGENT_SEEDING_ACTION / SEED_REAGENTS for physical plate seeding, INCUBATE_CELLS for inserting a container containing cells into an incubator, ASPIRATE_MEDIA / ASPRIRATE_MEDIA for emptying the content of a container with media using a pipette or aspirator, and HEMOCYTOMETER_LOADING / hemocytometer_loading for loading cells into the two squares of a hemocytometer slide) ONLY when they actually occur in the video. A video may have zero actions (actions: []) and only contain events that contribute to actions in subsequent videos.`
     : `CRITICAL TEMPORAL SCANNING INSTRUCTIONS:
 - Analyze the full video timeline from 00:00 through completion (${durationSeconds}s), across both the FIRST HALF and the SECOND HALF.
 - IGNORE verbal count cues from the audio transcript; rely strictly on visual evidence.`;
@@ -1199,20 +1511,20 @@ export async function runPass1ActionDetection(
   const gcsUri = resolveNormalizedGcsUri(resolvedGcs, videoId);
 
   const promptText = isArchiveWorkflow
-    ? `TASK: Detect EVERY distinct experimental work step action (Mix Reagents: REAGENT_MIXING_ACTION / MIX_REAGENTS, and Seed Reagents: REAGENT_SEEDING_ACTION / SEED_REAGENTS) across the entire video timeline.
+    ? `TASK: Detect EVERY distinct experimental work step action (Mix Reagents: REAGENT_MIXING_ACTION / MIX_REAGENTS, Seed Reagents: REAGENT_SEEDING_ACTION / SEED_REAGENTS, Incubate Cells: INCUBATE_CELLS, Aspirate Media: ASPIRATE_MEDIA / ASPRIRATE_MEDIA, and Hemocytometer Loading: HEMOCYTOMETER_LOADING / hemocytometer_loading) across the entire video timeline.
 Workflow Type: ${classification.workflowType}.
 Video URI: ${gcsUri}.
 Video Duration: ${durationSeconds} seconds (${durationSeconds}s).
 
 CRITICAL TEMPORAL SCANNING INSTRUCTIONS:
 - Analyze the full video timeline from 00:00 to ${durationSeconds}s (including both the FIRST HALF and the SECOND HALF).
-- IMPORTANT - MULTI-ACTION TEMPORAL EXTRACTION: Emit each distinct experimental action (mixing two reagents or seeding a plate) as a separate, chronological action (\`act_001\`, \`act_002\`, ...); NEVER aggregate multiple steps into one summary event.
+- IMPORTANT - MULTI-ACTION TEMPORAL EXTRACTION: Emit each distinct experimental action (mixing two reagents, seeding a plate, inserting a container containing cells into an incubator, emptying a container with media using a pipette or aspirator, or loading cells into the two squares of the hemocytometer slide) as a separate, chronological action (\`act_001\`, \`act_002\`, ...); NEVER aggregate multiple steps into one summary event.
 - \`totalActionsDetected\` MUST equal \`actions.length\`.
 
 CRITICAL WORK STEP DETECTION RULES:
-- Only emit a work step action in the "actions" array ('REAGENT_MIXING_ACTION' / 'MIX_REAGENTS' for physical reagent mixing, media preparation, or liquid transfers between vessels; 'REAGENT_SEEDING_ACTION' / 'SEED_REAGENTS' for physical plate seeding/dispensing) when that physical action actually occurs in the video.
-- NEVER hallucinate or fabricate a work step action if no physical mixing or seeding occurs in the video. It is completely valid for a video to have ZERO actions (\`actions: []\`, \`totalActionsDetected: 0\`) and ONLY contain events in "events" that contribute to actions in subsequent videos.
-- In the "events" array, detect 'REAGENT_LABEL_PRESENTATION_EVENT' (operator shows reagent bottle/tube label to the camera) and 'PROTOCOL_AUDIO_UTTERANCE_EVENT' across the timeline. Emit EXACTLY ONE 'REAGENT_LABEL_PRESENTATION_EVENT' per distinct reagent; if a reagent label is shown multiple times, select the presentation where the label is best visible (closest to the camera and not occluded by objects in the foreground). Associate each event with its parent work step in "actionIds" (and primary "actionId") ONLY if a corresponding action occurs in this video; otherwise leave "actionId" empty ("") and "actionIds" empty ([]).
+- Only emit a work step action in the "actions" array ('REAGENT_MIXING_ACTION' / 'MIX_REAGENTS' for physical reagent mixing, media preparation, or liquid transfers between vessels; 'REAGENT_SEEDING_ACTION' / 'SEED_REAGENTS' for physical plate seeding/dispensing; 'INCUBATE_CELLS' for inserting a container containing cells into an incubator; 'ASPIRATE_MEDIA' / 'ASPRIRATE_MEDIA' for emptying the content of a container with media using a pipette or aspirator; 'HEMOCYTOMETER_LOADING' / 'hemocytometer_loading' for when the operator loads the cells into the two squares of the hemocytometer slide) when that physical action actually occurs in the video.
+- NEVER hallucinate or fabricate a work step action if no physical mixing, seeding, incubating, aspirating, or hemocytometer loading occurs in the video. It is completely valid for a video to have ZERO actions (\`actions: []\`, \`totalActionsDetected: 0\`) and ONLY contain events in "events" that contribute to actions in subsequent videos.
+- In the "events" array, detect 'REAGENT_LABEL_PRESENTATION_EVENT' (operator shows reagent bottle/tube label to the camera), 'INCUBATOR_SETTINGS' (operator looks at the incubator settings panel; extract temperature and CO2 level / co2Level), 'HEMOCYTOMETER_LOAD' / 'hemocytometer_load' (contains information in "substanceLoaded" about the substance that was loaded into the hemocytometer slide, associated with the 'HEMOCYTOMETER_LOADING' / 'hemocytometer_loading' action), and 'PROTOCOL_AUDIO_UTTERANCE_EVENT' across the timeline. Emit EXACTLY ONE 'REAGENT_LABEL_PRESENTATION_EVENT' per distinct reagent; if a reagent label is shown multiple times, select the presentation where the label is best visible (closest to the camera and not occluded by objects in the foreground). Associate each 'INCUBATOR_SETTINGS' event with its corresponding 'INCUBATE_CELLS' action and each 'HEMOCYTOMETER_LOAD' / 'hemocytometer_load' event with its corresponding 'HEMOCYTOMETER_LOADING' / 'hemocytometer_loading' action in "actionIds" (and primary "actionId"). Associate each event with its parent work step in "actionIds" (and primary "actionId") ONLY if a corresponding action occurs in this video; otherwise leave "actionId" empty ("") and "actionIds" empty ([]).
 - CRITICAL PASS 0 IDENTIFICATION EVENT EXCLUSION: The opening announcement of the archive/experiment title, creator/researcher name, creation date, or target inventory name (ARCHIVE_IDENTIFICATION / INVENTORY_IDENTIFICATION) is detected in Pass 0. Do NOT repeat it in Pass 1 "events" and do NOT misclassify it as VIAL_LABEL_PRESENTATION, REAGENT_LABEL_PRESENTATION_EVENT, or PROTOCOL_AUDIO_UTTERANCE_EVENT.
 
 CRITICAL CONSTRAINTS:
@@ -1291,8 +1603,16 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
                 ? [
                     'MIX_REAGENTS',
                     'SEED_REAGENTS',
+                    'INCUBATE_CELLS',
+                    'ASPIRATE_MEDIA',
+                    'ASPRIRATE_MEDIA',
+                    'HEMOCYTOMETER_LOADING',
+                    'hemocytometer_loading',
                     'REAGENT_MIXING_ACTION',
                     'REAGENT_SEEDING_ACTION',
+                    'INCUBATE_CELLS_ACTION',
+                    'ASPIRATE_MEDIA_ACTION',
+                    'HEMOCYTOMETER_LOADING_ACTION',
                     'REAGENT_MIXING',
                     'REAGENT_SEEDING',
                   ]
@@ -1301,7 +1621,18 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
             actionClass: {
               type: 'STRING',
               enum: isArchiveWorkflow
-                ? ['REAGENT_MIXING_ACTION', 'REAGENT_SEEDING_ACTION']
+                ? [
+                    'REAGENT_MIXING_ACTION',
+                    'REAGENT_SEEDING_ACTION',
+                    'INCUBATE_CELLS',
+                    'INCUBATE_CELLS_ACTION',
+                    'ASPIRATE_MEDIA',
+                    'ASPRIRATE_MEDIA',
+                    'ASPIRATE_MEDIA_ACTION',
+                    'HEMOCYTOMETER_LOADING',
+                    'HEMOCYTOMETER_LOADING_ACTION',
+                    'hemocytometer_loading',
+                  ]
                 : ['VIAL_INSERTION_ACTION', 'VIAL_REMOVAL_ACTION'],
             },
             description: {
@@ -1377,6 +1708,36 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
                       },
                     },
                   },
+                  incubateCellsData: {
+                    type: 'OBJECT',
+                    properties: {
+                      temperature: {
+                        type: 'STRING',
+                        description:
+                          'Incubator temperature extracted from the INCUBATOR_SETTINGS panel or audio (e.g. "37.0°C"), or "N/A" if not found.',
+                      },
+                      co2Level: {
+                        type: 'STRING',
+                        description:
+                          'Incubator CO2 level extracted from the INCUBATOR_SETTINGS panel or audio (e.g. "5.0%"), or "N/A" if not found.',
+                      },
+                    },
+                  },
+                  hemocytometerLoadingData: {
+                    type: 'OBJECT',
+                    properties: {
+                      substanceLoaded: {
+                        type: 'STRING',
+                        description:
+                          'Information about the substance (cell suspension, dye/trypan blue dilution, etc.) loaded into the two squares of the hemocytometer slide, or "N/A" if not found.',
+                      },
+                    },
+                  },
+                  substanceLoaded: {
+                    type: 'STRING',
+                    description:
+                      'Information about the substance loaded into the hemocytometer slide during a hemocytometer_loading action, or "N/A" if not applicable.',
+                  },
                 }
               : {}),
           },
@@ -1409,6 +1770,11 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
                 'VIAL_LABEL_PRESENTATION_EVENT',
                 'REAGENT_LABEL_PRESENTATION',
                 'REAGENT_LABEL_PRESENTATION_EVENT',
+                'INCUBATOR_SETTINGS',
+                'INCUBATOR_SETTINGS_EVENT',
+                'HEMOCYTOMETER_LOAD',
+                'HEMOCYTOMETER_LOAD_EVENT',
+                'hemocytometer_load',
                 'PROTOCOL_AUDIO_UTTERANCE_EVENT',
                 'MIXING_AMOUNT_UTTERANCE_EVENT',
                 'WELL_SEEDING_EVENT',
@@ -1479,6 +1845,18 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
                     type: 'STRING',
                     description: 'Pipette type stated in audio or observed, or "N/A" if not applicable.',
                   },
+                  temperature: {
+                    type: 'STRING',
+                    description: 'Incubator temperature read from the INCUBATOR_SETTINGS panel (e.g. "37.0°C"), or "N/A" if not applicable.',
+                  },
+                  co2Level: {
+                    type: 'STRING',
+                    description: 'Incubator CO2 level read from the INCUBATOR_SETTINGS panel (e.g. "5.0%"), or "N/A" if not applicable.',
+                  },
+                  substanceLoaded: {
+                    type: 'STRING',
+                    description: 'Information about the substance loaded into the hemocytometer slide for a hemocytometer_load (HEMOCYTOMETER_LOAD) event, or "N/A" if not applicable.',
+                  },
                 }
               : {}),
           },
@@ -1493,13 +1871,13 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
   const candidateModels = Array.from(
     new Set(
       isFlashTarget
-        ? [targetModel, DEFAULT_FLASH_MODEL]
+        ? [targetModel, DEFAULT_FLASH_MODEL, 'gemini-4-argon']
         : [
             targetModel,
             'gemini-1.5-pro-002',
             'gemini-1.5-pro',
             'gemini-4-argon',
-            'gemini-3.1-pro-preview',
+            DEFAULT_FLASH_MODEL,
           ]
     )
   );
@@ -1520,72 +1898,72 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
   let response: any;
   let lastError: any = null;
 
-  for (let i = 0; i < candidateModels.length; i++) {
-    const model = candidateModels[i];
-    activeModel = model;
-    try {
-      console.log(`[Pass 1] Running with model: ${model}`);
-      response = await generateContentWithRetry(client, {
-        model,
-        contents: [
-          {
-            role: 'user',
-            parts,
-          },
-        ],
-        config: {
-          systemInstruction,
-          ...config,
-        },
-      });
-      break;
-    } catch (err: any) {
-      lastError = err;
-      const isNotFound =
-        err?.status === 404 ||
-        err?.statusCode === 404 ||
-        err?.code === 404 ||
-        err?.code === 'NOT_FOUND' ||
-        err?.message?.includes('404') ||
-        err?.message?.includes('NOT_FOUND') ||
-        err?.message?.includes('not found') ||
-        err?.message?.includes('does not have access');
+  const sortedChunks = getSortedVideoChunks(videoDoc, videoId, gcsUri);
+  const isMultiChunk = sortedChunks.length > 1;
 
-      if (isNotFound && i < candidateModels.length - 1) {
-        console.warn(`[Pass 1] Model ${model} not found, falling back to next model...`);
-        continue;
-      } else {
-        throw err;
+  const callPass1ForChunkParts = async (chunkParts: any[]) => {
+    let chunkResp: any;
+    for (let i = 0; i < candidateModels.length; i++) {
+      const model = candidateModels[i];
+      activeModel = model;
+      try {
+        console.log(`[Pass 1] Running with model: ${model}`);
+        chunkResp = await generateContentWithRetry(client, {
+          model,
+          contents: [
+            {
+              role: 'user',
+              parts: chunkParts,
+            },
+          ],
+          config: {
+            systemInstruction,
+            ...config,
+          },
+        });
+        break;
+      } catch (err: any) {
+        lastError = err;
+        const isNotFound =
+          err?.status === 404 ||
+          err?.statusCode === 404 ||
+          err?.code === 404 ||
+          err?.code === 'NOT_FOUND' ||
+          err?.message?.includes('404') ||
+          err?.message?.includes('NOT_FOUND') ||
+          err?.message?.includes('not found') ||
+          err?.message?.includes('does not have access');
+
+        if (isNotFound && i < candidateModels.length - 1) {
+          console.warn(`[Pass 1] Model ${model} not found, falling back to next model...`);
+          continue;
+        } else {
+          throw err;
+        }
       }
     }
-  }
+    if (!chunkResp) {
+      throw lastError || new Error(`[Pass 1] Failed to obtain response from any candidate model`);
+    }
+    return chunkResp;
+  };
 
-  if (!response) {
-    throw lastError || new Error(`[Pass 1] Failed to obtain response from any candidate model`);
-  }
-
-  const candidate = response?.candidates?.[0];
-  const finishReason = candidate?.finishReason;
-  if (finishReason === 'MAX_TOKENS') {
-    console.warn('[Pass 1] Model response hit MAX_TOKENS limit');
-  }
-
-  const thoughtsTokenCount = (response?.usageMetadata as any)?.thoughtsTokenCount || 0;
-  const thoughtSignature = (candidate as any)?.thoughtSignature;
-
-  const rawText = extractTextFromResponse(response);
-  const cleaned = rawText.replace(/```json\n?|```/g, '').trim();
-
-  let parsedJson: any;
-  try {
-    parsedJson = JSON.parse(cleaned);
-  } catch (err: any) {
-    const repaired = tryRepairTruncatedJson(cleaned);
-    if (repaired !== undefined) {
-      parsedJson = repaired;
-      console.warn('[Pass 1] Successfully repaired truncated JSON response');
-    } else {
-      const payloadPreview = cleaned.slice(0, 500);
+  const parsePass1ResponsePayload = (resp: any): any => {
+    const cand = resp?.candidates?.[0];
+    if (cand?.finishReason === 'MAX_TOKENS') {
+      console.warn('[Pass 1] Model response hit MAX_TOKENS limit');
+    }
+    const rText = extractTextFromResponse(resp);
+    const cln = rText.replace(/```json\n?|```/g, '').trim();
+    try {
+      return JSON.parse(cln);
+    } catch (err: any) {
+      const repaired = tryRepairTruncatedJson(cln);
+      if (repaired !== undefined) {
+        console.warn('[Pass 1] Successfully repaired truncated JSON response');
+        return repaired;
+      }
+      const payloadPreview = cln.slice(0, 500);
       console.error(
         `[Pass 1] JSON parse error: ${err.message}. Payload preview (first 500 chars): ${payloadPreview}`
       );
@@ -1593,15 +1971,344 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
         `[Pass 1] Failed to parse model JSON response: ${err.message}. Payload preview: ${payloadPreview}`
       );
     }
+  };
+
+  let parsedJson: any;
+  let rawActions: any[] = [];
+  let rawPass1Events: any[] = [];
+
+  const runAndParsePass1Chunk = async (
+    chunkParts: any[],
+    chunkUri: string | undefined,
+    basePrompt: string,
+    maxChunkSec: number
+  ): Promise<{ resp: any; json: any }> => {
+    const chunkResp = await callPass1ForChunkParts(chunkParts);
+    try {
+      const json = parsePass1ResponsePayload(chunkResp);
+      return { resp: chunkResp, json };
+    } catch (parseErr: any) {
+      if (!chunkUri) {
+        throw parseErr;
+      }
+      const blockReason =
+        chunkResp?.promptFeedback?.blockReason ||
+        chunkResp?.candidates?.[0]?.finishReason ||
+        'UNKNOWN';
+      console.warn(
+        `[Pass 1] Full chunk response could not be parsed (${blockReason}: ${parseErr.message}); scanning sub-windows...`
+      );
+      const subWindows = [
+        { startSec: 0, endSec: 20 },
+        { startSec: 25, endSec: 50 },
+        { startSec: 50, endSec: 100 },
+        { startSec: 100, endSec: 200 },
+        { startSec: 200, endSec: 400 },
+        { startSec: 400, endSec: 600 },
+      ];
+      const mergedSubActions: any[] = [];
+      const mergedSubEvents: any[] = [];
+      let lastSubResp: any = chunkResp;
+      let anySubWindowSucceeded = false;
+
+      for (const win of subWindows) {
+        if (win.startSec >= maxChunkSec) break;
+        const wStart = win.startSec;
+        const wEnd = Math.min(win.endSec, Math.ceil(maxChunkSec));
+        if (wEnd <= wStart) continue;
+        try {
+          const subPrompt = `${basePrompt}\n\nSUB-WINDOW TIMELINE CONTEXT: This video clip covers chunk timestamps ${wStart}s to ${wEnd}s. Detect all actions and events occurring within this [${wStart}s, ${wEnd}s] window.`;
+          const subParts = [
+            {
+              fileData: {
+                fileUri: chunkUri,
+                mimeType: 'video/mp4',
+              },
+              videoMetadata: {
+                fps: 1,
+                startOffset: `${wStart}s`,
+                endOffset: `${wEnd}s`,
+              },
+            },
+            { text: subPrompt },
+          ];
+          const subResp = await callPass1ForChunkParts(subParts);
+          const subJson = parsePass1ResponsePayload(subResp);
+          lastSubResp = subResp;
+          anySubWindowSucceeded = true;
+
+          const sActions: any[] = Array.isArray(subJson)
+            ? subJson
+            : Array.isArray(subJson?.actions)
+            ? subJson.actions
+            : Array.isArray(subJson?.actionList)
+            ? subJson.actionList
+            : [];
+          const sEvents: any[] = Array.isArray(subJson?.events)
+            ? subJson.events
+            : Array.isArray(subJson?.eventList)
+            ? subJson.eventList
+            : [];
+
+          const idMap = new Map<string, string>();
+          for (let aIdx = 0; aIdx < sActions.length; aIdx++) {
+            const act = { ...sActions[aIdx] };
+            const origId = act.actionId || `act_${String(aIdx + 1).padStart(3, '0')}`;
+            const newId = `act_${String(mergedSubActions.length + 1).padStart(3, '0')}`;
+            idMap.set(origId, newId);
+            act.actionId = newId;
+
+            let sSec =
+              typeof act.startTimestampSeconds === 'number'
+                ? act.startTimestampSeconds
+                : typeof act.startTime === 'number'
+                ? act.startTime
+                : typeof act.startTime === 'string'
+                ? parseTimeStringToSeconds(act.startTime)
+                : 0;
+            let eSec =
+              typeof act.endTimestampSeconds === 'number'
+                ? act.endTimestampSeconds
+                : typeof act.endTime === 'number'
+                ? act.endTime
+                : typeof act.endTime === 'string'
+                ? parseTimeStringToSeconds(act.endTime)
+                : sSec + 5;
+
+            if (wStart > 0 && sSec < wStart) {
+              sSec = Number((sSec + wStart).toFixed(2));
+              eSec = Number(Math.max(sSec, eSec + wStart).toFixed(2));
+            }
+            act.startTimestampSeconds = sSec;
+            act.endTimestampSeconds = eSec;
+            act.startTime = formatSecondsToTimeString(sSec);
+            act.endTime = formatSecondsToTimeString(eSec);
+            mergedSubActions.push(act);
+          }
+
+          for (let eIdx = 0; eIdx < sEvents.length; eIdx++) {
+            const evt = { ...sEvents[eIdx] };
+            evt.eventId = `evt_${String(mergedSubEvents.length + 1).padStart(3, '0')}`;
+            if (typeof evt.actionId === 'string' && idMap.has(evt.actionId)) {
+              evt.actionId = idMap.get(evt.actionId);
+            }
+            if (Array.isArray(evt.actionIds)) {
+              evt.actionIds = evt.actionIds.map((id: string) => idMap.get(id) || id);
+            }
+            let sSec =
+              typeof evt.startTimestampSeconds === 'number'
+                ? evt.startTimestampSeconds
+                : typeof evt.startTime === 'number'
+                ? evt.startTime
+                : typeof evt.startTime === 'string'
+                ? parseTimeStringToSeconds(evt.startTime)
+                : 0;
+            let eSec =
+              typeof evt.endTimestampSeconds === 'number'
+                ? evt.endTimestampSeconds
+                : typeof evt.endTime === 'number'
+                ? evt.endTime
+                : typeof evt.endTime === 'string'
+                ? parseTimeStringToSeconds(evt.endTime)
+                : sSec;
+            if (wStart > 0 && sSec < wStart) {
+              sSec = Number((sSec + wStart).toFixed(2));
+              eSec = Number(Math.max(sSec, eSec + wStart).toFixed(2));
+            }
+            evt.startTimestampSeconds = sSec;
+            evt.endTimestampSeconds = eSec;
+            evt.startTime = sSec;
+            evt.endTime = eSec;
+            mergedSubEvents.push(evt);
+          }
+        } catch (subErr: any) {
+          console.warn(
+            `[Pass 1] Sub-window [${wStart}s-${wEnd}s] skipped: ${subErr?.message || subErr}`
+          );
+        }
+      }
+
+      if (!anySubWindowSucceeded) {
+        throw parseErr;
+      }
+
+      return {
+        resp: lastSubResp,
+        json: {
+          workflowContext: classification.workflowType,
+          totalActionsDetected: mergedSubActions.length,
+          totalEventsDetected: mergedSubEvents.length,
+          actions: mergedSubActions,
+          events: mergedSubEvents,
+        },
+      };
+    }
+  };
+
+  if (!isMultiChunk) {
+    const singleChunkUri = sortedChunks[0]?.gcsUri || gcsUri;
+    const singleRes = await runAndParsePass1Chunk(
+      parts,
+      singleChunkUri,
+      promptText,
+      Math.min(CHUNK_DURATION_SECONDS, durationSeconds || CHUNK_DURATION_SECONDS)
+    );
+    response = singleRes.resp;
+    parsedJson = singleRes.json;
+    rawActions = Array.isArray(parsedJson)
+      ? parsedJson
+      : Array.isArray(parsedJson?.actions)
+      ? parsedJson.actions
+      : Array.isArray(parsedJson?.actionList)
+      ? parsedJson.actionList
+      : [];
+    rawPass1Events = Array.isArray(parsedJson?.events)
+      ? parsedJson.events
+      : Array.isArray(parsedJson?.eventList)
+      ? parsedJson.eventList
+      : [];
+  } else {
+    console.log(
+      `[Pass 1] Multi-chunk video detected (${sortedChunks.length} chunks of up to ${CHUNK_DURATION_SECONDS}s each). Scanning all chunks sequentially...`
+    );
+    let globalActionCounter = 0;
+    let globalEventCounter = 0;
+
+    for (let cIdx = 0; cIdx < sortedChunks.length; cIdx++) {
+      const chunk = sortedChunks[cIdx];
+      const chunkOffsetSec = chunk.offsetSeconds;
+      const chunkEndSec = durationSeconds
+        ? Math.min(durationSeconds, chunkOffsetSec + CHUNK_DURATION_SECONDS)
+        : chunkOffsetSec + CHUNK_DURATION_SECONDS;
+      const chunkPromptText = `${promptText}\n\nMULTI-CHUNK SEGMENT CONTEXT: This video file (${chunk.gcsUri}) is Chunk ${cIdx + 1} of ${sortedChunks.length} (10-minute segment covering global video timeline ${chunkOffsetSec}s to ${chunkEndSec}s). Detect all actions and events occurring within this chunk.`;
+
+      const chunkParts: any[] = [];
+      if (chunk.gcsUri) {
+        chunkParts.push({
+          fileData: {
+            fileUri: chunk.gcsUri,
+            mimeType: 'video/mp4',
+          },
+          videoMetadata: {
+            fps: 1,
+          },
+        });
+      }
+      chunkParts.push({ text: chunkPromptText });
+
+      const chunkRes = await runAndParsePass1Chunk(
+        chunkParts,
+        chunk.gcsUri,
+        chunkPromptText,
+        Math.max(10, chunkEndSec - chunkOffsetSec)
+      );
+      response = chunkRes.resp;
+      const chunkJson = chunkRes.json;
+      if (!parsedJson) {
+        parsedJson = chunkJson;
+      }
+
+      const chunkActions: any[] = Array.isArray(chunkJson)
+        ? chunkJson
+        : Array.isArray(chunkJson?.actions)
+        ? chunkJson.actions
+        : Array.isArray(chunkJson?.actionList)
+        ? chunkJson.actionList
+        : [];
+      const chunkEvents: any[] = Array.isArray(chunkJson?.events)
+        ? chunkJson.events
+        : Array.isArray(chunkJson?.eventList)
+        ? chunkJson.eventList
+        : [];
+
+      const chunkActionIdMap = new Map<string, string>();
+
+      for (let aIdx = 0; aIdx < chunkActions.length; aIdx++) {
+        const rawAct = { ...chunkActions[aIdx] };
+        globalActionCounter++;
+        const origActionId = rawAct.actionId || `act_${String(aIdx + 1).padStart(3, '0')}`;
+        const globalActionId = `act_${String(globalActionCounter).padStart(3, '0')}`;
+        chunkActionIdMap.set(origActionId, globalActionId);
+        rawAct.actionId = globalActionId;
+
+        let sSec =
+          typeof rawAct.startTimestampSeconds === 'number'
+            ? rawAct.startTimestampSeconds
+            : typeof rawAct.startTime === 'number'
+            ? rawAct.startTime
+            : typeof rawAct.startTime === 'string'
+            ? parseTimeStringToSeconds(rawAct.startTime)
+            : aIdx * 10;
+        let eSec =
+          typeof rawAct.endTimestampSeconds === 'number'
+            ? rawAct.endTimestampSeconds
+            : typeof rawAct.endTime === 'number'
+            ? rawAct.endTime
+            : typeof rawAct.endTime === 'string'
+            ? parseTimeStringToSeconds(rawAct.endTime)
+            : sSec + 5;
+
+        // Normalized chunks created with -reset_timestamps 1 have internal timestamps in [0, 600s].
+        // Offset chunk-local timestamps to the global video timeline when chunkOffsetSec > 0.
+        if (chunkOffsetSec > 0 && sSec < chunkOffsetSec) {
+          sSec = Number((sSec + chunkOffsetSec).toFixed(2));
+          eSec = Number((Math.max(sSec, eSec + chunkOffsetSec)).toFixed(2));
+        }
+
+        rawAct.startTimestampSeconds = sSec;
+        rawAct.endTimestampSeconds = eSec;
+        rawAct.startTime = formatSecondsToTimeString(sSec);
+        rawAct.endTime = formatSecondsToTimeString(eSec);
+        rawActions.push(rawAct);
+      }
+
+      for (let eIdx = 0; eIdx < chunkEvents.length; eIdx++) {
+        const rawEvt = { ...chunkEvents[eIdx] };
+        globalEventCounter++;
+        rawEvt.eventId = `evt_${String(globalEventCounter).padStart(3, '0')}`;
+
+        if (typeof rawEvt.actionId === 'string' && chunkActionIdMap.has(rawEvt.actionId)) {
+          rawEvt.actionId = chunkActionIdMap.get(rawEvt.actionId);
+        }
+        if (Array.isArray(rawEvt.actionIds)) {
+          rawEvt.actionIds = rawEvt.actionIds.map((id: string) => chunkActionIdMap.get(id) || id);
+        }
+
+        let sSec =
+          typeof rawEvt.startTimestampSeconds === 'number'
+            ? rawEvt.startTimestampSeconds
+            : typeof rawEvt.startTime === 'number'
+            ? rawEvt.startTime
+            : typeof rawEvt.startTime === 'string'
+            ? parseTimeStringToSeconds(rawEvt.startTime)
+            : 0;
+        let eSec =
+          typeof rawEvt.endTimestampSeconds === 'number'
+            ? rawEvt.endTimestampSeconds
+            : typeof rawEvt.endTime === 'number'
+            ? rawEvt.endTime
+            : typeof rawEvt.endTime === 'string'
+            ? parseTimeStringToSeconds(rawEvt.endTime)
+            : sSec;
+
+        if (chunkOffsetSec > 0 && sSec < chunkOffsetSec) {
+          sSec = Number((sSec + chunkOffsetSec).toFixed(2));
+          eSec = Number((Math.max(sSec, eSec + chunkOffsetSec)).toFixed(2));
+        }
+
+        rawEvt.startTimestampSeconds = sSec;
+        rawEvt.endTimestampSeconds = eSec;
+        rawEvt.startTime = sSec;
+        rawEvt.endTime = eSec;
+        rawPass1Events.push(rawEvt);
+      }
+    }
   }
 
-  const rawActions: any[] = Array.isArray(parsedJson)
-    ? parsedJson
-    : Array.isArray(parsedJson?.actions)
-    ? parsedJson.actions
-    : Array.isArray(parsedJson?.actionList)
-    ? parsedJson.actionList
-    : [];
+  const candidate = response?.candidates?.[0];
+  const finishReason = candidate?.finishReason;
+  const thoughtsTokenCount = (response?.usageMetadata as any)?.thoughtsTokenCount || 0;
+  const thoughtSignature = (candidate as any)?.thoughtSignature;
 
   const finalVideoId =
     videoId ||
@@ -1632,11 +2339,32 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       'VIAL_REMOVAL_ACTION',
       'REAGENT_MIXING_ACTION',
       'REAGENT_SEEDING_ACTION',
+      'INCUBATE_CELLS',
+      'INCUBATE_CELLS_ACTION',
+      'ASPIRATE_MEDIA',
+      'ASPRIRATE_MEDIA',
+      'ASPIRATE_MEDIA_ACTION',
+      'ASPRIRATE_MEDIA_ACTION',
+      'HEMOCYTOMETER_LOADING',
+      'HEMOCYTOMETER_LOADING_ACTION',
+      'hemocytometer_loading',
     ]);
 
     if (!actionClass || !VALID_ACTION_CLASSES.has(actionClass)) {
       const combined = `${actionClass || ''} ${actionType || ''}`.toUpperCase();
-      if (
+      if (combined.includes('HEMOCYTOMETER')) {
+        actionClass = 'HEMOCYTOMETER_LOADING';
+        if (!raw.actionType) actionType = 'HEMOCYTOMETER_LOADING';
+      } else if (combined.includes('INCUBAT')) {
+        actionClass = 'INCUBATE_CELLS';
+        if (!raw.actionType) actionType = 'INCUBATE_CELLS';
+      } else if (combined.includes('ASPRIRAT')) {
+        actionClass = 'ASPRIRATE_MEDIA';
+        if (!raw.actionType) actionType = 'ASPRIRATE_MEDIA';
+      } else if (combined.includes('ASPIRAT')) {
+        actionClass = 'ASPIRATE_MEDIA';
+        if (!raw.actionType) actionType = 'ASPIRATE_MEDIA';
+      } else if (
         combined.includes('REAGENT') ||
         combined.includes('SEEDING') ||
         combined.includes('MIX') ||
@@ -1650,6 +2378,24 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
         actionClass = 'VIAL_INSERTION_ACTION';
       }
     }
+
+    let incubateCellsData: IncubateCellsActionData | undefined =
+      raw.incubateCellsData || raw.incubatorSettings
+        ? parseIncubatorSettingsFields(
+            (raw.incubateCellsData || raw.incubatorSettings)?.rawPanelText,
+            raw.incubateCellsData || raw.incubatorSettings
+          )
+        : undefined;
+
+    let hemocytometerLoadingData: HemocytometerLoadingActionData | undefined =
+      raw.hemocytometerLoadingData || raw.hemocytometerLoad || raw.substanceLoaded
+        ? parseHemocytometerLoadingFields(raw.description, {
+            substanceLoaded:
+              raw.hemocytometerLoadingData?.substanceLoaded ||
+              raw.hemocytometerLoad?.substanceLoaded ||
+              raw.substanceLoaded,
+          })
+        : undefined;
 
     // Normalize mixReagentsData and seedReagentsData if present
     let mixReagentsData: MixReagentsActionData | undefined = raw.mixReagentsData
@@ -1742,7 +2488,23 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
     const isArchiveAct =
       classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
       actionType === 'REAGENT_SEEDING_ACTION' ||
-      actionType === 'REAGENT_MIXING_ACTION';
+      actionType === 'REAGENT_MIXING_ACTION' ||
+      actionType === 'INCUBATE_CELLS' ||
+      actionType === 'INCUBATE_CELLS_ACTION' ||
+      actionType === 'ASPIRATE_MEDIA' ||
+      actionType === 'ASPRIRATE_MEDIA' ||
+      actionType === 'ASPIRATE_MEDIA_ACTION' ||
+      actionType === 'HEMOCYTOMETER_LOADING' ||
+      actionType === 'HEMOCYTOMETER_LOADING_ACTION' ||
+      actionType === 'hemocytometer_loading' ||
+      actionClass === 'INCUBATE_CELLS' ||
+      actionClass === 'INCUBATE_CELLS_ACTION' ||
+      actionClass === 'ASPIRATE_MEDIA' ||
+      actionClass === 'ASPRIRATE_MEDIA' ||
+      actionClass === 'ASPIRATE_MEDIA_ACTION' ||
+      actionClass === 'HEMOCYTOMETER_LOADING' ||
+      actionClass === 'HEMOCYTOMETER_LOADING_ACTION' ||
+      actionClass === 'hemocytometer_loading';
 
     // Coordinate & Location (cryo-box slot coordinates only apply to inventory vial actions, never 96-well plate seeding or archive workflows)
     let targetLocation = isArchiveAct ? undefined : raw.targetLocation;
@@ -1768,10 +2530,16 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
 
     const rawDescription =
       raw.description ||
-      (actionType === 'REAGENT_SEEDING_ACTION'
+      (actionType === 'REAGENT_SEEDING_ACTION' || actionType === 'SEED_REAGENTS'
         ? 'Seeding cells into 96-well plate'
-        : actionType === 'REAGENT_MIXING_ACTION'
+        : actionType === 'REAGENT_MIXING_ACTION' || actionType === 'MIX_REAGENTS'
         ? 'Mixing reagents'
+        : String(actionType || actionClass || '').toUpperCase().includes('HEMOCYTOMETER')
+        ? 'Loading cells into the two squares of the hemocytometer slide'
+        : String(actionType || actionClass || '').toUpperCase().includes('INCUBAT')
+        ? 'Inserting cell container into incubator'
+        : /ASPIRAT|ASPRIRAT/i.test(String(actionType || actionClass || ''))
+        ? 'Aspirating media from container using pipette'
         : `Operator performs ${actionType} at ${
             targetCoordinate || (boxRowId ? `${boxRowId}${boxColId || ''}` : 'target slot')
           }`);
@@ -1809,6 +2577,8 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       boxColId,
       ...(mixReagentsData ? { mixReagentsData } : {}),
       ...(seedReagentsData ? { seedReagentsData } : {}),
+      ...(incubateCellsData ? { incubateCellsData } : {}),
+      ...(hemocytometerLoadingData ? { hemocytometerLoadingData, substanceLoaded: hemocytometerLoadingData.substanceLoaded } : {}),
     };
 
     const actionItem: Action = {
@@ -1840,6 +2610,8 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
       boxColId,
       ...(mixReagentsData ? { mixReagentsData } : {}),
       ...(seedReagentsData ? { seedReagentsData } : {}),
+      ...(incubateCellsData ? { incubateCellsData } : {}),
+      ...(hemocytometerLoadingData ? { hemocytometerLoadingData, substanceLoaded: hemocytometerLoadingData.substanceLoaded } : {}),
       eventList: Array.isArray(raw.eventList) && raw.eventList.length > 0 ? raw.eventList : [`evt_${actionId}`],
     };
 
@@ -1848,12 +2620,6 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
   }
 
   // Extract & associate BOX_LABEL_PRESENTATION and VIAL_LABEL_PRESENTATION events detected at 1 fps in Pass 1
-  const rawPass1Events: any[] = Array.isArray(parsedJson?.events)
-    ? parsedJson.events
-    : Array.isArray(parsedJson?.eventList)
-    ? parsedJson.eventList
-    : [];
-
   const normalizedPass1RawEvents = rawPass1Events
     .filter((evt: any) => !isPass0IdentificationEventDuplicate(evt, classification))
     .map((evt: any, idx: number) => {
@@ -2031,6 +2797,87 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
         };
         interval.seedReagentsData = act.seedReagentsData;
       }
+
+      const isIncubateAction =
+        String(act.actionClass || act.actionType || '').toUpperCase().includes('INCUBAT');
+      if (isIncubateAction) {
+        const linkedIncubatorEvts = pass1Events.filter(
+          (e) =>
+            String(e.eventClass || '').toUpperCase().includes('INCUBATOR') &&
+            (e.actionId === act.actionId ||
+              (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId)) ||
+              (Array.isArray(act.eventList) && act.eventList.includes(e.eventId)))
+        );
+        const incEvt =
+          linkedIncubatorEvts[0] ||
+          pass1Events.find((e) => String(e.eventClass || '').toUpperCase().includes('INCUBATOR'));
+        const panelTextPool = [
+          incEvt?.conflatedLabelText,
+          incEvt?.description,
+          incEvt?.spokenContext,
+          act.description,
+          ...globalAudioEvents.map((e) => e.description || ''),
+          classification?.transcribedAudio,
+        ]
+          .filter(Boolean)
+          .join(' ');
+        const resolvedIncubate = parseIncubatorSettingsFields(panelTextPool, {
+          ...(act.incubateCellsData || {}),
+          ...(incEvt?.incubatorSettings || {}),
+          ...(incEvt?.temperature ? { temperature: incEvt.temperature } : {}),
+          ...(incEvt?.co2Level ? { co2Level: incEvt.co2Level } : {}),
+        });
+        act.incubateCellsData = resolvedIncubate;
+        interval.incubateCellsData = resolvedIncubate;
+      }
+
+      const isHemocytometerAction =
+        String(act.actionClass || act.actionType || '').toUpperCase().includes('HEMOCYTOMETER');
+      if (isHemocytometerAction) {
+        const linkedHemocytometerEvts = pass1Events.filter(
+          (e) =>
+            String(e.eventClass || '').toUpperCase().includes('HEMOCYTOMETER') &&
+            (e.actionId === act.actionId ||
+              (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId)) ||
+              (Array.isArray(act.eventList) && act.eventList.includes(e.eventId)))
+        );
+        const hemoEvt =
+          linkedHemocytometerEvts[0] ||
+          pass1Events.find((e) => String(e.eventClass || '').toUpperCase().includes('HEMOCYTOMETER'));
+        const hemoTextPool = [
+          hemoEvt?.substanceLoaded,
+          hemoEvt?.hemocytometerLoad?.substanceLoaded,
+          hemoEvt?.hemocytometerLoadingData?.substanceLoaded,
+          hemoEvt?.conflatedLabelText,
+          hemoEvt?.description,
+          hemoEvt?.spokenContext,
+          act.description,
+          ...globalAudioEvents.map((e) => e.description || ''),
+          classification?.transcribedAudio,
+        ]
+          .filter(Boolean)
+          .join(' ');
+        const resolvedHemocytometer = parseHemocytometerLoadingFields(hemoTextPool, {
+          substanceLoaded:
+            act.hemocytometerLoadingData?.substanceLoaded ||
+            act.hemocytometerLoad?.substanceLoaded ||
+            act.substanceLoaded ||
+            hemoEvt?.substanceLoaded ||
+            hemoEvt?.hemocytometerLoad?.substanceLoaded ||
+            hemoEvt?.hemocytometerLoadingData?.substanceLoaded,
+        });
+        act.hemocytometerLoadingData = resolvedHemocytometer;
+        act.hemocytometerLoad = resolvedHemocytometer;
+        act.substanceLoaded = resolvedHemocytometer.substanceLoaded;
+        interval.hemocytometerLoadingData = resolvedHemocytometer;
+        interval.hemocytometerLoad = resolvedHemocytometer;
+        interval.substanceLoaded = resolvedHemocytometer.substanceLoaded;
+        if (hemoEvt && resolvedHemocytometer.substanceLoaded !== 'N/A') {
+          hemoEvt.substanceLoaded = resolvedHemocytometer.substanceLoaded;
+          hemoEvt.hemocytometerLoad = resolvedHemocytometer;
+          hemoEvt.hemocytometerLoadingData = resolvedHemocytometer;
+        }
+      }
     }
   }
 
@@ -2155,6 +3002,11 @@ export function getEventDetectionSchema(isArchiveWorkflow: boolean = false) {
                 ? [
                     'REAGENT_LABEL_PRESENTATION',
                     'REAGENT_LABEL_PRESENTATION_EVENT',
+                    'INCUBATOR_SETTINGS',
+                    'INCUBATOR_SETTINGS_EVENT',
+                    'HEMOCYTOMETER_LOAD',
+                    'HEMOCYTOMETER_LOAD_EVENT',
+                    'hemocytometer_load',
                     'WELL_SEEDING_EVENT',
                     'SEEDING_EVENT',
                   ]
@@ -2165,6 +3017,11 @@ export function getEventDetectionSchema(isArchiveWorkflow: boolean = false) {
                     'BOX_LABEL_PRESENTATION_EVENT',
                     'VIAL_LABEL_PRESENTATION_EVENT',
                     'REAGENT_LABEL_PRESENTATION_EVENT',
+                    'INCUBATOR_SETTINGS',
+                    'INCUBATOR_SETTINGS_EVENT',
+                    'HEMOCYTOMETER_LOAD',
+                    'HEMOCYTOMETER_LOAD_EVENT',
+                    'hemocytometer_load',
                     'VIAL_INSERTION',
                     'VIAL_REMOVAL',
                     'CAP_REMOVAL',
@@ -2273,6 +3130,21 @@ export function getEventDetectionSchema(isArchiveWorkflow: boolean = false) {
               items: { type: 'INTEGER', minimum: 1, maximum: 12 },
               description:
                 'Aggregated list of detected 96-well plate column numbers (1 to 12, left to right) into which cells were seeded across the seeding action.',
+            },
+            temperature: {
+              type: 'STRING',
+              description:
+                'Incubator temperature read from the INCUBATOR_SETTINGS panel (e.g. "37.0°C"), or "N/A" if not visible.',
+            },
+            co2Level: {
+              type: 'STRING',
+              description:
+                'Incubator CO2 level read from the INCUBATOR_SETTINGS panel (e.g. "5.0%"), or "N/A" if not visible.',
+            },
+            substanceLoaded: {
+              type: 'STRING',
+              description:
+                'Information about the substance (cell suspension, dye/trypan blue dilution, etc.) loaded into the hemocytometer slide for a HEMOCYTOMETER_LOAD / hemocytometer_load event, or "N/A" if not applicable.',
             },
             highestContrastTimestamp: {
               type: 'NUMBER',
@@ -2494,6 +3366,48 @@ export function associatePresentationEventsWithActions(
           associationReason = `Box label presentation at ${evtStart.toFixed(1)}s applies to ${resolvedIds.length} subsequent vial action(s) in this box.`;
         }
       }
+    } else if (cls.includes('INCUBATOR')) {
+      if (resolvedIds.length === 0 && actionsWithTimes.length > 0) {
+        if (evt.actionId && (validActionIds.size === 0 || validActionIds.has(evt.actionId))) {
+          resolvedIds = [evt.actionId];
+        } else {
+          const incubateAction =
+            actionsWithTimes.find((item) =>
+              String(item.action.actionType || item.action.actionClass || '')
+                .toUpperCase()
+                .includes('INCUBAT')
+            ) ||
+            actionsWithTimes.find((item) => item.hasTime && item.endSec >= evtStart - 2.0) ||
+            actionsWithTimes[0];
+          if (incubateAction) {
+            resolvedIds = [incubateAction.action.actionId];
+          }
+        }
+        if (!associationReason && resolvedIds.length > 0) {
+          associationReason = `Associated incubator settings panel inspection with INCUBATE_CELLS action ${resolvedIds.join(', ')}.`;
+        }
+      }
+    } else if (cls.includes('HEMOCYTOMETER')) {
+      if (resolvedIds.length === 0 && actionsWithTimes.length > 0) {
+        if (evt.actionId && (validActionIds.size === 0 || validActionIds.has(evt.actionId))) {
+          resolvedIds = [evt.actionId];
+        } else {
+          const hemoAction =
+            actionsWithTimes.find((item) =>
+              String(item.action.actionType || item.action.actionClass || '')
+                .toUpperCase()
+                .includes('HEMOCYTOMETER')
+            ) ||
+            actionsWithTimes.find((item) => item.hasTime && item.endSec >= evtStart - 2.0) ||
+            actionsWithTimes[0];
+          if (hemoAction) {
+            resolvedIds = [hemoAction.action.actionId];
+          }
+        }
+        if (!associationReason && resolvedIds.length > 0) {
+          associationReason = `Associated hemocytometer_load event with hemocytometer_loading action ${resolvedIds.join(', ')}.`;
+        }
+      }
     } else if (cls.includes('REAGENT_LABEL')) {
       if (resolvedIds.length === 0 && actionsWithTimes.length > 0) {
         if (evt.actionId && (validActionIds.size === 0 || validActionIds.has(evt.actionId))) {
@@ -2710,6 +3624,157 @@ async function ensureLocalNormalizedVideoPath(
   return undefined;
 }
 
+const CHUNK_DURATION_SECONDS = 600;
+
+function getSortedVideoChunks(
+  videoDoc: any,
+  videoId?: string,
+  defaultGcsUri?: string
+): { index: number; gcsUri: string; offsetSeconds: number }[] {
+  const rawChunks = Array.isArray(videoDoc?.chunks) ? videoDoc.chunks : [];
+  if (rawChunks.length > 1) {
+    return [...rawChunks]
+      .sort((a: any, b: any) => Number(a?.index ?? 0) - Number(b?.index ?? 0))
+      .map((c: any, idx: number) => {
+        const chunkIndex = typeof c?.index === 'number' ? c.index : idx;
+        return {
+          index: chunkIndex,
+          gcsUri: resolveNormalizedGcsUri(c?.gcsUri || defaultGcsUri, videoId),
+          offsetSeconds: chunkIndex * CHUNK_DURATION_SECONDS,
+        };
+      });
+  }
+  return [
+    {
+      index: 0,
+      gcsUri: defaultGcsUri || resolveNormalizedGcsUri(rawChunks[0]?.gcsUri, videoId),
+      offsetSeconds: 0,
+    },
+  ];
+}
+
+function resolveChunkClipForInterval(
+  startSec: number,
+  endSec: number,
+  defaultGcsUri: string,
+  videoDoc: any,
+  videoId?: string
+): {
+  fileUri: string;
+  startOffsetSec: number;
+  endOffsetSec: number;
+  chunkIndex: number;
+  chunkOffsetSec: number;
+} {
+  const chunks = getSortedVideoChunks(videoDoc, videoId, defaultGcsUri);
+  if (chunks.length <= 1) {
+    const s = Math.max(0, Number(startSec.toFixed(2)));
+    const e = Math.max(s + 0.5, Number(endSec.toFixed(2)));
+    return {
+      fileUri: defaultGcsUri,
+      startOffsetSec: s,
+      endOffsetSec: e,
+      chunkIndex: 0,
+      chunkOffsetSec: 0,
+    };
+  }
+  const targetIdx = Math.min(
+    chunks.length - 1,
+    Math.max(0, Math.floor(Math.max(0, startSec) / CHUNK_DURATION_SECONDS))
+  );
+  const chunk = chunks.find((c) => c.index === targetIdx) || chunks[targetIdx] || chunks[0];
+  const chunkOffsetSec = chunk.offsetSeconds;
+  const localStart = Math.max(0, Number((startSec - chunkOffsetSec).toFixed(2)));
+  const localEnd = Math.min(
+    CHUNK_DURATION_SECONDS,
+    Math.max(localStart + 0.5, Number((endSec - chunkOffsetSec).toFixed(2)))
+  );
+  return {
+    fileUri: chunk.gcsUri || defaultGcsUri,
+    startOffsetSec: localStart,
+    endOffsetSec: localEnd,
+    chunkIndex: chunk.index,
+    chunkOffsetSec,
+  };
+}
+
+async function resolveLocalVideoForTimestamp(
+  videoId: string | undefined,
+  timestampSec: number,
+  baseLocalPath: string | undefined,
+  videoDoc: any
+): Promise<{ videoPath: string; seekOffsetSec: number }> {
+  if (!baseLocalPath || timestampSec < CHUNK_DURATION_SECONDS) {
+    return { videoPath: baseLocalPath || '', seekOffsetSec: 0 };
+  }
+  const baseName = path.basename(baseLocalPath);
+  // If baseLocalPath is the full un-segmented raw video (raw_<videoId>.mp4), seek directly at global timestampSec
+  if (baseName.startsWith('raw_')) {
+    return { videoPath: baseLocalPath, seekOffsetSec: 0 };
+  }
+  // Otherwise baseLocalPath is a 10-minute normalized chunk (norm_<videoId>.mp4).
+  const chunkIdx = Math.floor(timestampSec / CHUNK_DURATION_SECONDS);
+  if (chunkIdx <= 0 || !videoId) {
+    return { videoPath: baseLocalPath, seekOffsetSec: 0 };
+  }
+  const chunkFilename = `norm_${videoId}_chunk_${chunkIdx}.mp4`;
+  const candidateDirs = Array.from(
+    new Set([
+      path.dirname(baseLocalPath),
+      path.join('/tmp', 'sail_normalized_cache'),
+      path.join(os.tmpdir(), 'sail_normalized_cache'),
+    ])
+  );
+  for (const dir of candidateDirs) {
+    const cand = path.join(dir, chunkFilename);
+    if (fs.existsSync(cand)) {
+      try {
+        if (fs.statSync(cand).size > 256) {
+          return { videoPath: cand, seekOffsetSec: chunkIdx * CHUNK_DURATION_SECONDS };
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  if (process.env.NODE_ENV !== 'test') {
+    const defaultBucket = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
+    const chunks = getSortedVideoChunks(videoDoc, videoId);
+    const matchingChunk = chunks.find((c) => c.index === chunkIdx);
+    const chunkGcsUri =
+      matchingChunk?.gcsUri ||
+      `gs://${defaultBucket}/normalized/${videoId}/chunk_${String(chunkIdx).padStart(3, '0')}.mp4`;
+    if (chunkGcsUri.startsWith('gs://')) {
+      const withoutScheme = chunkGcsUri.slice(5);
+      const slashIdx = withoutScheme.indexOf('/');
+      if (slashIdx > 0) {
+        const bName = withoutScheme.slice(0, slashIdx);
+        const objPath = withoutScheme.slice(slashIdx + 1);
+        try {
+          const file = storage.bucket(bName).file(objPath);
+          const [exists] = await file.exists();
+          if (exists) {
+            const targetDir = candidateDirs[0];
+            if (!fs.existsSync(targetDir)) {
+              fs.mkdirSync(targetDir, { recursive: true });
+            }
+            const destPath = path.join(targetDir, chunkFilename);
+            await file.download({ destination: destPath });
+            if (fs.existsSync(destPath) && fs.statSync(destPath).size > 256) {
+              return { videoPath: destPath, seekOffsetSec: chunkIdx * CHUNK_DURATION_SECONDS };
+            }
+          }
+        } catch {
+          // fallback below
+        }
+      }
+    }
+  }
+
+  return { videoPath: baseLocalPath, seekOffsetSec: 0 };
+}
+
 function resolvePersistentFrameDirs(videoId?: string): { primaryDir: string; mirrorDir?: string } {
   const safeVideoId = videoId || 'default';
   let primaryBase = '/tmp';
@@ -2823,11 +3888,16 @@ export async function runPass2EventDetection(
     const actType = String(act.actionType || act.actionClass || '').toUpperCase();
     return actType.includes('SEED');
   });
-  // Pass 2 selects 4 fps best frames for label presentation events and detects individual seeding events
+  // Pass 2 selects 4 fps best frames for label presentation events and incubator settings events, and detects individual seeding events
   const pass1Events: Event[] = isArchivePass2
     ? rawPass1EventsList.filter((evt) => {
         const cls = String(evt?.eventClass || (evt as any)?.actionType || '').toUpperCase();
-        return isReagentLabelPresentationEvent(evt) || cls.includes('SEEDING');
+        return (
+          isReagentLabelPresentationEvent(evt) ||
+          cls.includes('SEEDING') ||
+          cls.includes('INCUBATOR') ||
+          cls.includes('HEMOCYTOMETER')
+        );
       })
     : rawPass1EventsList.filter((evt) => {
         const cls = String(evt?.eventClass || (evt as any)?.actionType || '').toUpperCase();
@@ -2969,8 +4039,14 @@ export async function runPass2EventDetection(
           `   - "minimalBlurTimestamp": timestamp (seconds) of the frame showing the label clearly with minimal blur.`,
           `   - It is OK if both frames are the same ("highestContrastTimestamp" === "minimalBlurTimestamp"). Set "bestShotTimes" to [highestContrastTimestamp, minimalBlurTimestamp].`,
           `   - Populate "reagentName", "reagentAcronym" (formed from the first letters of the reagent name), "manufacturer", "catalogNumber" (Catalog / Ref #), and "lotNumber" (Lot #), leaving any field not printed on the label as "N/A".`,
+          `2. For each INCUBATOR_SETTINGS event (associated with INCUBATE_CELLS action):`,
+          `   - Inspect its window at 4 fps and identify the 2 best frames ("highestContrastTimestamp" and "minimalBlurTimestamp") showing the incubator settings panel clearly.`,
+          `   - Extract "temperature" (e.g. "37.0°C") and "co2Level" (e.g. "5.0%") from the incubator settings panel, leaving any field not visible as "N/A".`,
+          `3. For each HEMOCYTOMETER_LOAD / hemocytometer_load event (associated with HEMOCYTOMETER_LOADING / hemocytometer_loading action):`,
+          `   - Inspect its window at 4 fps and identify the 2 best frames ("highestContrastTimestamp" and "minimalBlurTimestamp") showing the hemocytometer loading clearly.`,
+          `   - Extract "substanceLoaded" containing information about the substance that was loaded into the two squares of the hemocytometer slide, or "N/A" if not found.`,
           hasSeedingAction
-            ? `2. For REAGENT_SEEDING_ACTION: Detect each individual seeding event where the pipette deposits cells into a column of the 96-well plate. Emit a WELL_SEEDING_EVENT for each dispense, setting "seededColumn" to the column number (1 to 12, with column 1 on the left side and column 12 all the way to the right). Count the total seeding events in "seedingEventsCount" and verify against "expectedSeedingEventsCount" (12).`
+            ? `4. For REAGENT_SEEDING_ACTION: Detect each individual seeding event where the pipette deposits cells into a column of the 96-well plate. Emit a WELL_SEEDING_EVENT for each dispense, setting "seededColumn" to the column number (1 to 12, with column 1 on the left side and column 12 all the way to the right). Count the total seeding events in "seedingEventsCount" and verify against "expectedSeedingEventsCount" (12).`
             : '',
           `Return a JSON object containing "events" and "refinedActions" conforming to the response schema.`,
         ]
@@ -3004,47 +4080,76 @@ export async function runPass2EventDetection(
           .join('\n');
 
     const parts: any[] = [];
+    const sortedPass2Chunks = getSortedVideoChunks(videoDoc, videoId, gcsUri);
     if (gcsUri) {
       if (hasExplicitActionWindows || hasExplicitEventWindows) {
         const candidateVideoParts: any[] = [];
         for (const win of actionRefinementWindows) {
           if (win.hasExplicitTimestamps) {
+            const clip = resolveChunkClipForInterval(
+              win.searchWindowStartSeconds,
+              win.searchWindowEndSeconds,
+              gcsUri,
+              videoDoc,
+              videoId
+            );
             candidateVideoParts.push({
               fileData: {
-                fileUri: gcsUri,
+                fileUri: clip.fileUri,
                 mimeType: 'video/mp4',
               },
               videoMetadata: {
                 fps: 4,
-                startOffset: `${win.searchWindowStartSeconds}s`,
-                endOffset: `${win.searchWindowEndSeconds}s`,
+                startOffset: `${clip.startOffsetSec}s`,
+                endOffset: `${clip.endOffsetSec}s`,
               },
             });
           }
         }
         for (const ew of eventWindows) {
           if (ew.hasExplicitTimestamps) {
+            const clip = resolveChunkClipForInterval(
+              ew.startSeconds,
+              ew.endSeconds,
+              gcsUri,
+              videoDoc,
+              videoId
+            );
             candidateVideoParts.push({
               fileData: {
-                fileUri: gcsUri,
+                fileUri: clip.fileUri,
                 mimeType: 'video/mp4',
               },
               videoMetadata: {
                 fps: 4,
-                startOffset: `${ew.startSeconds}s`,
-                endOffset: `${ew.endSeconds}s`,
+                startOffset: `${clip.startOffsetSec}s`,
+                endOffset: `${clip.endOffsetSec}s`,
               },
             });
           }
         }
 
-        // Vertex AI supports at most 10 video files per request. If > 10 clips exist, submit 1 spanning video at 4 fps.
+        // Vertex AI supports at most 10 video files per request. If > 10 clips exist, submit spanning chunk videos at 4 fps.
         if (candidateVideoParts.length > 0 && candidateVideoParts.length <= 10) {
           parts.push(...candidateVideoParts);
         } else {
+          for (const ch of sortedPass2Chunks.slice(0, 10)) {
+            parts.push({
+              fileData: {
+                fileUri: ch.gcsUri || gcsUri,
+                mimeType: 'video/mp4',
+              },
+              videoMetadata: {
+                fps: 4,
+              },
+            });
+          }
+        }
+      } else {
+        for (const ch of sortedPass2Chunks.slice(0, 10)) {
           parts.push({
             fileData: {
-              fileUri: gcsUri,
+              fileUri: ch.gcsUri || gcsUri,
               mimeType: 'video/mp4',
             },
             videoMetadata: {
@@ -3052,16 +4157,6 @@ export async function runPass2EventDetection(
             },
           });
         }
-      } else {
-        parts.push({
-          fileData: {
-            fileUri: gcsUri,
-            mimeType: 'video/mp4',
-          },
-          videoMetadata: {
-            fps: 4,
-          },
-        });
       }
     }
     parts.push({ text: promptText });
@@ -3069,8 +4164,8 @@ export async function runPass2EventDetection(
     const pass2Candidates = Array.from(
       new Set(
         targetModel.toLowerCase().includes('flash')
-          ? [targetModel, DEFAULT_FLASH_MODEL]
-          : [targetModel, 'gemini-1.5-pro-002', 'gemini-1.5-pro', 'gemini-4-argon', 'gemini-3.1-pro-preview']
+          ? [targetModel, DEFAULT_FLASH_MODEL, 'gemini-4-argon']
+          : [targetModel, 'gemini-1.5-pro-002', 'gemini-1.5-pro', 'gemini-4-argon', DEFAULT_FLASH_MODEL]
       )
     );
 
@@ -3253,7 +4348,31 @@ export async function runPass2EventDetection(
         if (matched?.eventId) {
           matchedModelIds.add(matched.eventId);
         }
-        const matchedClsUpper = String(matched?.eventClass || '').toUpperCase();
+        const p1ChunkOffsetSec =
+          sortedPass2Chunks.length > 1 && p1Start >= CHUNK_DURATION_SECONDS
+            ? Math.floor(p1Start / CHUNK_DURATION_SECONDS) * CHUNK_DURATION_SECONDS
+            : 0;
+        const normalizeChunkTs = (ts: any): any => {
+          if (typeof ts === 'number' && !isNaN(ts) && p1ChunkOffsetSec > 0 && ts < p1ChunkOffsetSec) {
+            return Number((ts + p1ChunkOffsetSec).toFixed(2));
+          }
+          return ts;
+        };
+        const normalizedMatched = matched
+          ? {
+              ...matched,
+              ...(typeof matched.highestContrastTimestamp === 'number'
+                ? { highestContrastTimestamp: normalizeChunkTs(matched.highestContrastTimestamp) }
+                : {}),
+              ...(typeof matched.minimalBlurTimestamp === 'number'
+                ? { minimalBlurTimestamp: normalizeChunkTs(matched.minimalBlurTimestamp) }
+                : {}),
+              ...(Array.isArray(matched.bestShotTimes)
+                ? { bestShotTimes: matched.bestShotTimes.map((t: any) => normalizeChunkTs(t)) }
+                : {}),
+            }
+          : undefined;
+        const matchedClsUpper = String(normalizedMatched?.eventClass || '').toUpperCase();
         const p1ClsUpper = String(p1Evt.eventClass || '').toUpperCase();
         const defaultPass2EventClass =
           classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
@@ -3263,28 +4382,31 @@ export async function runPass2EventDetection(
           matchedClsUpper.includes('REAGENT_LABEL') ||
           (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
             p1ClsUpper.includes('VIAL_LABEL'))
-            ? matched?.eventClass || 'REAGENT_LABEL_PRESENTATION_EVENT'
-            : p1Evt.eventClass || matched?.eventClass || defaultPass2EventClass;
+            ? normalizedMatched?.eventClass || 'REAGENT_LABEL_PRESENTATION_EVENT'
+            : p1Evt.eventClass || normalizedMatched?.eventClass || defaultPass2EventClass;
         return {
           ...p1Evt,
-          ...(matched || {}),
+          ...(normalizedMatched || {}),
           eventId: p1Evt.eventId,
           eventClass: resolvedEventClass,
-          actionId: p1Evt.actionId || matched?.actionId,
+          actionId: p1Evt.actionId || normalizedMatched?.actionId,
           actionIds:
             Array.isArray(p1Evt.actionIds) && p1Evt.actionIds.length > 0
               ? p1Evt.actionIds
-              : matched?.actionIds,
-          description: p1Evt.description || matched?.description,
-          reagentName: pickValidStr(matched?.reagentName, (p1Evt as any).reagentName),
-          reagentAcronym: pickValidStr(matched?.reagentAcronym, (p1Evt as any).reagentAcronym),
-          manufacturer: pickValidStr(matched?.manufacturer, (p1Evt as any).manufacturer),
-          catalogNumber: pickValidStr(matched?.catalogNumber, (p1Evt as any).catalogNumber),
-          lotNumber: pickValidStr(matched?.lotNumber, (p1Evt as any).lotNumber),
-          spokenContext: p1Evt.spokenContext || matched?.spokenContext,
-          associationReason: p1Evt.associationReason || matched?.associationReason,
-          startTime: p1Evt.startTime !== undefined ? p1Evt.startTime : matched?.startTime,
-          endTime: p1Evt.endTime !== undefined ? p1Evt.endTime : matched?.endTime,
+              : normalizedMatched?.actionIds,
+          description: p1Evt.description || normalizedMatched?.description,
+          reagentName: pickValidStr(normalizedMatched?.reagentName, (p1Evt as any).reagentName),
+          reagentAcronym: pickValidStr(normalizedMatched?.reagentAcronym, (p1Evt as any).reagentAcronym),
+          manufacturer: pickValidStr(normalizedMatched?.manufacturer, (p1Evt as any).manufacturer),
+          catalogNumber: pickValidStr(normalizedMatched?.catalogNumber, (p1Evt as any).catalogNumber),
+          lotNumber: pickValidStr(normalizedMatched?.lotNumber, (p1Evt as any).lotNumber),
+          temperature: pickValidStr(normalizedMatched?.temperature, (p1Evt as any).temperature),
+          co2Level: pickValidStr(normalizedMatched?.co2Level, (p1Evt as any).co2Level),
+          substanceLoaded: pickValidStr(normalizedMatched?.substanceLoaded, (p1Evt as any).substanceLoaded),
+          spokenContext: p1Evt.spokenContext || normalizedMatched?.spokenContext,
+          associationReason: p1Evt.associationReason || normalizedMatched?.associationReason,
+          startTime: p1Evt.startTime !== undefined ? p1Evt.startTime : normalizeChunkTs(normalizedMatched?.startTime),
+          endTime: p1Evt.endTime !== undefined ? p1Evt.endTime : normalizeChunkTs(normalizedMatched?.endTime),
         };
       });
       if (!isArchivePass2) {
@@ -3294,10 +4416,17 @@ export async function runPass2EventDetection(
           }
         }
       } else {
-        // In archive Pass 2, include newly detected WELL_SEEDING_EVENTs / SEEDING_EVENTs from model
+        // In archive Pass 2, include newly detected WELL_SEEDING_EVENTs / SEEDING_EVENTs / INCUBATOR_SETTINGS / HEMOCYTOMETER_LOAD from model
         for (const me of candidateModelEvents) {
           const meCls = String(me?.eventClass || me?.actionType || '').toUpperCase();
-          if (me && (meCls.includes('SEEDING') || meCls.includes('WELL_SEEDING')) && !matchedModelIds.has(me.eventId)) {
+          if (
+            me &&
+            (meCls.includes('SEEDING') ||
+              meCls.includes('WELL_SEEDING') ||
+              meCls.includes('INCUBATOR') ||
+              meCls.includes('HEMOCYTOMETER')) &&
+            !matchedModelIds.has(me.eventId)
+          ) {
             combinedRawEvents.push(me);
           }
         }
@@ -3305,7 +4434,7 @@ export async function runPass2EventDetection(
     } else if (isArchivePass2 && hasPass1EventsInput) {
       combinedRawEvents = candidateModelEvents.filter((me) => {
         const meCls = String(me?.eventClass || me?.actionType || '').toUpperCase();
-        return meCls.includes('SEEDING');
+        return meCls.includes('SEEDING') || meCls.includes('INCUBATOR') || meCls.includes('HEMOCYTOMETER');
       });
     } else {
       combinedRawEvents = rawModelEvents;
@@ -3372,6 +4501,10 @@ export async function runPass2EventDetection(
             ? 'REAGENT_LABEL_PRESENTATION_EVENT'
             : rawEvtCls.includes('SEEDING')
             ? 'WELL_SEEDING_EVENT'
+            : rawEvtCls.includes('INCUBATOR')
+            ? 'INCUBATOR_SETTINGS'
+            : rawEvtCls.includes('HEMOCYTOMETER')
+            ? 'HEMOCYTOMETER_LOAD'
             : evt.eventClass || evt.actionType || defaultCls;
         return {
           ...evt,
@@ -3452,8 +4585,15 @@ export async function runPass2EventDetection(
           ? rawBestShotTimes[1]
           : contrastCandidateTs;
 
+      const localVideoForEvent = await resolveLocalVideoForTimestamp(
+        videoId,
+        numStart,
+        resolvedLocalVideoPath,
+        videoDoc
+      );
+
       const selectedFrames = await selectBestEventFrames(
-        resolvedLocalVideoPath || '',
+        localVideoForEvent.videoPath,
         eventId,
         numStart,
         numEnd,
@@ -3462,6 +4602,7 @@ export async function runPass2EventDetection(
           highestContrastTimestamp: contrastCandidateTs,
           minimalBlurTimestamp: blurCandidateTs,
           bestShotTimes: rawBestShotTimes,
+          seekOffsetSec: localVideoForEvent.seekOffsetSec,
         }
       );
 
@@ -3547,6 +4688,29 @@ export async function runPass2EventDetection(
 
       const isArchiveWithoutActions =
         classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' && actions.length === 0;
+      const isIncubatorEvt = String(rawEvent.eventClass || rawEvent.actionType || '')
+        .toUpperCase()
+        .includes('INCUBATOR');
+      const parsedIncSettings = isIncubatorEvt
+        ? parseIncubatorSettingsFields(rawEvent.description || '', {
+            temperature: rawEvent.incubatorSettings?.temperature || rawEvent.temperature,
+            co2Level: rawEvent.incubatorSettings?.co2Level || rawEvent.co2Level,
+          })
+        : undefined;
+      const isHemocytometerEvt = String(rawEvent.eventClass || rawEvent.actionType || '')
+        .toUpperCase()
+        .includes('HEMOCYTOMETER');
+      const parsedHemoLoad = isHemocytometerEvt
+        ? parseHemocytometerLoadingFields(
+            `${rawEvent.description || ''} ${rawEvent.spokenContext || ''}`,
+            {
+              substanceLoaded:
+                rawEvent.hemocytometerLoadingData?.substanceLoaded ||
+                rawEvent.hemocytometerLoad?.substanceLoaded ||
+                rawEvent.substanceLoaded,
+            }
+          )
+        : undefined;
       const validatedEvent = EventSchema.parse({
         ...rawEvent,
         eventId,
@@ -3570,6 +4734,20 @@ export async function runPass2EventDetection(
         bestFrames,
         highestContrastFrame,
         minimalBlurFrame,
+        ...(parsedIncSettings
+          ? {
+              incubatorSettings: parsedIncSettings,
+              temperature: parsedIncSettings.temperature,
+              co2Level: parsedIncSettings.co2Level,
+            }
+          : {}),
+        ...(parsedHemoLoad
+          ? {
+              hemocytometerLoadingData: parsedHemoLoad,
+              hemocytometerLoad: parsedHemoLoad,
+              substanceLoaded: parsedHemoLoad.substanceLoaded,
+            }
+          : {}),
         refinementList: Array.isArray(rawEvent.refinementList) ? rawEvent.refinementList : [],
       });
 
@@ -3621,22 +4799,32 @@ export async function runPass2EventDetection(
       );
 
       if (modelRefined) {
-        const rawBeforeTs =
+        const actChunkOffsetSec =
+          sortedPass2Chunks.length > 1 && win.pass1StartSeconds >= CHUNK_DURATION_SECONDS
+            ? Math.floor(win.pass1StartSeconds / CHUNK_DURATION_SECONDS) * CHUNK_DURATION_SECONDS
+            : 0;
+        let rawBeforeTs =
           typeof modelRefined.beforeActionTimestampSeconds === 'number' && !isNaN(modelRefined.beforeActionTimestampSeconds)
             ? modelRefined.beforeActionTimestampSeconds
             : modelRefined.refinedStartTimestampSeconds;
-        const rawAfterTs =
+        let rawAfterTs =
           typeof modelRefined.afterActionTimestampSeconds === 'number' && !isNaN(modelRefined.afterActionTimestampSeconds)
             ? modelRefined.afterActionTimestampSeconds
             : modelRefined.refinedEndTimestampSeconds;
 
         if (typeof rawBeforeTs === 'number' && !isNaN(rawBeforeTs)) {
+          if (actChunkOffsetSec > 0 && rawBeforeTs < actChunkOffsetSec) {
+            rawBeforeTs += actChunkOffsetSec;
+          }
           refinedStart = Math.max(
             win.searchWindowStartSeconds,
             Math.min(win.searchWindowEndSeconds, Number(rawBeforeTs.toFixed(2)))
           );
         }
         if (typeof rawAfterTs === 'number' && !isNaN(rawAfterTs)) {
+          if (actChunkOffsetSec > 0 && rawAfterTs < actChunkOffsetSec) {
+            rawAfterTs += actChunkOffsetSec;
+          }
           refinedEnd = Math.max(
             refinedStart,
             Math.min(win.searchWindowEndSeconds, Number(rawAfterTs.toFixed(2)))
@@ -3804,6 +4992,75 @@ export async function runPass2EventDetection(
         };
         if (detectedCols.length > 0) {
           act.seededColumns = detectedCols;
+        }
+      } else if (
+        String(act.actionType || act.actionClass || '').toUpperCase().includes('INCUBAT')
+      ) {
+        const incEvts = allEvents.filter(
+          (e) =>
+            String(e.eventClass || '').toUpperCase().includes('INCUBATOR') &&
+            (e.actionId === act.actionId ||
+              (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId)))
+        );
+        const incEvt =
+          incEvts[0] ||
+          allEvents.find((e) => String(e.eventClass || '').toUpperCase().includes('INCUBATOR'));
+        if (incEvt || act.incubateCellsData) {
+          const panelText = [
+            incEvt?.conflatedLabelText,
+            incEvt?.description,
+            incEvt?.spokenContext,
+            act.description,
+            classification?.transcribedAudio,
+          ]
+            .filter(Boolean)
+            .join(' ');
+          const resolvedIncubate = parseIncubatorSettingsFields(panelText, {
+            ...(act.incubateCellsData || {}),
+            ...(incEvt?.incubatorSettings || {}),
+            ...(incEvt?.temperature ? { temperature: incEvt.temperature } : {}),
+            ...(incEvt?.co2Level ? { co2Level: incEvt.co2Level } : {}),
+          });
+          act.incubateCellsData = resolvedIncubate;
+          act.incubatorSettings = resolvedIncubate;
+        }
+      } else if (
+        String(act.actionType || act.actionClass || '').toUpperCase().includes('HEMOCYTOMETER')
+      ) {
+        const hemoEvts = allEvents.filter(
+          (e) =>
+            String(e.eventClass || '').toUpperCase().includes('HEMOCYTOMETER') &&
+            (e.actionId === act.actionId ||
+              (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId)))
+        );
+        const hemoEvt =
+          hemoEvts[0] ||
+          allEvents.find((e) => String(e.eventClass || '').toUpperCase().includes('HEMOCYTOMETER'));
+        if (hemoEvt || act.hemocytometerLoadingData || act.hemocytometerLoad || act.substanceLoaded) {
+          const hemoText = [
+            hemoEvt?.substanceLoaded,
+            hemoEvt?.hemocytometerLoad?.substanceLoaded,
+            hemoEvt?.hemocytometerLoadingData?.substanceLoaded,
+            hemoEvt?.conflatedLabelText,
+            hemoEvt?.description,
+            hemoEvt?.spokenContext,
+            act.description,
+            classification?.transcribedAudio,
+          ]
+            .filter(Boolean)
+            .join(' ');
+          const resolvedHemo = parseHemocytometerLoadingFields(hemoText, {
+            substanceLoaded:
+              act.hemocytometerLoadingData?.substanceLoaded ||
+              act.hemocytometerLoad?.substanceLoaded ||
+              act.substanceLoaded ||
+              hemoEvt?.substanceLoaded ||
+              hemoEvt?.hemocytometerLoad?.substanceLoaded ||
+              hemoEvt?.hemocytometerLoadingData?.substanceLoaded,
+          });
+          act.hemocytometerLoadingData = resolvedHemo;
+          act.hemocytometerLoad = resolvedHemo;
+          act.substanceLoaded = resolvedHemo.substanceLoaded;
         }
       }
 
@@ -4285,13 +5542,11 @@ export async function runPass3AnalysisRefinement(
     ((videoDoc as any)?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
       events.some(
         (e: any) =>
-          String(e?.eventClass || e?.eventType || '')
-            .toUpperCase()
-            .includes('REAGENT') ||
-          Boolean(e?.reagentData || e?.reagentName)
+          /REAGENT|INCUBATOR/i.test(String(e?.eventClass || e?.eventType || '')) ||
+          Boolean(e?.reagentData || e?.reagentName || e?.incubatorSettings)
       ) ||
       actions.some((a: any) =>
-        /REAGENT|MIX_REAGENTS|SEED_REAGENTS|SEEDING/i.test(
+        /REAGENT|MIX_REAGENTS|SEED_REAGENTS|SEEDING|INCUBAT|ASPIRAT|ASPRIRAT/i.test(
           String(a?.actionClass || a?.actionType || '')
         )
       ));
@@ -4517,8 +5772,8 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
   const pass3Candidates = Array.from(
     new Set(
       targetModel.toLowerCase().includes('flash')
-        ? [targetModel, DEFAULT_FLASH_MODEL]
-        : [targetModel, 'gemini-1.5-pro-002', 'gemini-1.5-pro', 'gemini-4-argon', 'gemini-3.1-pro-preview']
+        ? [targetModel, DEFAULT_FLASH_MODEL, 'gemini-4-argon']
+        : [targetModel, 'gemini-1.5-pro-002', 'gemini-1.5-pro', 'gemini-4-argon', DEFAULT_FLASH_MODEL]
     )
   );
   const pass3Config: any = {
@@ -4720,21 +5975,25 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
     }
   })();
 
+  const sortedPass3Chunks = getSortedVideoChunks(videoDoc, videoId, gcsUri);
+
   if (
     (classification.workflowType !== 'INVENTORY_UPDATE_WORKFLOW' && !hasRealFullResVideo) ||
     (eventsSummary.length === 0 && actionsSummary.length === 0)
   ) {
     const singleVideoParts: any[] = [];
     if (gcsUri) {
-      singleVideoParts.push({
-        fileData: {
-          fileUri: gcsUri,
-          mimeType: 'video/mp4',
-        },
-        videoMetadata: {
-          fps: 4,
-        },
-      });
+      for (const ch of sortedPass3Chunks.slice(0, 10)) {
+        singleVideoParts.push({
+          fileData: {
+            fileUri: ch.gcsUri || gcsUri,
+            mimeType: 'video/mp4',
+          },
+          videoMetadata: {
+            fps: 4,
+          },
+        });
+      }
     }
     singleVideoParts.push({ text: promptText });
     const singleResp = await callPass3ModelWithSingleVideo(singleVideoParts);
@@ -4751,8 +6010,10 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
       if (
         classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
         !evtClsUpper.includes('LABEL') &&
+        !evtClsUpper.includes('INCUBATOR') &&
         !evtObj?.reagentData &&
-        !evtObj?.reagentName
+        !evtObj?.reagentName &&
+        !evtObj?.incubatorSettings
       ) {
         continue;
       }
@@ -4769,15 +6030,16 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
 
       const eventParts: any[] = [];
       if (gcsUri) {
+        const evtClip = resolveChunkClipForInterval(clipStart, clipEnd, gcsUri, videoDoc, videoId);
         eventParts.push({
           fileData: {
-            fileUri: gcsUri,
+            fileUri: evtClip.fileUri,
             mimeType: 'video/mp4',
           },
           videoMetadata: {
             fps: 4,
-            startOffset: `${Number(clipStart.toFixed(2))}s`,
-            endOffset: `${Number(clipEnd.toFixed(2))}s`,
+            startOffset: `${Number(evtClip.startOffsetSec.toFixed(2))}s`,
+            endOffset: `${Number(evtClip.endOffsetSec.toFixed(2))}s`,
           },
         });
       }
@@ -4803,9 +6065,15 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
         let candidateFramePath = path.join(persistentFrameDir, spec.filename);
         if (hasRealFullResVideo && localFullResVideoPath) {
           try {
-            candidateFramePath = await extractCandidateFrame(
-              localFullResVideoPath,
+            const localVideoForShot = await resolveLocalVideoForTimestamp(
+              videoId,
               spec.ts,
+              localFullResVideoPath,
+              videoDoc
+            );
+            candidateFramePath = await extractCandidateFrame(
+              localVideoForShot.videoPath,
+              Math.max(0, Number((spec.ts - localVideoForShot.seekOffsetSec).toFixed(3))),
               persistentFrameDir,
               spec.filename
             );
@@ -4845,12 +6113,39 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
         }
       }
 
-      const evtIsReagentLabel =
-        classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
-        evtClsUpper.includes('REAGENT_LABEL') ||
-        Boolean(evtObj?.reagentData || evtObj?.reagentName);
+      const evtIsIncubatorSettings =
+        evtClsUpper.includes('INCUBATOR') ||
+        Boolean(evtObj?.incubatorSettings || evtObj?.temperature || evtObj?.co2Level);
 
-      const eventPromptText = evtIsReagentLabel
+      const evtIsReagentLabel =
+        !evtIsIncubatorSettings &&
+        (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+          evtClsUpper.includes('REAGENT_LABEL') ||
+          Boolean(evtObj?.reagentData || evtObj?.reagentName));
+
+      const eventPromptText = evtIsIncubatorSettings
+        ? `Workflow: ${classification.workflowType}
+Video URI: ${gcsUri}
+
+INCUBATOR SETTINGS PANEL EVENT (Dual-Shot Full-Resolution Frame Transcription & Extraction):
+Read the incubator settings panel shown in the TWO full-resolution best shots (Shot 1: HIGHEST_CONTRAST at ${t1}s and Shot 2: MINIMAL_BLUR at ${t2}s) for this INCUBATOR_SETTINGS event and extract:
+- "temperature": incubator temperature displayed on the panel (e.g. "37.0°C", or "N/A" if not visible)
+- "co2Level": CO2 level displayed on the panel (e.g. "5.0%", or "N/A" if not visible)
+- "rawPanelText": verbatim text/numbers read from the incubator settings panel across the two shots
+Event to refine:
+${JSON.stringify(evtSum, null, 2)}
+
+Output a JSON Refinement object (or array of 1 Refinement object) with:
+- "refinementId": "ref_${evtSum.eventId}"
+- "eventId": "${evtSum.eventId}"
+- "actionId": "${evtSum.actionId || ''}"
+- "refinementClass": "INCUBATOR_SETTINGS_OCR"
+- "transcriptionText": string (full conflated panel text)
+- "frame1Text": string (verbatim OCR text from Shot 1: HIGHEST_CONTRAST)
+- "frame2Text": string (verbatim OCR text from Shot 2: MINIMAL_BLUR)
+- "incubatorSettings": { "temperature": string, "co2Level": string, "rawPanelText": string }
+- "conflationMetadata": { "confidence": number, "framesEvaluated": 2, "ocrEngine": "Gemini-DualShot-Conflation" }`
+        : evtIsReagentLabel
         ? `Workflow: ${classification.workflowType}
 Video URI: ${gcsUri}
 
@@ -4943,15 +6238,16 @@ Output a JSON Refinement object (or array of 1 Refinement object) with:
 
         const actionParts: any[] = [];
         if (gcsUri) {
+          const actClip = resolveChunkClipForInterval(startSec, endSec, gcsUri, videoDoc, videoId);
           actionParts.push({
             fileData: {
-              fileUri: gcsUri,
+              fileUri: actClip.fileUri,
               mimeType: 'video/mp4',
             },
             videoMetadata: {
               fps: 4,
-              startOffset: `${Number(startSec.toFixed(2))}s`,
-              endOffset: `${Number(endSec.toFixed(2))}s`,
+              startOffset: `${Number(actClip.startOffsetSec.toFixed(2))}s`,
+              endOffset: `${Number(actClip.endOffsetSec.toFixed(2))}s`,
             },
           });
         }
@@ -4995,7 +6291,19 @@ Output a JSON object (or array of 1 Refinement object) with:
     ).toUpperCase();
     const refCls = String(matchingRef?.refinementClass || '').toUpperCase();
 
-    if (evtCls.includes('BOX_LABEL') || modelCls.includes('BOX_LABEL')) {
+    if (
+      evtCls.includes('BOX_LABEL') ||
+      modelCls.includes('BOX_LABEL') ||
+      evtCls.includes('INCUBATOR') ||
+      modelCls.includes('INCUBATOR') ||
+      refCls.includes('INCUBATOR') ||
+      Boolean(
+        evt?.incubatorSettings ||
+          matchingRef?.incubatorSettings ||
+          matchingRef?.incubateCellsData ||
+          matchingModelLabel?.incubatorSettings
+      )
+    ) {
       return false;
     }
     if (evtCls.includes('REAGENT_LABEL') || modelCls.includes('REAGENT_LABEL')) {
@@ -5072,9 +6380,21 @@ Output a JSON object (or array of 1 Refinement object) with:
     const matchingModelLabel = modelLabelTranscriptions.find((l) => l.eventId === evt.eventId);
 
     const clsUpper = String(evt.eventClass || '').toUpperCase();
-    const isReagentLabel = isReagentLabelPresentation(evt, matchingRef, matchingModelLabel);
+    const isIncubatorSettings =
+      clsUpper.includes('INCUBATOR') ||
+      String(matchingRef?.refinementClass || '').toUpperCase().includes('INCUBATOR') ||
+      Boolean(
+        evt.incubatorSettings ||
+          evt.temperature ||
+          evt.co2Level ||
+          matchingRef?.incubatorSettings ||
+          matchingRef?.incubateCellsData ||
+          matchingModelLabel?.incubatorSettings
+      );
+    const isReagentLabel =
+      !isIncubatorSettings && isReagentLabelPresentation(evt, matchingRef, matchingModelLabel);
 
-    if (!isReagentLabel && isVialLabelEventForRemovalOnly(evt)) {
+    if (!isReagentLabel && !isIncubatorSettings && isVialLabelEventForRemovalOnly(evt)) {
       delete evt.labelTranscription;
       delete evt.vialLabelData;
       delete evt.conflatedLabelText;
@@ -5083,10 +6403,11 @@ Output a JSON object (or array of 1 Refinement object) with:
       continue;
     }
 
-    // In EXPERIMENT_NOTEBOOK_WORKFLOW, skip non-label state/audio/seeding events unless they explicitly carry label data
+    // In EXPERIMENT_NOTEBOOK_WORKFLOW, skip non-label state/audio/seeding events unless they explicitly carry label or incubator settings data
     if (
       classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
       !isReagentLabel &&
+      !isIncubatorSettings &&
       !clsUpper.includes('LABEL') &&
       !matchingModelLabel &&
       !evt.vialLabelData &&
@@ -5107,6 +6428,121 @@ Output a JSON object (or array of 1 Refinement object) with:
           .map((a) => a.actionId),
       ])
     ).filter(Boolean);
+
+    if (isIncubatorSettings) {
+      const rawIncubatorExplicit: Record<string, any> = {
+        ...(evt.incubatorSettings || {}),
+        ...(evt.temperature ? { temperature: evt.temperature } : {}),
+        ...(evt.co2Level ? { co2Level: evt.co2Level } : {}),
+        ...(matchingRef || {}),
+        ...(matchingRef?.incubatorSettings || {}),
+        ...(matchingRef?.incubateCellsData || {}),
+        ...(matchingModelLabel || {}),
+        ...(matchingModelLabel?.incubatorSettings || {}),
+      };
+
+      const shot1Raw =
+        rawIncubatorExplicit.frame1Text ||
+        rawIncubatorExplicit.highestContrastShotText ||
+        rawIncubatorExplicit.highestContrastText ||
+        evt.highestContrastText ||
+        '';
+      const shot2Raw =
+        rawIncubatorExplicit.frame2Text ||
+        rawIncubatorExplicit.minimalBlurShotText ||
+        rawIncubatorExplicit.minimalBlurText ||
+        evt.minimalBlurText ||
+        '';
+      const conflatedShots =
+        shot1Raw || shot2Raw ? conflateTwoShotLabelText(shot1Raw, shot2Raw) : '';
+
+      const rawPanelTextSource =
+        rawIncubatorExplicit.rawPanelText ||
+        rawIncubatorExplicit.fullText ||
+        rawIncubatorExplicit.conflatedText ||
+        rawIncubatorExplicit.conflatedLabelText ||
+        rawIncubatorExplicit.transcriptionText ||
+        conflatedShots ||
+        evt.conflatedLabelText ||
+        evt.description ||
+        evt.spokenContext ||
+        '';
+
+      const parsedIncubator = IncubateCellsActionDataSchema.parse(
+        parseIncubatorSettingsFields(rawPanelTextSource, rawIncubatorExplicit)
+      );
+
+      const resolvedFullText =
+        rawPanelTextSource ||
+        parsedIncubator.rawPanelText ||
+        [
+          parsedIncubator.temperature !== 'N/A' ? `Temperature: ${parsedIncubator.temperature}` : '',
+          parsedIncubator.co2Level !== 'N/A' ? `CO2: ${parsedIncubator.co2Level}` : '',
+        ]
+          .filter(Boolean)
+          .join(' | ') ||
+        'N/A';
+
+      parsedIncubator.rawPanelText = resolvedFullText;
+      const shot1Text = shot1Raw || resolvedFullText;
+      const shot2Text = shot2Raw || resolvedFullText;
+
+      const frameTranscriptions = [
+        {
+          frameType: 'HIGHEST_CONTRAST',
+          timestampSeconds: evtSum?.twoBestShots?.[0]?.timestampSeconds ?? 0,
+          gcsUri: evtSum?.twoBestShots?.[0]?.uri || '',
+          url: evt.highestContrastFrame?.url || evt.bestFrames?.[0]?.url || evt.bestShotUrls?.[0] || '',
+          text: shot1Text,
+        },
+        {
+          frameType: 'MINIMAL_BLUR',
+          timestampSeconds: evtSum?.twoBestShots?.[1]?.timestampSeconds ?? 0,
+          gcsUri: evtSum?.twoBestShots?.[1]?.uri || '',
+          url:
+            evt.minimalBlurFrame?.url ||
+            evt.bestFrames?.[1]?.url ||
+            evt.bestShotUrls?.[1] ||
+            evt.bestShotUrls?.[0] ||
+            '',
+          text: shot2Text,
+        },
+      ];
+
+      const record = LabelTranscriptionRecordSchema.parse({
+        eventId: evt.eventId,
+        eventClass: 'INCUBATOR_SETTINGS',
+        actionIds: rawAssociatedActionIds,
+        isVialLabel: false,
+        isReagentLabel: false,
+        cellLineName: '',
+        fullText: resolvedFullText,
+        frame1Text: shot1Text,
+        frame2Text: shot2Text,
+        highestContrastShotText: shot1Text,
+        minimalBlurShotText: shot2Text,
+        conflatedText: resolvedFullText,
+        incubatorSettings: parsedIncubator,
+        temperature: parsedIncubator.temperature,
+        co2Level: parsedIncubator.co2Level,
+        frameTranscriptions,
+        conflatedAt: new Date().toISOString(),
+      });
+
+      delete evt.vialLabelData;
+      delete evt.labelTranscription;
+      evt.eventClass = 'INCUBATOR_SETTINGS';
+      evt.incubatorSettings = parsedIncubator;
+      evt.temperature = parsedIncubator.temperature;
+      evt.co2Level = parsedIncubator.co2Level;
+      evt.conflatedLabelText = record.fullText;
+      evt.highestContrastText = shot1Text;
+      evt.minimalBlurText = shot2Text;
+
+      labelTranscriptions.push(record);
+      eventIdToLabelRecord.set(evt.eventId, record);
+      continue;
+    }
 
     if (isReagentLabel) {
       const rawReagentExplicit: Record<string, any> = {
@@ -5410,7 +6846,11 @@ Output a JSON object (or array of 1 Refinement object) with:
       classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
       actTypeUpper.includes('SEED') ||
       actTypeUpper.includes('MIX') ||
-      actTypeUpper.includes('PREPAR');
+      actTypeUpper.includes('PREPAR') ||
+      actTypeUpper.includes('HEMOCYTOMETER') ||
+      actTypeUpper.includes('INCUBAT') ||
+      actTypeUpper.includes('ASPIRAT') ||
+      actTypeUpper.includes('ASPRIRAT');
 
     // Cryo-box well locations (A1-I9, origin top-left black corner) only apply to cryo-box vial inventory actions,
     // never to 96-well plate seeding or experiment archive notebook actions.
@@ -5616,7 +7056,11 @@ Output a JSON object (or array of 1 Refinement object) with:
       classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
       actTypeUpper.includes('SEED') ||
       actTypeUpper.includes('MIX') ||
-      actTypeUpper.includes('PREPAR');
+      actTypeUpper.includes('PREPAR') ||
+      actTypeUpper.includes('HEMOCYTOMETER') ||
+      actTypeUpper.includes('INCUBAT') ||
+      actTypeUpper.includes('ASPIRAT') ||
+      actTypeUpper.includes('ASPRIRAT');
 
     if (isArchiveAct) {
       delete act.boxWellLocation;
@@ -5734,12 +7178,33 @@ Output a JSON object (or array of 1 Refinement object) with:
         r.vialLabelData?.fullText ||
         r.reagentData?.rawLabelText;
 
-    const isReagentRef = Boolean(
-      labelRec?.isReagentLabel ||
-        r.reagentData ||
-        (r.reagentName && !r.vialLabelData && !r.cellLineName) ||
-        isLikelyReagentBottleLabelText(rawText)
+    const isIncubatorRef = Boolean(
+      String(labelRec?.eventClass || '').toUpperCase().includes('INCUBATOR') ||
+        String(r.refinementClass || '').toUpperCase().includes('INCUBATOR') ||
+        r.incubatorSettings ||
+        r.incubateCellsData ||
+        labelRec?.incubatorSettings
     );
+
+    const isReagentRef =
+      !isIncubatorRef &&
+      Boolean(
+        labelRec?.isReagentLabel ||
+          r.reagentData ||
+          (r.reagentName && !r.vialLabelData && !r.cellLineName) ||
+          isLikelyReagentBottleLabelText(rawText)
+      );
+
+    const parsedIncubatorData = isIncubatorRef
+      ? labelRec?.incubatorSettings ||
+        IncubateCellsActionDataSchema.parse(
+          parseIncubatorSettingsFields(rawText, {
+            ...r,
+            ...(r.incubatorSettings || {}),
+            ...(r.incubateCellsData || {}),
+          })
+        )
+      : undefined;
 
     const parsedReagentData = isReagentRef
       ? labelRec?.reagentData ||
@@ -5760,7 +7225,7 @@ Output a JSON object (or array of 1 Refinement object) with:
           fullText: '',
           ...(wellLoc?.boxId ? { boxId: wellLoc.boxId } : {}),
         }
-      : isReagentRef
+      : isReagentRef || isIncubatorRef
       ? undefined
       : r.vialLabelData
       ? parseVialLabelFields(rawText, r.vialLabelData)
@@ -5802,7 +7267,7 @@ Output a JSON object (or array of 1 Refinement object) with:
             : undefined);
 
     const sanitizedRef = { ...r };
-    if (isReagentRef) {
+    if (isReagentRef || isIncubatorRef) {
       delete sanitizedRef.vialLabelData;
       delete sanitizedRef.cellLineName;
       delete sanitizedRef.userInitials;
@@ -5820,6 +7285,9 @@ Output a JSON object (or array of 1 Refinement object) with:
       ...(labelRec?.actionIds && labelRec.actionIds.length > 0 ? { actionIds: labelRec.actionIds } : {}),
       ...(parsedLabel ? { vialLabelData: parsedLabel } : {}),
       ...(parsedReagentData ? { reagentData: parsedReagentData } : {}),
+      ...(parsedIncubatorData
+        ? { incubatorSettings: parsedIncubatorData, incubateCellsData: parsedIncubatorData }
+        : {}),
       ...(isRemovalRef
         ? { transcriptionText: '' }
         : !r.transcriptionText && (labelRec?.fullText || parsedLabel?.fullText || parsedReagentData?.rawLabelText)
@@ -5848,7 +7316,12 @@ Output a JSON object (or array of 1 Refinement object) with:
         actionIds: labelRec.actionIds,
         refinementClass: 'OCR_CONFLATION',
         transcriptionText: labelRec.fullText,
-        ...(labelRec.isReagentLabel && labelRec.reagentData
+        ...(labelRec.incubatorSettings
+          ? {
+              incubatorSettings: labelRec.incubatorSettings,
+              incubateCellsData: labelRec.incubatorSettings,
+            }
+          : labelRec.isReagentLabel && labelRec.reagentData
           ? {
               reagentData: labelRec.reagentData,
             }
@@ -6102,10 +7575,46 @@ Output a JSON object (or array of 1 Refinement object) with:
         );
         const actRef = enrichedRefinementsInput.find((r) => r.actionId === act.actionId);
 
+        const actTypeClassUpper = String(act.actionType || act.actionClass || '').toUpperCase();
         const isMix =
           act.actionClass === 'REAGENT_MIXING_ACTION' ||
-          String(act.actionType || '').toUpperCase().includes('MIX') ||
+          actTypeClassUpper.includes('MIX') ||
           Boolean(act.mixReagentsData || actRef?.mixReagentsData);
+        const isIncubate =
+          !isMix &&
+          (act.actionClass === 'INCUBATE_CELLS' ||
+            act.actionClass === 'INCUBATE_CELLS_ACTION' ||
+            actTypeClassUpper.includes('INCUBAT') ||
+            Boolean(
+              act.incubateCellsData ||
+                act.incubatorSettings ||
+                actRef?.incubateCellsData ||
+                actRef?.incubatorSettings
+            ));
+        const isAspirate =
+          !isMix &&
+          !isIncubate &&
+          (act.actionClass === 'ASPIRATE_MEDIA' ||
+            act.actionClass === 'ASPRIRATE_MEDIA' ||
+            act.actionClass === 'ASPIRATE_MEDIA_ACTION' ||
+            act.actionClass === 'ASPRIRATE_MEDIA_ACTION' ||
+            /ASPIRAT|ASPRIRAT/i.test(actTypeClassUpper));
+        const isHemocytometerLoading =
+          !isMix &&
+          !isIncubate &&
+          !isAspirate &&
+          (act.actionClass === 'HEMOCYTOMETER_LOADING' ||
+            act.actionClass === 'HEMOCYTOMETER_LOADING_ACTION' ||
+            act.actionClass === 'hemocytometer_loading' ||
+            actTypeClassUpper.includes('HEMOCYTOMETER') ||
+            Boolean(
+              act.hemocytometerLoadingData ||
+                act.hemocytometerLoad ||
+                act.substanceLoaded ||
+                actRef?.hemocytometerLoadingData ||
+                actRef?.hemocytometerLoad ||
+                actRef?.substanceLoaded
+            ));
 
         if (isMix) {
           act.actionClass = 'REAGENT_MIXING_ACTION';
@@ -6244,6 +7753,199 @@ Output a JSON object (or array of 1 Refinement object) with:
               startTime: typeof act.startTime === 'number' ? formatSecondsToTimeString(act.startTime) : act.startTime,
               endTime: typeof act.endTime === 'number' ? formatSecondsToTimeString(act.endTime) : act.endTime,
               mixReagentsData: mixData,
+            })
+          );
+        } else if (isIncubate) {
+          act.actionClass =
+            act.actionClass === 'INCUBATE_CELLS_ACTION' ? 'INCUBATE_CELLS_ACTION' : 'INCUBATE_CELLS';
+          act.actionType = act.actionType || 'INCUBATE_CELLS';
+
+          const incubatorEvts = actEvents.filter(
+            (e) =>
+              String(e.eventClass || '').toUpperCase().includes('INCUBATOR') ||
+              Boolean(e.incubatorSettings || e.temperature || e.co2Level)
+          );
+          const fallbackIncubatorEvts =
+            incubatorEvts.length > 0
+              ? incubatorEvts
+              : allContextEvents.filter(
+                  (e) =>
+                    String(e.eventClass || '').toUpperCase().includes('INCUBATOR') ||
+                    Boolean(e.incubatorSettings || e.temperature || e.co2Level)
+                );
+          const primaryIncEvt = fallbackIncubatorEvts[0];
+
+          const combinedPanelText = [
+            primaryIncEvt?.conflatedLabelText,
+            primaryIncEvt?.incubatorSettings?.rawPanelText,
+            primaryIncEvt?.description,
+            primaryIncEvt?.spokenContext,
+            actRef?.transcriptionText,
+            actRef?.incubatorSettings?.rawPanelText,
+            actRef?.incubateCellsData?.rawPanelText,
+            act.description,
+            ...globalAudioEvents.map((e) => e.description || ''),
+            classification?.transcribedAudio,
+          ]
+            .filter(Boolean)
+            .join(' ');
+
+          const explicitIncubate = {
+            ...(act.incubateCellsData || {}),
+            ...(act.incubatorSettings || {}),
+            ...(primaryIncEvt?.incubatorSettings || {}),
+            ...(primaryIncEvt?.temperature ? { temperature: primaryIncEvt.temperature } : {}),
+            ...(primaryIncEvt?.co2Level ? { co2Level: primaryIncEvt.co2Level } : {}),
+            ...(actRef?.incubateCellsData || {}),
+            ...(actRef?.incubatorSettings || {}),
+          };
+
+          const incubateData: IncubateCellsActionData = parseIncubatorSettingsFields(
+            combinedPanelText,
+            explicitIncubate
+          );
+
+          act.incubateCellsData = incubateData;
+          act.incubatorSettings = incubateData;
+          if (actRef) {
+            actRef.incubateCellsData = incubateData;
+            actRef.incubatorSettings = incubateData;
+          }
+
+          archiveWorkSteps.push(
+            ArchiveWorkStepSchema.parse({
+              id: `step_${act.actionId}`,
+              stepNumber: idx + 1,
+              actionType: 'INCUBATE_CELLS',
+              actionId: act.actionId,
+              description: toActiveVoiceDescription(
+                act.description ||
+                  `Inserting cell container into incubator (Temperature: ${incubateData.temperature}, CO2 Level: ${incubateData.co2Level}).`
+              ),
+              startTime: typeof act.startTime === 'number' ? formatSecondsToTimeString(act.startTime) : act.startTime,
+              endTime: typeof act.endTime === 'number' ? formatSecondsToTimeString(act.endTime) : act.endTime,
+              incubateCellsData: incubateData,
+              incubatorSettings: incubateData,
+            })
+          );
+        } else if (isAspirate) {
+          const aspirateActionType = actTypeClassUpper.includes('ASPRIRAT')
+            ? 'ASPRIRATE_MEDIA'
+            : 'ASPIRATE_MEDIA';
+          act.actionClass = aspirateActionType as any;
+          act.actionType = aspirateActionType;
+
+          archiveWorkSteps.push(
+            ArchiveWorkStepSchema.parse({
+              id: `step_${act.actionId}`,
+              stepNumber: idx + 1,
+              actionType: aspirateActionType,
+              actionId: act.actionId,
+              description: toActiveVoiceDescription(
+                act.description || 'Aspirating media from container using pipette'
+              ),
+              startTime: typeof act.startTime === 'number' ? formatSecondsToTimeString(act.startTime) : act.startTime,
+              endTime: typeof act.endTime === 'number' ? formatSecondsToTimeString(act.endTime) : act.endTime,
+            })
+          );
+        } else if (isHemocytometerLoading) {
+          act.actionClass =
+            act.actionClass === 'HEMOCYTOMETER_LOADING_ACTION'
+              ? 'HEMOCYTOMETER_LOADING_ACTION'
+              : act.actionClass === 'hemocytometer_loading'
+              ? 'hemocytometer_loading'
+              : 'HEMOCYTOMETER_LOADING';
+          act.actionType = act.actionType || 'HEMOCYTOMETER_LOADING';
+
+          const hemoEvts = actEvents.filter(
+            (e) =>
+              String(e.eventClass || '').toUpperCase().includes('HEMOCYTOMETER') ||
+              Boolean(e.hemocytometerLoadingData || e.hemocytometerLoad || e.substanceLoaded)
+          );
+          const fallbackHemoEvts =
+            hemoEvts.length > 0
+              ? hemoEvts
+              : allContextEvents.filter(
+                  (e) =>
+                    String(e.eventClass || '').toUpperCase().includes('HEMOCYTOMETER') ||
+                    Boolean(e.hemocytometerLoadingData || e.hemocytometerLoad || e.substanceLoaded)
+                );
+          const primaryHemoEvt = fallbackHemoEvts[0];
+
+          const combinedHemoText = [
+            primaryHemoEvt?.substanceLoaded,
+            primaryHemoEvt?.hemocytometerLoad?.substanceLoaded,
+            primaryHemoEvt?.hemocytometerLoadingData?.substanceLoaded,
+            primaryHemoEvt?.conflatedLabelText,
+            primaryHemoEvt?.description,
+            primaryHemoEvt?.spokenContext,
+            actRef?.substanceLoaded,
+            actRef?.hemocytometerLoad?.substanceLoaded,
+            actRef?.hemocytometerLoadingData?.substanceLoaded,
+            actRef?.transcriptionText,
+            act.description,
+            ...globalAudioEvents.map((e) => e.description || ''),
+            classification?.transcribedAudio,
+          ]
+            .filter(Boolean)
+            .join(' ');
+
+          const explicitSubstance =
+            actRef?.hemocytometerLoadingData?.substanceLoaded ||
+            actRef?.hemocytometerLoad?.substanceLoaded ||
+            actRef?.substanceLoaded ||
+            act.hemocytometerLoadingData?.substanceLoaded ||
+            act.hemocytometerLoad?.substanceLoaded ||
+            act.substanceLoaded ||
+            primaryHemoEvt?.hemocytometerLoadingData?.substanceLoaded ||
+            primaryHemoEvt?.hemocytometerLoad?.substanceLoaded ||
+            primaryHemoEvt?.substanceLoaded;
+
+          const resolvedSubstance =
+            explicitSubstance && explicitSubstance !== 'N/A'
+              ? resolveReagentDisplayName(explicitSubstance)
+              : undefined;
+
+          const hemoData: HemocytometerLoadingActionData = parseHemocytometerLoadingFields(
+            combinedHemoText,
+            {
+              substanceLoaded: resolvedSubstance || explicitSubstance,
+            }
+          );
+
+          act.hemocytometerLoadingData = hemoData;
+          act.hemocytometerLoad = hemoData;
+          act.substanceLoaded = hemoData.substanceLoaded;
+          if (actRef) {
+            actRef.hemocytometerLoadingData = hemoData;
+            actRef.hemocytometerLoad = hemoData;
+            actRef.substanceLoaded = hemoData.substanceLoaded;
+          }
+          if (primaryHemoEvt) {
+            primaryHemoEvt.hemocytometerLoadingData = hemoData;
+            primaryHemoEvt.hemocytometerLoad = hemoData;
+            primaryHemoEvt.substanceLoaded = hemoData.substanceLoaded;
+          }
+
+          archiveWorkSteps.push(
+            ArchiveWorkStepSchema.parse({
+              id: `step_${act.actionId}`,
+              stepNumber: idx + 1,
+              actionType: 'HEMOCYTOMETER_LOADING',
+              actionId: act.actionId,
+              description: toActiveVoiceDescription(
+                act.description ||
+                  `Loading cells into the two squares of the hemocytometer slide${
+                    hemoData.substanceLoaded && hemoData.substanceLoaded !== 'N/A'
+                      ? ` (Substance Loaded: ${hemoData.substanceLoaded})`
+                      : ''
+                  }.`
+              ),
+              startTime: typeof act.startTime === 'number' ? formatSecondsToTimeString(act.startTime) : act.startTime,
+              endTime: typeof act.endTime === 'number' ? formatSecondsToTimeString(act.endTime) : act.endTime,
+              hemocytometerLoadingData: hemoData,
+              hemocytometerLoad: hemoData,
+              substanceLoaded: hemoData.substanceLoaded,
             })
           );
         } else {

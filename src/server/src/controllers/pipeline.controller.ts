@@ -69,15 +69,34 @@ export async function reconcileVideoInventoryAssociation(
 
     let matchedDoc: any = null;
     if (snapshot && !snapshot.empty && Array.isArray(snapshot.docs)) {
+      let videoOrgId: string | undefined;
+      try {
+        const vidMeta =
+          (await getVideoMetadata(databaseId, videoId)) ||
+          (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null);
+        if (vidMeta && typeof (vidMeta as any).organizationId === 'string' && (vidMeta as any).organizationId.trim()) {
+          videoOrgId = (vidMeta as any).organizationId.trim();
+        }
+      } catch {
+        // ignore
+      }
+      const orgScopedDocs = videoOrgId
+        ? snapshot.docs.filter((d: any) => {
+            const docOrg = d.data()?.organizationId;
+            return !docOrg || docOrg === videoOrgId;
+          })
+        : snapshot.docs;
+      const candidateDocs = orgScopedDocs.length > 0 ? orgScopedDocs : snapshot.docs;
+
       // 1. Exact match on name.trim().toLowerCase()
-      matchedDoc = snapshot.docs.find((d: any) => {
+      matchedDoc = candidateDocs.find((d: any) => {
         const invName = d.data()?.name;
         return typeof invName === 'string' && invName.trim().toLowerCase() === rawTargetName;
       });
 
       // 2. Fuzzy match if exact match not found
       if (!matchedDoc) {
-        matchedDoc = snapshot.docs.find((d: any) => {
+        matchedDoc = candidateDocs.find((d: any) => {
           const invName = d.data()?.name;
           if (typeof invName !== 'string') return false;
           const lower = invName.trim().toLowerCase();
@@ -178,6 +197,7 @@ export async function reconcileVideoArchiveAssociation(
   unmatchedArchiveName?: string | null;
   archiveCreatorName?: string | null;
   archiveCreationDate?: string | null;
+  archivePurpose?: string | null;
   archiveIntent?: 'CREATE' | 'APPEND' | null;
   archiveAssociationType?: 'AUTOMATIC' | 'UNMATCHED' | 'PENDING_CONFIRMATION';
 }> {
@@ -192,6 +212,7 @@ export async function reconcileVideoArchiveAssociation(
   const targetArchiveName = (normalizedCopy.archiveName || '').trim() || 'Untitled Experiment Archive';
   const creatorName: string | null = normalizedCopy.creatorName || null;
   const creationDate: string | null = normalizedCopy.creationDate || null;
+  const purpose: string | null = normalizedCopy.purpose || null;
   const archiveIntent: 'CREATE' | 'APPEND' =
     normalizedCopy.archiveIntent === 'APPEND' || normalizedCopy.isAppending === true
       ? 'APPEND'
@@ -201,6 +222,7 @@ export async function reconcileVideoArchiveAssociation(
   classification.archiveName = targetArchiveName;
   classification.creatorName = creatorName;
   classification.creationDate = creationDate;
+  classification.purpose = purpose;
   classification.archiveIntent = archiveIntent;
   classification.isAppending = archiveIntent === 'APPEND';
 
@@ -237,8 +259,27 @@ export async function reconcileVideoArchiveAssociation(
     Array.isArray(snapshot.docs) &&
     (archiveIntent === 'APPEND' || !hasExplicitCreateSpeech)
   ) {
+    let videoOrgId: string | undefined;
+    try {
+      const vidMeta =
+        (await getVideoMetadata(databaseId, videoId)) ||
+        (databaseId !== '(default)' ? await getVideoMetadata('(default)', videoId) : null);
+      if (vidMeta && typeof (vidMeta as any).organizationId === 'string' && (vidMeta as any).organizationId.trim()) {
+        videoOrgId = (vidMeta as any).organizationId.trim();
+      }
+    } catch {
+      // ignore
+    }
+    const orgScopedDocs = videoOrgId
+      ? snapshot.docs.filter((d: any) => {
+          const docOrg = d.data()?.organizationId;
+          return !docOrg || docOrg === videoOrgId;
+        })
+      : snapshot.docs;
+    const candidateDocs = orgScopedDocs.length > 0 ? orgScopedDocs : snapshot.docs;
+
     // 1. Exact case-insensitive, alphanumeric-normalized, or core-name match
-    matchedDoc = snapshot.docs.find((d: any) => {
+    matchedDoc = candidateDocs.find((d: any) => {
       if (archiveIntent === 'CREATE' && d.id === 'demo-archive-01') {
         return false;
       }
@@ -256,7 +297,7 @@ export async function reconcileVideoArchiveAssociation(
 
     // 2. High-confidence fuzzy match if exact match not found (only when intent is APPEND)
     if (!matchedDoc && archiveIntent === 'APPEND' && normTarget.length >= 3) {
-      matchedDoc = snapshot.docs.find((d: any) => {
+      matchedDoc = candidateDocs.find((d: any) => {
         const data = d.data() || {};
         const candidateName = typeof data.name === 'string' ? data.name.trim() : '';
         if (!candidateName) return false;
@@ -294,12 +335,14 @@ export async function reconcileVideoArchiveAssociation(
     const matchedName = matchedData.name || matchedDoc.id;
     const resolvedCreator = matchedData.creatorName ?? creatorName ?? null;
     const resolvedDate = matchedData.creationDate ?? creationDate ?? null;
+    const resolvedPurpose = matchedData.purpose ?? purpose ?? null;
     const nowIso = new Date().toISOString();
 
     // Update classification in-memory so Pass 0 data carries the canonical existing archive name
     classification.archiveName = matchedName;
     classification.creatorName = resolvedCreator;
     classification.creationDate = resolvedDate;
+    classification.purpose = resolvedPurpose;
     classification.archiveIntent = 'APPEND';
     classification.isAppending = true;
     if (
@@ -311,12 +354,16 @@ export async function reconcileVideoArchiveAssociation(
       classification.identificationEvent.description =
         classification.identificationEvent.description.replace(targetArchiveName, matchedName);
     }
+    if (classification.identificationEvent && resolvedPurpose) {
+      classification.identificationEvent.purpose = resolvedPurpose;
+    }
 
     const updatePayload = {
       archiveId: matchedDoc.id,
       archiveName: matchedName,
       archiveCreatorName: resolvedCreator,
       archiveCreationDate: resolvedDate,
+      archivePurpose: resolvedPurpose,
       archiveIntent: 'APPEND' as const,
       unmatchedArchiveName: null,
       archiveAssociationType: 'AUTOMATIC' as const,
@@ -341,6 +388,7 @@ export async function reconcileVideoArchiveAssociation(
             archiveName: matchedName,
             creatorName: resolvedCreator,
             creationDate: resolvedDate,
+            purpose: resolvedPurpose,
             archiveIntent: 'APPEND',
             isAppending: true,
           },
@@ -379,6 +427,7 @@ export async function reconcileVideoArchiveAssociation(
       archiveName: matchedName,
       archiveCreatorName: resolvedCreator,
       archiveCreationDate: resolvedDate,
+      archivePurpose: resolvedPurpose,
       archiveIntent: 'APPEND',
       archiveAssociationType: 'AUTOMATIC',
     };
@@ -391,6 +440,7 @@ export async function reconcileVideoArchiveAssociation(
       unmatchedArchiveName: targetArchiveName,
       archiveCreatorName: creatorName,
       archiveCreationDate: creationDate,
+      archivePurpose: purpose,
       archiveIntent: 'CREATE' as const,
       archiveAssociationType: 'PENDING_CONFIRMATION' as const,
       associatedAt: null,
@@ -405,6 +455,7 @@ export async function reconcileVideoArchiveAssociation(
       unmatchedArchiveName: targetArchiveName,
       archiveCreatorName: creatorName,
       archiveCreationDate: creationDate,
+      archivePurpose: purpose,
       archiveIntent: 'CREATE',
       archiveAssociationType: 'PENDING_CONFIRMATION',
     };
@@ -416,6 +467,7 @@ export async function reconcileVideoArchiveAssociation(
     unmatchedArchiveName: targetArchiveName,
     archiveCreatorName: creatorName,
     archiveCreationDate: creationDate,
+    archivePurpose: purpose,
     archiveIntent: 'APPEND' as const,
     archiveAssociationType: 'UNMATCHED' as const,
     associatedAt: null,
@@ -430,6 +482,7 @@ export async function reconcileVideoArchiveAssociation(
     unmatchedArchiveName: targetArchiveName,
     archiveCreatorName: creatorName,
     archiveCreationDate: creationDate,
+    archivePurpose: purpose,
     archiveIntent: 'APPEND',
     archiveAssociationType: 'UNMATCHED',
   };
@@ -823,6 +876,9 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         if (latestMeta.archiveCreationDate !== undefined && latestMeta.archiveCreationDate !== null) {
           cls.creationDate = latestMeta.archiveCreationDate;
         }
+        if ((latestMeta as any).archivePurpose !== undefined && (latestMeta as any).archivePurpose !== null) {
+          cls.purpose = (latestMeta as any).archivePurpose;
+        }
       }
       return cls;
     };
@@ -1052,6 +1108,9 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
         ...(latestVideoMetaPass2?.archiveCreationDate
           ? { creationDate: latestVideoMetaPass2.archiveCreationDate }
           : {}),
+        ...((latestVideoMetaPass2 as any)?.archivePurpose || classification.purpose
+          ? { purpose: (latestVideoMetaPass2 as any)?.archivePurpose || classification.purpose }
+          : {}),
         ...(latestVideoMetaPass2?.inventoryId ? { inventoryId: latestVideoMetaPass2.inventoryId } : {}),
         workloadClassification: classification,
         workflowClassification: classification,
@@ -1236,6 +1295,9 @@ export async function analyzePassHandler(req: Request, res: Response): Promise<R
           : {}),
         ...(latestVideoMetaPass3?.archiveCreationDate
           ? { creationDate: latestVideoMetaPass3.archiveCreationDate }
+          : {}),
+        ...((latestVideoMetaPass3 as any)?.archivePurpose || classification.purpose
+          ? { purpose: (latestVideoMetaPass3 as any)?.archivePurpose || classification.purpose }
           : {}),
         ...(latestVideoMetaPass3?.inventoryId ? { inventoryId: latestVideoMetaPass3.inventoryId } : {}),
         workloadClassification: classification,
@@ -1527,6 +1589,7 @@ export async function archiveSignOffHandler(req: Request, res: Response): Promis
     archiveName,
     creatorName,
     creationDate,
+    purpose,
     operatorInitials,
     signedOffAt,
     replaceArchiveContent,
@@ -1559,6 +1622,7 @@ export async function archiveSignOffHandler(req: Request, res: Response): Promis
       archiveName,
       creatorName,
       creationDate,
+      purpose,
       operatorInitials,
       signedOffAt,
       replaceArchiveContent,
@@ -1626,12 +1690,19 @@ export async function getVideoAnalysisHandler(req: Request, res: Response): Prom
     const authoritativeArchiveName = videoMeta?.archiveName || analysis.archiveName;
     const authoritativeCreatorName = videoMeta?.archiveCreatorName || analysis.creatorName;
     const authoritativeCreationDate = videoMeta?.archiveCreationDate || analysis.creationDate;
+    const authoritativePurpose =
+      (videoMeta as any)?.archivePurpose ||
+      analysis.purpose ||
+      analysis.archivePurpose ||
+      analysis.workflowClassification?.purpose ||
+      analysis.workloadClassification?.purpose;
     const workflowClassification = analysis.workflowClassification
       ? {
           ...analysis.workflowClassification,
           ...(authoritativeArchiveName ? { archiveName: authoritativeArchiveName } : {}),
           ...(authoritativeCreatorName ? { creatorName: authoritativeCreatorName } : {}),
           ...(authoritativeCreationDate ? { creationDate: authoritativeCreationDate } : {}),
+          ...(authoritativePurpose !== undefined ? { purpose: authoritativePurpose } : {}),
         }
       : undefined;
     const workloadClassification = analysis.workloadClassification
@@ -1640,6 +1711,7 @@ export async function getVideoAnalysisHandler(req: Request, res: Response): Prom
           ...(authoritativeArchiveName ? { archiveName: authoritativeArchiveName } : {}),
           ...(authoritativeCreatorName ? { creatorName: authoritativeCreatorName } : {}),
           ...(authoritativeCreationDate ? { creationDate: authoritativeCreationDate } : {}),
+          ...(authoritativePurpose !== undefined ? { purpose: authoritativePurpose } : {}),
         }
       : undefined;
     return res.status(200).json({
@@ -1649,6 +1721,7 @@ export async function getVideoAnalysisHandler(req: Request, res: Response): Prom
       ...(authoritativeArchiveName ? { archiveName: authoritativeArchiveName } : {}),
       ...(authoritativeCreatorName ? { creatorName: authoritativeCreatorName } : {}),
       ...(authoritativeCreationDate ? { creationDate: authoritativeCreationDate } : {}),
+      ...(authoritativePurpose !== undefined ? { purpose: authoritativePurpose } : {}),
       ...(videoMeta?.inventoryId ? { inventoryId: videoMeta.inventoryId } : {}),
       ...(workflowClassification ? { workflowClassification } : {}),
       ...(workloadClassification ? { workloadClassification } : {}),

@@ -24,6 +24,8 @@ import {
   render96WellPlateMarkdown,
   generateReagentAcronym,
   toActiveVoiceDescription,
+  parseIncubatorSettingsFields,
+  parseHemocytometerLoadingFields,
   DEFAULT_VIDEO_PASSES,
 } from '@sail/shared';
 import { auth } from '../firebase';
@@ -765,6 +767,7 @@ export class ApiService {
       name?: string;
       creatorName?: string | null;
       creationDate?: string | null;
+      purpose?: string | null;
     }
   ): Promise<ArchiveRecord | null> {
     const rawDbId = options?.databaseId || this.tenant.databaseId || '(default)';
@@ -785,6 +788,7 @@ export class ApiService {
         ...(options?.name ? { name: options.name } : {}),
         ...(options?.creatorName !== undefined ? { creatorName: options.creatorName } : {}),
         ...(options?.creationDate !== undefined ? { creationDate: options.creationDate } : {}),
+        ...(options?.purpose !== undefined ? { purpose: options.purpose } : {}),
       }),
     });
 
@@ -985,6 +989,7 @@ export class ApiService {
             const topArchiveName = (passesRes as any)?.archiveName || undefined;
             const topCreatorName = (passesRes as any)?.archiveCreatorName || undefined;
             const topCreationDate = (passesRes as any)?.archiveCreationDate || undefined;
+            const topPurpose = (passesRes as any)?.archivePurpose || (passesRes as any)?.purpose || undefined;
             const rawClassification = p.pass0?.data || {
               workflowType: 'INVENTORY_UPDATE_WORKFLOW',
               transcribedAudio: '',
@@ -995,6 +1000,7 @@ export class ApiService {
                   archiveName: topArchiveName,
                   ...(topCreatorName ? { creatorName: topCreatorName } : {}),
                   ...(topCreationDate ? { creationDate: topCreationDate } : {}),
+                  ...(topPurpose ? { purpose: topPurpose } : {}),
                 }
               : rawClassification;
             const rawPass1 = p.pass1?.data;
@@ -1042,6 +1048,7 @@ export class ApiService {
               ...(topArchiveName ? { archiveName: topArchiveName } : {}),
               ...(topCreatorName ? { creatorName: topCreatorName } : {}),
               ...(topCreationDate ? { creationDate: topCreationDate } : {}),
+              ...(topPurpose ? { purpose: topPurpose } : {}),
               workflowClassification: classification,
               workloadClassification: classification,
               actions,
@@ -1354,6 +1361,7 @@ export class ApiService {
       archiveName?: string;
       creatorName?: string | null;
       creationDate?: string | null;
+      purpose?: string | null;
       reagents?: ArchiveReagent[];
       labelTranscriptions?: string[];
       workSteps?: ArchiveWorkStep[];
@@ -1368,6 +1376,7 @@ export class ApiService {
       ...(notebookData?.archiveName ? { archiveName: notebookData.archiveName } : {}),
       ...(notebookData?.creatorName !== undefined ? { creatorName: notebookData.creatorName } : {}),
       ...(notebookData?.creationDate !== undefined ? { creationDate: notebookData.creationDate } : {}),
+      ...(notebookData?.purpose !== undefined ? { purpose: notebookData.purpose } : {}),
       ...(notebookData?.reagents ? { reagents: notebookData.reagents } : {}),
       ...(notebookData?.labelTranscriptions ? { labelTranscriptions: notebookData.labelTranscriptions } : {}),
       ...(notebookData?.workSteps ? { workSteps: notebookData.workSteps } : {}),
@@ -1505,6 +1514,7 @@ export const commitArchiveSignOff = (
     archiveName?: string;
     creatorName?: string | null;
     creationDate?: string | null;
+    purpose?: string | null;
     reagents?: ArchiveReagent[];
     labelTranscriptions?: string[];
     workSteps?: ArchiveWorkStep[];
@@ -1526,6 +1536,7 @@ export const emptyArchive = (
     name?: string;
     creatorName?: string | null;
     creationDate?: string | null;
+    purpose?: string | null;
   }
 ) => apiService.emptyArchive(id, options);
 
@@ -1549,6 +1560,7 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
   archiveName: string;
   creatorName: string;
   creationDate: string;
+  purpose: string;
   reagents: ArchiveReagent[];
   labelTranscriptions: string[];
   workSteps: ArchiveWorkStep[];
@@ -1560,6 +1572,7 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
       archiveName: 'Experiment Archive',
       creatorName: 'Lab Technician',
       creationDate: new Date().toISOString().split('T')[0],
+      purpose: '',
       reagents: [],
       labelTranscriptions: [],
       workSteps: [],
@@ -1594,6 +1607,16 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
     raw.archiveCreationDate ||
     classification.creationDate ||
     new Date().toISOString().split('T')[0];
+  const purpose =
+    typeof raw.purpose === 'string'
+      ? raw.purpose
+      : typeof raw.archivePurpose === 'string'
+      ? raw.archivePurpose
+      : typeof classification.purpose === 'string'
+      ? classification.purpose
+      : typeof classification.identificationEvent?.purpose === 'string'
+      ? classification.identificationEvent.purpose
+      : '';
 
   const rawReagentCandidates =
     Array.isArray(raw.reagents) && raw.reagents.length > 0
@@ -1753,8 +1776,12 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
   if (workSteps.length === 0 && actions.length > 0) {
     actions.forEach((act: Record<string, any>, idx: number) => {
       const cls = String(act.actionType || act.actionClass || '').toUpperCase();
-      if (!cls.includes('MIX') && !cls.includes('SEED')) return;
+      const isIncubate = cls.includes('INCUBAT');
+      const isAspirate = /ASPIRAT|ASPRIRAT/.test(cls);
+      const isHemocytometer = cls.includes('HEMOCYTOMETER');
       const isSeed = cls.includes('SEED');
+      const isMix = cls.includes('MIX');
+      if (!isMix && !isSeed && !isIncubate && !isAspirate && !isHemocytometer) return;
       const relatedEventIds: string[] = Array.isArray(act.eventList) ? act.eventList : [];
       const relatedEvents = events.filter((e: any) => relatedEventIds.includes(e.eventId));
       const relatedRefs = refinements.filter((r: any) => relatedEventIds.includes(r.eventId));
@@ -1775,8 +1802,71 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
 
       let mixReagentsData = act.mixReagentsData;
       let seedReagentsData = act.seedReagentsData;
+      let incubateCellsData = act.incubateCellsData || act.incubatorSettings;
+      let hemocytometerLoadingData = act.hemocytometerLoadingData || act.hemocytometerLoad;
 
-      if (!isSeed && !mixReagentsData) {
+      if (isIncubate) {
+        const incRef = relatedRefs.find(
+          (r: any) =>
+            r.incubatorSettings ||
+            r.incubateCellsData ||
+            String(r.eventClass || '').toUpperCase().includes('INCUBATOR_SETTINGS')
+        );
+        const incEvt = relatedEvents.find((e: any) =>
+          String(e.eventClass || e.actionType || '').toUpperCase().includes('INCUBATOR_SETTINGS')
+        );
+        const combinedText = [
+          act.description || '',
+          incEvt?.description || '',
+          incRef?.transcriptionText || '',
+        ]
+          .filter(Boolean)
+          .join(' ');
+        incubateCellsData = parseIncubatorSettingsFields(combinedText, {
+          temperature:
+            incubateCellsData?.temperature ||
+            incRef?.incubatorSettings?.temperature ||
+            incRef?.temperature ||
+            incEvt?.incubatorSettings?.temperature ||
+            incEvt?.temperature,
+          co2Level:
+            incubateCellsData?.co2Level ||
+            incRef?.incubatorSettings?.co2Level ||
+            incRef?.co2Level ||
+            incEvt?.incubatorSettings?.co2Level ||
+            incEvt?.co2Level,
+        });
+      } else if (isHemocytometer) {
+        const hemoRef = relatedRefs.find(
+          (r: any) =>
+            r.hemocytometerLoadingData ||
+            r.hemocytometerLoad ||
+            r.substanceLoaded ||
+            String(r.eventClass || '').toUpperCase().includes('HEMOCYTOMETER_LOAD')
+        );
+        const hemoEvt = relatedEvents.find((e: any) =>
+          String(e.eventClass || e.actionType || '').toUpperCase().includes('HEMOCYTOMETER_LOAD')
+        );
+        const combinedText = [
+          act.description || '',
+          hemoEvt?.description || '',
+          hemoRef?.transcriptionText || '',
+        ]
+          .filter(Boolean)
+          .join(' ');
+        hemocytometerLoadingData = parseHemocytometerLoadingFields(combinedText, {
+          substanceLoaded:
+            hemocytometerLoadingData?.substanceLoaded ||
+            act.substanceLoaded ||
+            hemoRef?.hemocytometerLoadingData?.substanceLoaded ||
+            hemoRef?.hemocytometerLoad?.substanceLoaded ||
+            hemoRef?.substanceLoaded ||
+            hemoEvt?.hemocytometerLoadingData?.substanceLoaded ||
+            hemoEvt?.hemocytometerLoad?.substanceLoaded ||
+            hemoEvt?.substanceLoaded ||
+            act.cellLineName,
+        });
+      } else if (isMix && !mixReagentsData) {
         const r1 = reagents[0];
         const r2 = reagents[1] || reagents[0];
         const refText = relatedRefs.map((r: any) => r.transcriptionText || '').join(' ');
@@ -1819,16 +1909,33 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
       }
 
       const stepNumber = workSteps.length + 1;
+      const resolvedActionType = isIncubate
+        ? 'INCUBATE_CELLS'
+        : isAspirate
+        ? cls === 'ASPRIRATE_MEDIA'
+          ? 'ASPRIRATE_MEDIA'
+          : 'ASPIRATE_MEDIA'
+        : isHemocytometer
+        ? 'HEMOCYTOMETER_LOADING'
+        : isSeed
+        ? 'SEED_REAGENTS'
+        : 'MIX_REAGENTS';
       workSteps.push({
         id: act.actionId || `step_${stepNumber}`,
         stepId: act.actionId || `step_${stepNumber}`,
         stepNumber,
-        actionType: isSeed ? 'SEED_REAGENTS' : 'MIX_REAGENTS',
+        actionType: resolvedActionType,
         startTimeSeconds,
         endTimeSeconds,
         description: toActiveVoiceDescription(
           act.description ||
-            (isSeed && seedReagentsData
+            (isIncubate
+              ? `Inserting cell container into incubator (Temperature: ${incubateCellsData?.temperature || 'N/A'}, CO2: ${incubateCellsData?.co2Level || 'N/A'}).`
+              : isAspirate
+              ? 'Aspirating media from container using pipette or aspirator.'
+              : isHemocytometer
+              ? `Loading cells into the two squares of the hemocytometer slide (Substance Loaded: ${hemocytometerLoadingData?.substanceLoaded || 'N/A'}).`
+              : isSeed && seedReagentsData
               ? `Seeding ${seedReagentsData.cellsSeeded} (${seedReagentsData.cellsPerWell}) into ${seedReagentsData.plateType}.`
               : mixReagentsData
               ? `Mixing ${mixReagentsData.firstReagentAmount} of ${mixReagentsData.firstReagentName} with ${mixReagentsData.secondReagentAmount} of ${mixReagentsData.secondReagentName}.`
@@ -1838,6 +1945,14 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
         ),
         ...(mixReagentsData ? { mixReagentsData } : {}),
         ...(seedReagentsData ? { seedReagentsData } : {}),
+        ...(incubateCellsData ? { incubateCellsData } : {}),
+        ...(hemocytometerLoadingData
+          ? {
+              hemocytometerLoadingData,
+              hemocytometerLoad: hemocytometerLoadingData,
+              substanceLoaded: hemocytometerLoadingData.substanceLoaded,
+            }
+          : {}),
         ...(raw.videoId ? { videoId: raw.videoId } : {}),
       });
     });
@@ -1847,6 +1962,7 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
     raw.markdownDoc ||
     compileArchiveMarkdownFromAnalysis({
       ...raw,
+      purpose,
       reagents,
       labelTranscriptions,
       workSteps,
@@ -1857,6 +1973,7 @@ export function deriveArchiveDataFromAnalysis(analysis?: VideoAnalysisDoc | null
     archiveName,
     creatorName,
     creationDate,
+    purpose,
     reagents,
     labelTranscriptions,
     workSteps,
@@ -1874,10 +1991,23 @@ export function compileArchiveMarkdownFromAnalysis(
   const src = analysis as Record<string, any>;
   const classification =
     src.workflowClassification || src.workloadClassification || {};
-  const description =
+  const purposeText =
+    typeof src.purpose === 'string' && src.purpose.trim()
+      ? src.purpose.trim()
+      : typeof classification.purpose === 'string' && classification.purpose.trim()
+      ? classification.purpose.trim()
+      : typeof classification.identificationEvent?.purpose === 'string' &&
+        classification.identificationEvent.purpose.trim()
+      ? classification.identificationEvent.purpose.trim()
+      : '';
+  const baseDescription =
     classification.transcribedAudio ||
     classification.archiveName ||
     'Experiment notebook entry compiled from SAIL video analysis.';
+  const description =
+    purposeText && !baseDescription.includes(purposeText)
+      ? `${baseDescription}\n- **Purpose**: ${purposeText}`
+      : baseDescription;
 
   const reagentLines: string[] = [];
   const rawReagents = Array.isArray(src.reagents) ? src.reagents : [];
@@ -1939,6 +2069,36 @@ export function compileArchiveMarkdownFromAnalysis(
         stepLines.push(
           `${stepNo}. **Seed Reagents**: Seeded ${s.cellsSeeded || 'N/A'} (${s.cellsPerWell || 'N/A'}) into ${s.plateType || 'N/A'} using ${s.pipetteType || 'N/A'} — Seeding Events: ${countStatus}.\n\n${plateMap}`
         );
+      } else if (
+        ws.actionType === 'INCUBATE_CELLS' ||
+        ws.actionType === 'INCUBATE_CELLS_ACTION' ||
+        ws.incubateCellsData ||
+        ws.incubatorSettings
+      ) {
+        const inc = ws.incubateCellsData || ws.incubatorSettings || {};
+        stepLines.push(
+          `${stepNo}. **Incubate Cells**: ${ws.description || 'Inserting cell container into incubator.'} — Incubator Settings: Temperature: ${inc.temperature || 'N/A'}, CO2 Level: ${inc.co2Level || 'N/A'}.`
+        );
+      } else if (
+        ws.actionType === 'ASPIRATE_MEDIA' ||
+        ws.actionType === 'ASPRIRATE_MEDIA' ||
+        ws.actionType === 'ASPIRATE_MEDIA_ACTION'
+      ) {
+        stepLines.push(
+          `${stepNo}. **Aspirate Media**: ${ws.description || 'Aspirating media from container using pipette or aspirator.'}`
+        );
+      } else if (
+        ws.actionType === 'HEMOCYTOMETER_LOADING' ||
+        ws.actionType === 'HEMOCYTOMETER_LOADING_ACTION' ||
+        ws.actionType === 'hemocytometer_loading' ||
+        ws.hemocytometerLoadingData ||
+        ws.hemocytometerLoad
+      ) {
+        const hemo = ws.hemocytometerLoadingData || ws.hemocytometerLoad || {};
+        const substanceStr = hemo.substanceLoaded || ws.substanceLoaded || 'N/A';
+        stepLines.push(
+          `${stepNo}. **Hemocytometer Loading**: ${ws.description || 'Loading cells into the two squares of the hemocytometer slide.'} — Substance Loaded: ${substanceStr}.`
+        );
       } else {
         stepLines.push(`${stepNo}. **${ws.actionType || 'Work Step'}**: ${ws.description || 'Executed step.'}`);
       }
@@ -1955,6 +2115,31 @@ export function compileArchiveMarkdownFromAnalysis(
         const plateMap = render96WellPlateMarkdown(s.seededColumns, s.seededWells);
         stepLines.push(
           `${idx + 1}. **Seed Reagents** (${act.actionId}): Seeded ${s.cellsSeeded} (${s.cellsPerWell}) into ${s.plateType} with ${s.pipetteType} (${s.seedingEventsCount} seeding events)\n\n${plateMap}`
+        );
+      } else if (
+        act.incubateCellsData ||
+        act.incubatorSettings ||
+        String(act.actionType || act.actionClass || '').toUpperCase().includes('INCUBAT')
+      ) {
+        const inc = act.incubateCellsData || act.incubatorSettings || {};
+        stepLines.push(
+          `${idx + 1}. **Incubate Cells** (${act.actionId}): ${act.description || 'Inserting cell container into incubator.'} — Incubator Settings: Temperature: ${inc.temperature || 'N/A'}, CO2 Level: ${inc.co2Level || 'N/A'}`
+        );
+      } else if (
+        /ASPIRAT|ASPRIRAT/i.test(String(act.actionType || act.actionClass || ''))
+      ) {
+        stepLines.push(
+          `${idx + 1}. **Aspirate Media** (${act.actionId}): ${act.description || 'Aspirating media from container using pipette or aspirator.'}`
+        );
+      } else if (
+        act.hemocytometerLoadingData ||
+        act.hemocytometerLoad ||
+        String(act.actionType || act.actionClass || '').toUpperCase().includes('HEMOCYTOMETER')
+      ) {
+        const hemo = act.hemocytometerLoadingData || act.hemocytometerLoad || {};
+        const substanceStr = hemo.substanceLoaded || act.substanceLoaded || 'N/A';
+        stepLines.push(
+          `${idx + 1}. **Hemocytometer Loading** (${act.actionId}): ${act.description || 'Loading cells into the two squares of the hemocytometer slide.'} — Substance Loaded: ${substanceStr}`
         );
       } else {
         const relatedRefs = refinements.filter((r: Record<string, any>) =>

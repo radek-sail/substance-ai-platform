@@ -56,6 +56,7 @@ interface SignOffModalProps {
   archiveName?: string;
   creatorName?: string;
   creationDate?: string;
+  purpose?: string;
   reagents?: ArchiveReagent[];
   labelTranscriptions?: string[];
   workSteps?: ArchiveWorkStep[];
@@ -79,6 +80,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
   archiveName,
   creatorName,
   creationDate,
+  purpose,
   reagents,
   labelTranscriptions,
   workSteps,
@@ -99,6 +101,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
     creationDate || new Date().toISOString().split('T')[0]
   );
   const [modalCreatorName, setModalCreatorName] = useState(creatorName || 'Lab Technician');
+  const [modalPurpose, setModalPurpose] = useState(purpose || '');
 
   const [modalReagents, setModalReagents] = useState<ArchiveReagent[]>(reagents || []);
   const [modalTranscriptions, setModalTranscriptions] = useState<string[]>(labelTranscriptions || []);
@@ -116,6 +119,10 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
   useEffect(() => {
     if (creatorName) setModalCreatorName(creatorName);
   }, [creatorName, isOpen]);
+
+  useEffect(() => {
+    setModalPurpose(purpose || '');
+  }, [purpose, isOpen]);
 
   useEffect(() => {
     if (reagents) setModalReagents(reagents);
@@ -140,6 +147,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
       archiveName: modalArchiveName,
       creatorName: modalCreatorName,
       creationDate: modalCreationDate,
+      purpose: modalPurpose.trim() || null,
       reagents: modalReagents,
       workSteps: modalWorkSteps,
       labelTranscriptions: modalTranscriptions,
@@ -296,7 +304,6 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
   }
 
   const handleCommit = async () => {
-    if (!confirmedCheck) return;
     setIsSubmitting(true);
     setErrorMsg(null);
 
@@ -429,6 +436,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
         const effectiveCreatorName = modalCreatorName || creatorName || 'Lab Technician';
         const effectiveCreationDate =
           modalCreationDate || creationDate || new Date().toISOString().split('T')[0];
+        const effectivePurpose = (modalPurpose ?? purpose ?? '').trim() || null;
 
         const baseMarkdown = modalMarkdown || markdownDoc || '';
         const shouldCompileFromStructured =
@@ -444,6 +452,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
                 archiveName: effectiveArchiveName,
                 creatorName: effectiveCreatorName,
                 creationDate: effectiveCreationDate,
+                purpose: effectivePurpose,
                 reagents: modalReagents,
                 workSteps: modalWorkSteps,
                 labelTranscriptions: modalTranscriptions,
@@ -459,6 +468,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
             archiveName: effectiveArchiveName,
             creatorName: effectiveCreatorName,
             creationDate: effectiveCreationDate,
+            purpose: effectivePurpose,
             reagents: modalReagents,
             labelTranscriptions: modalTranscriptions,
             workSteps: modalWorkSteps,
@@ -486,7 +496,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
-                <span>Atomic HITL Sign-Off & Multi-Tenant Commit</span>
+                <span>Analysis Verification</span>
               </h2>
               <p className="text-xs text-slate-400 font-mono">
                 Stream ID: {videoId} • Workflow: {workflowType}
@@ -617,7 +627,7 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
                   1. Experiment Notebook Identification
                 </span>
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs font-mono">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
                 <div>
                   <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Archive Name</span>
                   <input
@@ -642,6 +652,16 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
                     type="text"
                     value={modalCreatorName}
                     onChange={(e) => setModalCreatorName(e.target.value)}
+                    className="w-full mt-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-slate-100 text-xs focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Purpose (Optional)</span>
+                  <input
+                    type="text"
+                    value={modalPurpose}
+                    placeholder="Reason for experiment (optional)"
+                    onChange={(e) => setModalPurpose(e.target.value)}
                     className="w-full mt-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-slate-100 text-xs focus:outline-none focus:border-indigo-500"
                   />
                 </div>
@@ -802,11 +822,20 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
               </div>
               {modalWorkSteps.length > 0 ? (
                 <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
-                  {modalWorkSteps.map((step, idx) => (
+                  {modalWorkSteps.map((step, idx) => {
+                    const isSingleReagent = Boolean(
+                      step.actionType === 'MIX_REAGENTS' &&
+                      step.mixReagentsData &&
+                      (!step.mixReagentsData.secondReagentName ||
+                        step.mixReagentsData.secondReagentName.trim() === '' ||
+                        step.mixReagentsData.secondReagentName.trim().toUpperCase() === 'N/A')
+                    );
+
+                    return (
                     <div key={step.stepId || idx} className="bg-slate-900 border border-slate-800 rounded-lg p-2.5 text-xs font-mono space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-950 text-indigo-300 border border-indigo-800">
-                          {step.actionType}
+                          {isSingleReagent ? 'ADD_REAGENT' : step.actionType}
                         </span>
                         <span className="text-[10px] text-slate-400">
                           {step.startTimeSeconds ?? 0}s – {step.endTimeSeconds ?? 0}s
@@ -816,15 +845,24 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
                         <span className="text-[10px] text-slate-400 block mb-0.5">Description:</span>
                         <input
                           type="text"
-                          value={step.description || ''}
+                          value={
+                            isSingleReagent &&
+                            (!step.description ||
+                              step.description.trim().toLowerCase() === 'mix reagents' ||
+                              step.description.trim().toLowerCase() === 'mix reagents.')
+                              ? 'Add Reagent'
+                              : (step.description || '')
+                          }
                           onChange={(e) => handleUpdateWorkStep(idx, { description: e.target.value })}
                           className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200"
                         />
                       </div>
                       {step.actionType === 'MIX_REAGENTS' && step.mixReagentsData && (
-                        <div className="text-[11px] text-slate-300 bg-slate-950/60 p-2 rounded border border-slate-800 grid grid-cols-2 gap-2">
+                        <div className={`text-[11px] text-slate-300 bg-slate-950/60 p-2 rounded border border-slate-800 grid ${isSingleReagent ? 'grid-cols-1' : 'grid-cols-2'} gap-2`}>
                           <div>
-                            <span className="text-[10px] text-slate-400 block">Reagent 1 Name &amp; Amount:</span>
+                            <span className="text-[10px] text-slate-400 block">
+                              {isSingleReagent ? 'Reagent Name & Amount:' : 'Reagent 1 Name & Amount:'}
+                            </span>
                             <div className="flex gap-1.5 mt-0.5">
                               <input
                                 type="text"
@@ -856,39 +894,41 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
                               />
                             </div>
                           </div>
-                          <div>
-                            <span className="text-[10px] text-slate-400 block">Reagent 2 Name &amp; Amount:</span>
-                            <div className="flex gap-1.5 mt-0.5">
-                              <input
-                                type="text"
-                                value={step.mixReagentsData.secondReagentName || ''}
-                                onChange={(e) =>
-                                  handleUpdateWorkStep(idx, {
-                                    mixReagentsData: {
-                                      ...step.mixReagentsData!,
-                                      secondReagentName: e.target.value,
-                                    },
-                                  })
-                                }
-                                className="flex-1 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
-                                placeholder="Name"
-                              />
-                              <input
-                                type="text"
-                                value={step.mixReagentsData.secondReagentAmount || ''}
-                                onChange={(e) =>
-                                  handleUpdateWorkStep(idx, {
-                                    mixReagentsData: {
-                                      ...step.mixReagentsData!,
-                                      secondReagentAmount: e.target.value,
-                                    },
-                                  })
-                                }
-                                className="w-20 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
-                                placeholder="Amount"
-                              />
+                          {!isSingleReagent && (
+                            <div>
+                              <span className="text-[10px] text-slate-400 block">Reagent 2 Name &amp; Amount:</span>
+                              <div className="flex gap-1.5 mt-0.5">
+                                <input
+                                  type="text"
+                                  value={step.mixReagentsData.secondReagentName || ''}
+                                  onChange={(e) =>
+                                    handleUpdateWorkStep(idx, {
+                                      mixReagentsData: {
+                                        ...step.mixReagentsData!,
+                                        secondReagentName: e.target.value,
+                                      },
+                                    })
+                                  }
+                                  className="flex-1 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
+                                  placeholder="Name"
+                                />
+                                <input
+                                  type="text"
+                                  value={step.mixReagentsData.secondReagentAmount || ''}
+                                  onChange={(e) =>
+                                    handleUpdateWorkStep(idx, {
+                                      mixReagentsData: {
+                                        ...step.mixReagentsData!,
+                                        secondReagentAmount: e.target.value,
+                                      },
+                                    })
+                                  }
+                                  className="w-20 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200"
+                                  placeholder="Amount"
+                                />
+                              </div>
                             </div>
-                          </div>
+                          )}
                         </div>
                       )}
                       {step.actionType === 'SEED_REAGENTS' && step.seedReagentsData && (
@@ -1024,8 +1064,96 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
                           </div>
                         </div>
                       )}
+                      {(step.actionType === 'INCUBATE_CELLS' ||
+                        step.actionType === 'INCUBATE_CELLS_ACTION' ||
+                        step.incubateCellsData ||
+                        step.incubatorSettings) && (
+                        <div className="text-[11px] text-slate-300 bg-slate-950/60 p-2.5 rounded border border-slate-800 grid grid-cols-2 gap-2">
+                          <div>
+                            <span className="text-[10px] text-slate-400 block">
+                              Incubator Temperature (INCUBATOR_SETTINGS):
+                            </span>
+                            <input
+                              type="text"
+                              value={
+                                (step.incubateCellsData || step.incubatorSettings)?.temperature ||
+                                'N/A'
+                              }
+                              onChange={(e) =>
+                                handleUpdateWorkStep(idx, {
+                                  incubateCellsData: {
+                                    temperature: e.target.value,
+                                    co2Level:
+                                      (step.incubateCellsData || step.incubatorSettings)?.co2Level ||
+                                      'N/A',
+                                  },
+                                })
+                              }
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-amber-300 mt-0.5"
+                            />
+                          </div>
+                          <div>
+                            <span className="text-[10px] text-slate-400 block">
+                              Incubator CO2 Level (INCUBATOR_SETTINGS):
+                            </span>
+                            <input
+                              type="text"
+                              value={
+                                (step.incubateCellsData || step.incubatorSettings)?.co2Level ||
+                                'N/A'
+                              }
+                              onChange={(e) =>
+                                handleUpdateWorkStep(idx, {
+                                  incubateCellsData: {
+                                    temperature:
+                                      (step.incubateCellsData || step.incubatorSettings)
+                                        ?.temperature || 'N/A',
+                                    co2Level: e.target.value,
+                                  },
+                                })
+                              }
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-amber-300 mt-0.5"
+                            />
+                          </div>
+                        </div>
+                      )}
+                      {(step.actionType === 'HEMOCYTOMETER_LOADING' ||
+                        step.actionType === 'HEMOCYTOMETER_LOADING_ACTION' ||
+                        step.actionType === 'hemocytometer_loading' ||
+                        step.hemocytometerLoadingData ||
+                        step.hemocytometerLoad) && (
+                        <div className="text-[11px] text-slate-300 bg-slate-950/60 p-2.5 rounded border border-slate-800">
+                          <div>
+                            <span className="text-[10px] text-slate-400 block">
+                              Substance Loaded (hemocytometer_load):
+                            </span>
+                            <input
+                              type="text"
+                              value={
+                                (step.hemocytometerLoadingData || step.hemocytometerLoad)
+                                  ?.substanceLoaded ||
+                                step.substanceLoaded ||
+                                'N/A'
+                              }
+                              onChange={(e) =>
+                                handleUpdateWorkStep(idx, {
+                                  hemocytometerLoadingData: {
+                                    substanceLoaded: e.target.value,
+                                  },
+                                  hemocytometerLoad: {
+                                    substanceLoaded: e.target.value,
+                                  },
+                                  substanceLoaded: e.target.value,
+                                })
+                              }
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-teal-300 mt-0.5"
+                            />
+                          </div>
+                        </div>
+                      )}
                     </div>
-                  ))}
+                  );
+                })}
                 </div>
               ) : (
                 <p className="text-xs text-slate-400 font-mono italic">No work steps detected.</p>
@@ -1068,38 +1196,6 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
           </div>
         )}
 
-        {/* Operator Confirmation & Initials */}
-        <div className="bg-slate-950/60 p-3.5 rounded-xl border border-slate-800 space-y-3">
-          <div className="flex items-center justify-between text-xs">
-            <label className="text-slate-300 font-medium flex items-center gap-1.5">
-              <User className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Signing Operator Initials:</span>
-            </label>
-            <input
-              type="text"
-              maxLength={4}
-              value={operatorInitials}
-              onChange={(e) => setOperatorInitials(e.target.value.toUpperCase())}
-              className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-100 font-mono text-center uppercase focus:outline-none focus:border-cyan-500"
-              required
-            />
-          </div>
-
-          <label className="flex items-start gap-2.5 cursor-pointer text-xs text-slate-300 select-none">
-            <input
-              type="checkbox"
-              checked={confirmedCheck}
-              onChange={(e) => setConfirmedCheck(e.target.checked)}
-              className="mt-0.5 rounded border-slate-700 bg-slate-900 text-cyan-600 focus:ring-cyan-500"
-            />
-            <span>
-              I certify as the responsible laboratory operator that all physical actions, vial
-              locations, and reagent parameters have been verified against experimental video
-              evidence. Committing will permanently sign off this analysis.
-            </span>
-          </label>
-        </div>
-
         {/* Commit Actions */}
         <div className="flex items-center justify-end gap-3 pt-2 border-t border-slate-800">
           <button
@@ -1113,10 +1209,10 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
 
           <button
             type="button"
-            disabled={!confirmedCheck || isSubmitting}
+            disabled={isSubmitting}
             onClick={handleCommit}
             className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-semibold shadow-lg transition-all duration-150 ${
-              confirmedCheck && !isSubmitting
+              !isSubmitting
                 ? 'bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white shadow-emerald-500/25 active:scale-95 cursor-pointer'
                 : 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700/60'
             }`}
@@ -1124,12 +1220,12 @@ export const SignOffModal: React.FC<SignOffModalProps> = ({
             {isSubmitting ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin text-white" />
-                <span>Committing Atomic Batch...</span>
+                <span>Writing to Archive Notebook...</span>
               </>
             ) : (
               <>
                 <CheckCircle2 className="w-4 h-4" />
-                <span>Execute Atomic Sign-Off & Lock Record</span>
+                <span>Write to Archive Notebook</span>
               </>
             )}
           </button>
