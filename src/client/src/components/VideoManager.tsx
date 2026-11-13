@@ -5,7 +5,6 @@ import {
   CheckCircle2,
   Loader2,
   Sparkles,
-  ArrowRight,
   Building,
   Layers,
   AlertCircle,
@@ -3356,62 +3355,6 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                         <span className="text-sm font-bold text-slate-100">
                           {group.entityName}
                         </span>
-
-                        {group.entityType === 'inventory' && (
-                          <span
-                            role="link"
-                            tabIndex={0}
-                            data-testid={`group-jump-to-inventory-${group.groupKey}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const repVideo =
-                                (selectedVideo &&
-                                  group.videos.find((v) => v.videoId === selectedVideo.videoId)) ||
-                                group.videos[0];
-                              if (repVideo) {
-                                handleInspectResults(
-                                  {
-                                    ...repVideo,
-                                    inventoryId: group.entityId || repVideo.inventoryId,
-                                    inventoryName: group.entityName || repVideo.inventoryName,
-                                  },
-                                  false
-                                );
-                              } else if (group.entityId) {
-                                onNavigateToInventory?.(group.entityId);
-                              }
-                            }}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter' || e.key === ' ') {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                const repVideo =
-                                  (selectedVideo &&
-                                    group.videos.find(
-                                      (v) => v.videoId === selectedVideo.videoId
-                                    )) ||
-                                  group.videos[0];
-                                if (repVideo) {
-                                  handleInspectResults(
-                                    {
-                                      ...repVideo,
-                                      inventoryId: group.entityId || repVideo.inventoryId,
-                                      inventoryName: group.entityName || repVideo.inventoryName,
-                                    },
-                                    false
-                                  );
-                                } else if (group.entityId) {
-                                  onNavigateToInventory?.(group.entityId);
-                                }
-                              }
-                            }}
-                            title={`Jump to Cryo-Inventory: ${group.entityName}`}
-                            className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-[11px] font-mono font-semibold bg-cyan-600/25 hover:bg-cyan-600/45 text-cyan-200 border border-cyan-500/50 transition-colors cursor-pointer"
-                          >
-                            <span>Open Inventory</span>
-                            <ArrowRight className="w-3 h-3 text-cyan-300 shrink-0" />
-                          </span>
-                        )}
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
@@ -3688,93 +3631,138 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                 >
                   <Eye className="w-3.5 h-3.5 text-emerald-300" />
                   <span>Verify Analysis</span>
-                  <ArrowRight className="w-3.5 h-3.5" />
                 </button>
-              </div>
 
-              {(() => {
-                const selectedPass0Data = selectedPasses.pass0?.data;
-                const selectedPass0WorkflowType =
-                  selectedPass0Data?.workflowType ||
-                  analysisCache[selectedVideo.videoId]?.workflowClassification?.workflowType ||
-                  analysisCache[selectedVideo.videoId]?.workloadClassification?.workflowType;
-                const rawSelectedPass1 = selectedPasses.pass1?.data;
-                const selectedPass1Actions = Array.isArray(rawSelectedPass1)
-                  ? rawSelectedPass1
-                  : Array.isArray(rawSelectedPass1?.actions)
-                  ? rawSelectedPass1.actions
-                  : [];
-                const isSelectedArchive =
-                  selectedPass0WorkflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
-                  Boolean(selectedVideo.archiveId) ||
-                  Boolean(selectedVideo.archiveAssociationType) ||
-                  Boolean(selectedVideo.archiveName) ||
-                  Boolean(selectedVideo.unmatchedArchiveName) ||
-                  Boolean(selectedVideo.originalName?.toLowerCase().includes('archive')) ||
-                  Boolean(selectedVideo.videoId?.toLowerCase().includes('archive')) ||
-                  selectedPass1Actions.some((a: any) => {
-                    const cls = String(a?.actionType || a?.actionClass || '').toUpperCase();
-                    return (
-                      cls.includes('MIX') ||
-                      cls.includes('SEED') ||
-                      cls.includes('INCUBAT') ||
-                      cls.includes('ASPIRAT') ||
-                      cls.includes('ASPRIRAT') ||
-                      cls.includes('HEMOCYTOMETER')
+                {(() => {
+                  const selectedPass0Data = selectedPasses.pass0?.data;
+                  const selectedPass0WorkflowType =
+                    selectedPass0Data?.workflowType ||
+                    analysisCache[selectedVideo.videoId]?.workflowClassification?.workflowType ||
+                    analysisCache[selectedVideo.videoId]?.workloadClassification?.workflowType;
+                  const rawSelectedPass1 = selectedPasses.pass1?.data;
+                  const selectedPass1Actions = Array.isArray(rawSelectedPass1)
+                    ? rawSelectedPass1
+                    : Array.isArray(rawSelectedPass1?.actions)
+                    ? rawSelectedPass1.actions
+                    : [];
+                  const isSelectedArchive =
+                    selectedPass0WorkflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
+                    Boolean(selectedVideo.archiveId) ||
+                    Boolean(selectedVideo.archiveAssociationType) ||
+                    Boolean(selectedVideo.archiveName) ||
+                    Boolean(selectedVideo.unmatchedArchiveName) ||
+                    Boolean(selectedVideo.originalName?.toLowerCase().includes('archive')) ||
+                    Boolean(selectedVideo.videoId?.toLowerCase().includes('archive')) ||
+                    selectedPass1Actions.some((a: any) => {
+                      const cls = String(a?.actionType || a?.actionClass || '').toUpperCase();
+                      return (
+                        cls.includes('MIX') ||
+                        cls.includes('SEED') ||
+                        cls.includes('INCUBAT') ||
+                        cls.includes('ASPIRAT') ||
+                        cls.includes('ASPRIRAT') ||
+                        cls.includes('HEMOCYTOMETER')
+                      );
+                    });
+
+                  if (isSelectedArchive) {
+                    const candidateName =
+                      selectedVideo.archiveName ||
+                      selectedVideo.unmatchedArchiveName ||
+                      selectedPass0Data?.archiveName ||
+                      '';
+                    const matchedArchive = archives.find(
+                      (a) =>
+                        (selectedVideo.archiveId && a.id === selectedVideo.archiveId) ||
+                        (Array.isArray(a.videoIds) && a.videoIds.includes(selectedVideo.videoId)) ||
+                        (candidateName &&
+                          a.name &&
+                          a.name.trim().toLowerCase() === String(candidateName).trim().toLowerCase())
                     );
-                  });
+                    const resolvedArchiveId = selectedVideo.archiveId || matchedArchive?.id;
+                    const resolvedArchiveName =
+                      matchedArchive?.name ||
+                      selectedVideo.archiveName ||
+                      selectedVideo.unmatchedArchiveName ||
+                      selectedPass0Data?.archiveName;
 
-                if (!isSelectedArchive) return null;
+                    return (
+                      <button
+                        type="button"
+                        data-testid="open-archive-button"
+                        onClick={() =>
+                          handleInspectResults(
+                            {
+                              ...selectedVideo,
+                              archiveId: resolvedArchiveId || selectedVideo.archiveId,
+                              archiveName: resolvedArchiveName || selectedVideo.archiveName,
+                            },
+                            false
+                          )
+                        }
+                        title={
+                          resolvedArchiveName
+                            ? `Jump to Experiment Archive: ${resolvedArchiveName}`
+                            : 'Jump to Experiment Archive'
+                        }
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-cyan-600/25 hover:bg-cyan-600/40 text-cyan-200 border border-cyan-500/40 transition-colors"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+                        <span>Open Archive</span>
+                      </button>
+                    );
+                  }
 
-                const candidateName =
-                  selectedVideo.archiveName ||
-                  selectedVideo.unmatchedArchiveName ||
-                  selectedPass0Data?.archiveName ||
-                  '';
-                const matchedArchive = archives.find(
-                  (a) =>
-                    (selectedVideo.archiveId && a.id === selectedVideo.archiveId) ||
-                    (Array.isArray(a.videoIds) && a.videoIds.includes(selectedVideo.videoId)) ||
-                    (candidateName &&
-                      a.name &&
-                      a.name.trim().toLowerCase() === String(candidateName).trim().toLowerCase())
-                );
-                const resolvedArchiveId = selectedVideo.archiveId || matchedArchive?.id;
-                const resolvedArchiveName =
-                  matchedArchive?.name ||
-                  selectedVideo.archiveName ||
-                  selectedVideo.unmatchedArchiveName ||
-                  selectedPass0Data?.archiveName;
+                  const candidateInvName =
+                    selectedVideo.inventoryName ||
+                    selectedVideo.unmatchedInventoryName ||
+                    selectedPass0Data?.inventoryName ||
+                    '';
+                  const matchedInventory = inventories.find(
+                    (inv) =>
+                      (selectedVideo.inventoryId && inv.id === selectedVideo.inventoryId) ||
+                      (candidateInvName &&
+                        inv.name &&
+                        inv.name.trim().toLowerCase() ===
+                          String(candidateInvName).trim().toLowerCase())
+                  );
+                  const resolvedInventoryId = selectedVideo.inventoryId || matchedInventory?.id;
+                  const resolvedInventoryName =
+                    matchedInventory?.name ||
+                    selectedVideo.inventoryName ||
+                    selectedVideo.unmatchedInventoryName ||
+                    selectedPass0Data?.inventoryName;
 
-                return (
-                  <div className="flex flex-wrap items-center gap-3">
+                  return (
                     <button
                       type="button"
-                      data-testid="open-archive-button"
-                      onClick={() =>
+                      data-testid="open-inventory-button"
+                      onClick={() => {
                         handleInspectResults(
                           {
                             ...selectedVideo,
-                            archiveId: resolvedArchiveId || selectedVideo.archiveId,
-                            archiveName: resolvedArchiveName || selectedVideo.archiveName,
+                            inventoryId: resolvedInventoryId || selectedVideo.inventoryId,
+                            inventoryName: resolvedInventoryName || selectedVideo.inventoryName,
                           },
                           false
-                        )
-                      }
+                        );
+                        if (resolvedInventoryId) {
+                          onNavigateToInventory?.(resolvedInventoryId);
+                        }
+                      }}
                       title={
-                        resolvedArchiveName
-                          ? `Jump to Experiment Archive: ${resolvedArchiveName}`
-                          : 'Jump to Experiment Archive'
+                        resolvedInventoryName
+                          ? `Jump to Cryo-Inventory: ${resolvedInventoryName}`
+                          : 'Jump to Cryo-Inventory'
                       }
                       className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-cyan-600/25 hover:bg-cyan-600/40 text-cyan-200 border border-cyan-500/40 transition-colors"
                     >
-                      <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
-                      <span>Open Archive</span>
-                      <ArrowRight className="w-3.5 h-3.5" />
+                      <Package className="w-3.5 h-3.5 text-cyan-300" />
+                      <span>Open Inventory</span>
                     </button>
-                  </div>
-                );
-              })()}
+                  );
+                })()}
+              </div>
             </div>
           </div>
 

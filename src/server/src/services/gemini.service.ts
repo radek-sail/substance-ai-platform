@@ -1499,7 +1499,8 @@ export async function runPass1ActionDetection(
 - Segment physical experimental work steps in "actions" (REAGENT_MIXING_ACTION / MIX_REAGENTS for physical reagent mixing/transfers, REAGENT_SEEDING_ACTION / SEED_REAGENTS for physical plate seeding, INCUBATE_CELLS for inserting a container containing cells into an incubator, ASPIRATE_MEDIA / ASPRIRATE_MEDIA for emptying the content of a container with media using a pipette or aspirator, and HEMOCYTOMETER_LOADING / hemocytometer_loading for loading cells into the two squares of a hemocytometer slide) ONLY when they actually occur in the video. A video may have zero actions (actions: []) and only contain events that contribute to actions in subsequent videos.`
     : `CRITICAL TEMPORAL SCANNING INSTRUCTIONS:
 - Analyze the full video timeline from 00:00 through completion (${durationSeconds}s), across both the FIRST HALF and the SECOND HALF.
-- IGNORE verbal count cues from the audio transcript; rely strictly on visual evidence.`;
+- IGNORE verbal count cues from the audio transcript; rely strictly on visual evidence.
+- For every VIAL_INSERTION action, do NOT end the interval while the hand is still holding the vial; extend endTime and endTimestampSeconds until the hand releases the vial and stops occluding the view of the cryo-box.`;
 
   const systemInstruction = `${baseSystemInstruction}\n\n${temporalScanningInstructions}`;
   const client = getGenAIClient();
@@ -1551,6 +1552,10 @@ CRITICAL SCOPE RESTRICTION:
 - You MUST ONLY detect 'VIAL_INSERTION' (placing a vial into a slot) and 'VIAL_REMOVAL' (taking a vial out of a slot).
 - Do NOT detect box removals, cap opening/closing, or box lid adjustments.
 - Every single vial placed into or removed from the grid must be emitted as an independent action.
+
+VIAL INSERTION INTERVAL END-BOUNDARY RULE:
+- Do NOT end a 'VIAL_INSERTION' interval too soon while the operator's hand or fingers are still holding the vial.
+- Extend 'endTime' and 'endTimestampSeconds' for every 'VIAL_INSERTION' action until the hand completely releases the vial AND moves away so that it stops occluding the view of the cryo-box (leaving an unobstructed view of the box and seated vial), while keeping consecutive action intervals non-overlapping.
 
 CRITICAL CONSTRAINTS:
 - \`description\`: Concise sentence under 15 words (max 20 words, e.g., "Operator inserts vial into slot A1").
@@ -1646,8 +1651,9 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
             },
             endTime: {
               type: 'STRING',
-              description:
-                "Single timestamp string in 'MM:SS' format (e.g. '00:15'). Do NOT output multiple or comma-separated formats.",
+              description: isArchiveWorkflow
+                ? "Single timestamp string in 'MM:SS' format (e.g. '00:15'). Do NOT output multiple or comma-separated formats."
+                : "Single timestamp string in 'MM:SS' format (e.g. '00:15'). For VIAL_INSERTION, do NOT end while the hand is still holding the vial; extend until the hand releases the vial and stops occluding the view of the cryo-box. Do NOT output multiple or comma-separated formats.",
             },
             startTimestampSeconds: {
               type: 'NUMBER',
@@ -1655,7 +1661,9 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
             },
             endTimestampSeconds: {
               type: 'NUMBER',
-              description: 'Numeric end timestamp in seconds (e.g. 15.0).',
+              description: isArchiveWorkflow
+                ? 'Numeric end timestamp in seconds (e.g. 15.0).'
+                : 'Numeric end timestamp in seconds (e.g. 15.0). For VIAL_INSERTION, extend until the hand releases the vial and stops occluding the view of the cryo-box (do not end while the hand is still holding the vial).',
             },
             confidenceScore: { type: 'NUMBER' },
             targetCoordinate: {
@@ -3188,7 +3196,7 @@ export function getEventDetectionSchema(isArchiveWorkflow: boolean = false) {
             refinedEndTimestampSeconds: {
               type: 'NUMBER',
               description:
-                'Refined end timestamp in seconds at 4 fps precision within [pass1Start - 1s, pass1End + 1s] marking when the vial insertion or removal action completes.',
+                'Refined end timestamp in seconds at 4 fps precision within [pass1Start - 1s, pass1End + 1s] marking when the vial insertion or removal action completes (for VIAL_INSERTION, extend until the hand releases the vial and stops occluding the view of the cryo-box; do not end while the hand is still holding the vial).',
             },
             confidenceScore: { type: 'NUMBER' },
           },
@@ -4072,7 +4080,7 @@ export async function runPass2EventDetection(
           `   - For REAGENT_LABEL_PRESENTATION / REAGENT_LABEL_PRESENTATION_EVENT (reagent container/bottle labels distinct from small cryo-box vials): Emit EXACTLY ONE event per distinct reagent across the workflow. If a reagent bottle or container label is shown multiple times, select the single event where the label is best visible (i.e., closest to the camera and not occluded by objects in the foreground). Also populate "reagentName", "reagentAcronym" (formed from the first letters of the reagent name), "manufacturer", "catalogNumber" (Catalog / Ref #), and "lotNumber" (Lot #), leaving any field not printed on the label as "N/A". Either the acronym or the full name might be printed on the vessel containing the reagent; identify that it is the same reagent regardless of whether referred to by full name or acronym.`,
           `2. For each Pass 1 action, inspect its 4 fps refinement window in "refinedActions" and refine the action interval boundaries ("refinedStartTimestampSeconds" and "refinedEndTimestampSeconds") at 4 fps within [pass1Start - 1s, pass1End + 1s]:`,
           `   - "refinedStartTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the action begins.`,
-          `   - "refinedEndTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the action completes.`,
+          `   - "refinedEndTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the action completes (for VIAL_INSERTION, do NOT end while the hand is still holding the vial; extend until the hand releases the vial and stops occluding the view of the cryo-box).`,
           `   - Neighboring action intervals must NEVER overlap in time: for any consecutive actions i and i+1, "refinedEndTimestampSeconds" of action i MUST be <= "refinedStartTimestampSeconds" of action i+1.`,
           `Return a JSON object containing "events" and "refinedActions" conforming to the response schema.`,
         ]

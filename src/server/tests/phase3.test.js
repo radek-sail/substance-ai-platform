@@ -2298,5 +2298,96 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       assert.ok(actions[1].eventList.includes('evt_dmem_best_visible'));
       assert.strictEqual(actions[0].eventList.includes('evt_dmem_occluded'), false);
     });
+
+    it('should instruct Pass 1 and Pass 2 to extend VIAL_INSERTION intervals until the hand releases the vial and stops occluding the view of the cryo-box', async () => {
+      const capturedCalls = [];
+      setGenAIClient({
+        models: {
+          generateContent: async (params) => {
+            capturedCalls.push(params);
+            if (capturedCalls.length === 1) {
+              return {
+                text: JSON.stringify({
+                  workflowContext: 'INVENTORY_UPDATE_WORKFLOW',
+                  totalActionsDetected: 1,
+                  actions: [
+                    {
+                      actionId: 'act_001',
+                      actionType: 'VIAL_INSERTION',
+                      actionClass: 'VIAL_INSERTION_ACTION',
+                      description: 'Operator inserts cryovial into slot A2 and withdraws hand',
+                      startTime: '00:10',
+                      endTime: '00:16',
+                      startTimestampSeconds: 10.0,
+                      endTimestampSeconds: 16.0,
+                      confidenceScore: 0.98,
+                      targetCoordinate: 'A2',
+                    },
+                  ],
+                }),
+              };
+            }
+            return {
+              text: JSON.stringify({
+                events: [],
+                refinedActions: [
+                  {
+                    actionId: 'act_001',
+                    refinedStartTimestampSeconds: 10.25,
+                    refinedEndTimestampSeconds: 16.5,
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      });
+
+      const pass1Actions = await runPass1ActionDetection({
+        videoId: 'vid-vial-release-unoccluded-01',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_vid-vial-release-unoccluded-01.mp4',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          inventoryName: 'CryoTank-Alpha',
+          transcribedAudio: '',
+        },
+      });
+
+      assert.strictEqual(pass1Actions.length, 1);
+      assert.strictEqual(pass1Actions[0].endTimestampSeconds, 16.0);
+      assert.strictEqual(pass1Actions[0].endTime, '00:16');
+
+      const pass1Req = capturedCalls[0];
+      const pass1Sys = pass1Req.config.systemInstruction;
+      const pass1Prompt = pass1Req.contents[0].parts.find((p) => p.text).text;
+      const pass1ActionProps = pass1Req.config.responseSchema.properties.actions.items.properties;
+
+      assert.ok(pass1Sys.includes('releases the vial'));
+      assert.ok(pass1Sys.includes('stops occluding the view of the cryo-box'));
+      assert.ok(pass1Prompt.includes('VIAL INSERTION INTERVAL END-BOUNDARY RULE:'));
+      assert.ok(pass1Prompt.includes('releases the vial'));
+      assert.ok(pass1Prompt.includes('stops occluding the view of the cryo-box'));
+      assert.ok(pass1ActionProps.endTime.description.includes('releases the vial'));
+      assert.ok(pass1ActionProps.endTimestampSeconds.description.includes('stops occluding the view of the cryo-box'));
+
+      const pass2Result = await runPass2EventDetection({
+        videoId: 'vid-vial-release-unoccluded-01',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_vid-vial-release-unoccluded-01.mp4',
+        classification: {
+          workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+          inventoryName: 'CryoTank-Alpha',
+          transcribedAudio: '',
+        },
+        actions: pass1Actions,
+      });
+
+      const pass2Req = capturedCalls[1];
+      const pass2Prompt = pass2Req.contents[0].parts.find((p) => p.text).text;
+      const pass2RefinedProps = pass2Req.config.responseSchema.properties.refinedActions.items.properties;
+
+      assert.ok(pass2Prompt.includes('releases the vial and stops occluding the view of the cryo-box'));
+      assert.ok(pass2RefinedProps.refinedEndTimestampSeconds.description.includes('stops occluding the view of the cryo-box'));
+      assert.strictEqual(pass2Result.refinedActions[0].refinedEndTimestampSeconds, 16.5);
+    });
   });
 });

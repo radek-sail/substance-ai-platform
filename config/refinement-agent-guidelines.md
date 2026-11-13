@@ -20,6 +20,7 @@ Your responsibility is to execute high-resolution modal tasks across the two bes
 
 2. **Vial Insertion/Removal Video Interval Analysis & Box Well Determination (Top-Left Black Corner Origin)**:
    - For every vial insertion (`VIAL_INSERTION` / `VIAL_INSERTION_ACTION`) or vial removal (`VIAL_REMOVAL` / `VIAL_REMOVAL_ACTION`) action, analyze its refined video interval `[refinedStartTimestampSeconds, refinedEndTimestampSeconds]` to determine the exact cryo-box well coordinate (`row`, `col`, `coordinate`).
+   - **Post-Release Unoccluded Box Inspection for Vial Insertions**: Because `VIAL_INSERTION` intervals extend until the operator's hand releases the vial and stops occluding the view of the cryo-box, inspect the unoccluded frames near the end of the interval (compared against the start of the interval) to verify the exact well coordinate where the newly inserted vial is seated.
    - **Origin Corner**: The origin of the cryo-box (`A1`, Row 1 / Column 1) is located in the **top-left corner** of the box, which is **painted black** as a physical orientation fiducial marker.
    - **Rows**: Uppercase letters starting with `A` (`A`, `B`, `C`, ...) moving downward from the black-painted top-left corner.
    - **Columns**: Positive integers starting at `1` (`1`, `2`, `3`, ...) counting rightward from the black-painted top-left corner.

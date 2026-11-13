@@ -8,6 +8,7 @@ Identify and segment EVERY individual vial insertion (`VIAL_INSERTION`) or remov
 ### Critical Scanning & Extraction Rules for Actions
 - **Visual Ground Truth Only**: Scan systematically from `00:00` through the end of the video (including both the first and second halves and across pauses). Rely strictly on visual evidence for physical vial actions; ignore spoken counts or partial audio summaries when counting physical vial placements.
 - **Strict Scope for `actions`**: In the `actions` array, detect ONLY `VIAL_INSERTION` (seating a vial into a slot) and `VIAL_REMOVAL` (taking a vial from a slot). Ignore box movements, cap opening/closing, and lid adjustments.
+- **`VIAL_INSERTION` Interval End Boundary (Hand Release & Unoccluded Box View)**: Do **NOT** end a `VIAL_INSERTION` (`VIAL_INSERTION_ACTION`) interval prematurely when the vial first enters the slot or while the operator's hand or fingers are still holding the vial. Extend `endTime` and `endTimestampSeconds` until the operator's hand completely releases the vial **and** withdraws/moves away so that it stops occluding the view of the cryo-box (leaving an unobstructed view of the newly inserted vial seated in its slot and the cryo-box grid). Keep consecutive action intervals non-overlapping (`endTimestampSeconds` of action $i$ `<=` `startTimestampSeconds` of action $i+1$).
 - **No Aggregation**: Emit each physical vial transfer as a separate, chronological action object with incrementing `actionId` (`act_001`, `act_002`, ...). Never group multiple transfers into one summary action. `totalActionsDetected` MUST equal `actions.length`.
 - **Concise Formatting**:
   - `description`: Single sentence under 15 words (max 20 words), e.g., `"Operator transfers cryovial into slot A1"`.
@@ -16,7 +17,7 @@ Identify and segment EVERY individual vial insertion (`VIAL_INSERTION`) or remov
   - Explicitly forbidden: Repeating phrase chains or hierarchical taxonomy strings.
 
 ### Action Classes (Pass 1 @ 1 fps)
-- `VIAL_INSERTION_ACTION`: Placing a specimen cryovial into a cryo-box slot.
+- `VIAL_INSERTION_ACTION`: Placing a specimen cryovial into a cryo-box slot. The interval MUST extend until the operator's hand releases the vial and stops occluding the view of the cryo-box (never ending while the hand is still holding the vial).
 - `VIAL_REMOVAL_ACTION`: Extracting a specimen cryovial from a cryo-box slot. (Note: During vial removal, the operator may glance at the label to verify they are taking out the right vial, or may not do so for every vial; Pass 3 skips vial label text transcription for `VIAL_REMOVAL` actions and leaves all label fields empty except for the well coordinate.)
 
 Extracted fields: `actionId`, `actionClass`, `inventoryId`, `cellLineName`, `cellLineInfo`, `towerId`, `boxRowId` (A–Z), `boxColId` (1–N), `eventList`.
@@ -50,7 +51,7 @@ For every `BOX_LABEL_PRESENTATION` and `VIAL_LABEL_PRESENTATION` event detected 
 Pass 1 action detection runs at 1 fps. In Pass 2, refine the interval boundaries (`refinedStartTimestampSeconds` and `refinedEndTimestampSeconds`) for each inventory update action (`VIAL_INSERTION` and `VIAL_REMOVAL`) at **4 fps** and report those refined boundaries in `event_detection_pass.json`:
 - Inspect each Pass 1 `VIAL_INSERTION` or `VIAL_REMOVAL` action strictly at **4 fps** (0.25s resolution) ONLY within the local search window extending the Pass 1 interval by **1 second before `startTimestampSeconds` and 1 second after `endTimestampSeconds`**:
   `[max(0, pass1Start - 1.0), min(videoDuration, pass1End + 1.0)]` (clamped so adjacent windows never overlap).
-- Determine the refined start timestamp (`refinedStartTimestampSeconds`) and refined end timestamp (`refinedEndTimestampSeconds`) at 4 fps precision that accurately bound the vial insertion or removal action within its search window.
+- Determine the refined start timestamp (`refinedStartTimestampSeconds`) and refined end timestamp (`refinedEndTimestampSeconds`) at 4 fps precision that accurately bound the vial insertion or removal action within its search window. For `VIAL_INSERTION` actions, `refinedEndTimestampSeconds` MUST NOT end while the hand is still holding the vial; extend it until the hand releases the vial and stops occluding the view of the cryo-box.
 - Do NOT select or extract before/after box frames for actions; only refine and report the action interval boundaries (`refinedStartTimestampSeconds`, `refinedEndTimestampSeconds`, `startTime`, `endTime`).
 - **No Temporal Overlap Between Neighboring Action Intervals**: Refined action intervals must NEVER overlap in time with neighboring actions. For any consecutive actions $i$ and $i+1$, `refinedEndTimestampSeconds` of action $i$ MUST be less than or equal to (`<=`) `refinedStartTimestampSeconds` of action $i+1$.
 

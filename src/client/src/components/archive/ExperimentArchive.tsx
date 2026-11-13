@@ -2011,6 +2011,9 @@ function sanitizePdfText(raw: string | undefined | null): string {
     .replace(/°/g, ' deg ')
     .replace(/•/g, '-')
     .replace(/→/g, '->')
+    .replace(/[–—]/g, '-')
+    .replace(/[●✓]/g, 'X')
+    .replace(/[○·]/g, '.')
     .replace(/[^\x20-\x7E]/g, ' ');
   return str.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
 }
@@ -2294,7 +2297,7 @@ export function buildArchiveNotebookPdfBytes(input: ArchiveNotebookPdfInput): Ui
           ).split('\n');
           for (const pLine of plateLines) {
             lines.push({
-              text: pLine.replace(/✓/g, 'X').replace(/·/g, '.'),
+              text: pLine.replace(/[●✓]/g, 'X').replace(/[○·]/g, '.').replace(/[–—]/g, '-'),
               font: 'F3',
               size: 8,
               indent: 22,
