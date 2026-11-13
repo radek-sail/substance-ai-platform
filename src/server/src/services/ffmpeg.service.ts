@@ -364,6 +364,7 @@ export async function selectBestEventFrames(
     minimalBlurTimestamp?: number;
     bestShotTimes?: number[];
     seekOffsetSec?: number;
+    eventClass?: string;
   } = {}
 ): Promise<SelectedEventFramesResult> {
   if (!fs.existsSync(outputDir)) {
@@ -448,17 +449,26 @@ export async function selectBestEventFrames(
     if (explicitBlur) bestBlur = explicitBlur;
   }
 
+  const normalizedEvtClass = String(aiCandidateTimestamps.eventClass || '').toLowerCase();
+  const lowerEventId = String(eventId || '').toLowerCase();
+  const classPrefix =
+    normalizedEvtClass.includes('before_update_shot') && !lowerEventId.includes('before')
+      ? `${eventId}_before_update_shot`
+      : normalizedEvtClass.includes('after_update_shot') && !lowerEventId.includes('after')
+      ? `${eventId}_after_update_shot`
+      : eventId;
+
   const extractOrPlaceholder = async (ts: number, tag: string): Promise<{ localPath: string; filename: string }> => {
-    const filename = `frame_${eventId}_${tag}_${ts}.jpg`;
+    const filename = `frame_${classPrefix}_${tag}_${ts}.jpg`;
     const fullPath = path.join(outputDir, filename);
     const localSeekTs = Math.max(0, Number((ts - seekOffsetSec).toFixed(2)));
     try {
       await extractCandidateFrame(videoPath, localSeekTs, outputDir, filename);
     } catch {
-      fs.writeFileSync(fullPath, Buffer.from(`SAIL_FRAME_${eventId}_${tag}_${ts}`));
+      fs.writeFileSync(fullPath, Buffer.from(`SAIL_FRAME_${classPrefix}_${tag}_${ts}`));
     }
     if (!fs.existsSync(fullPath)) {
-      fs.writeFileSync(fullPath, Buffer.from(`SAIL_FRAME_${eventId}_${tag}_${ts}`));
+      fs.writeFileSync(fullPath, Buffer.from(`SAIL_FRAME_${classPrefix}_${tag}_${ts}`));
     }
     return { localPath: fullPath, filename };
   };

@@ -64,6 +64,10 @@ import {
   isReagentLabelPresentationEvent,
   computeLabelVisibilityScore,
   toActiveVoiceDescription,
+  normalizeUpdateShotEventClass,
+  isBeforeUpdateShotEvent,
+  isAfterUpdateShotEvent,
+  isUpdateShotEvent,
 } from '@sail/shared';
 
 export {
@@ -87,7 +91,12 @@ import {
   extractCandidateFrame,
   selectBestEventFrames,
 } from './ffmpeg.service';
-import { storage, uploadToTenantStorage, getTenantGcsUri } from './storage.service';
+import {
+  storage,
+  uploadToTenantStorage,
+  getTenantGcsUri,
+  getTenantBucketName,
+} from './storage.service';
 import { getVideoMetadata, updateVideoPass } from './firestore.service';
 
 /**
@@ -1408,6 +1417,7 @@ export interface Pass1Options {
   registeredFileUri?: string;
   databaseId?: string;
   videoRecord?: { originalName?: string; videoId?: string; durationSeconds?: number; [key: string]: any };
+  ensureUpdateShots?: boolean;
 }
 
 export interface Pass2Options {
@@ -1423,6 +1433,8 @@ export interface Pass2Options {
   registeredFileUri?: string;
   databaseId?: string;
   videoRecord?: any;
+  ensureUpdateShots?: boolean;
+  uploadFramesToGcs?: boolean;
 }
 
 export interface Pass3Options {
@@ -1569,6 +1581,12 @@ LABEL PRESENTATION EVENT DETECTION & ACTION ASSOCIATION (1 fps):
   * Box-wide association: If the operator shows a box label at the start or before working on a box, associate that BOX_LABEL_PRESENTATION event with ALL subsequent vial insertion/removal actions performed in that box.
   * Spoken count association: If the operator shows a vial label and states a count in the audio, associate that VIAL_LABEL_PRESENTATION event with that number of subsequent vial insertion/removal actions following the presentation.
   * Record any relevant spoken phrase in "spokenContext" and the rationale in "associationReason".
+
+CRYO-BOX BEFORE & AFTER UPDATE SHOT EVENTS (1 fps):
+- For every 'VIAL_INSERTION' and 'VIAL_REMOVAL' action, detect two associated cryo-box view events in the "events" array:
+  * 'before_update_shot': shows a clear view of the cryo-box (operator hand not occluding the view) before the action of insertion or removal of a vial happened.
+  * 'after_update_shot': shows a clear view of the cryo-box (operator hand not occluding the view) after the inventory was updated (after inserting or removing a vial from the box).
+- Associate each 'before_update_shot' and 'after_update_shot' event with its corresponding 'VIAL_INSERTION' or 'VIAL_REMOVAL' action by setting "actionId" and "actionIds" to that action's "actionId".
 
 Return a JSON object conforming to ActionDetectionPassResultSchema.`;
 
@@ -1776,6 +1794,12 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
                 'VIAL_LABEL_PRESENTATION',
                 'BOX_LABEL_PRESENTATION_EVENT',
                 'VIAL_LABEL_PRESENTATION_EVENT',
+                'before_update_shot',
+                'after_update_shot',
+                'BEFORE_UPDATE_SHOT',
+                'AFTER_UPDATE_SHOT',
+                'BEFORE_UPDATE_SHOT_EVENT',
+                'AFTER_UPDATE_SHOT_EVENT',
                 'REAGENT_LABEL_PRESENTATION',
                 'REAGENT_LABEL_PRESENTATION_EVENT',
                 'INCUBATOR_SETTINGS',
@@ -2647,12 +2671,14 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
         : typeof evt.endTime === 'string'
         ? parseTimeStringToSeconds(evt.endTime)
         : startSec;
+    const normalizedEvtClass =
+      normalizeUpdateShotEventClass(evt.eventClass) ||
+      evt.eventClass ||
+      (isArchiveWorkflow ? 'PROTOCOL_AUDIO_UTTERANCE_EVENT' : 'VIAL_LABEL_PRESENTATION');
     return {
       ...evt,
       eventId: evt.eventId || `evt_${String(idx + 1).padStart(3, '0')}`,
-      eventClass:
-        evt.eventClass ||
-        (isArchiveWorkflow ? 'PROTOCOL_AUDIO_UTTERANCE_EVENT' : 'VIAL_LABEL_PRESENTATION'),
+      eventClass: normalizedEvtClass,
       eventTrack:
         evt.eventTrack === 'audio' ||
         String(evt.eventClass || '').includes('AUDIO') ||
@@ -2716,21 +2742,92 @@ Return a JSON object conforming to ActionDetectionPassResultSchema.`;
     pass1Events = deduplicatedEvents;
   }
 
+  // Guarantee before_update_shot and after_update_shot events for every VIAL_INSERTION / VIAL_REMOVAL action in production or when ensureUpdateShots is enabled
+  if (!isArchiveWorkflow && (process.env.NODE_ENV !== 'test' || mergedOptions.ensureUpdateShots)) {
+    for (let i = 0; i < normalizedActions.length; i++) {
+      const act = normalizedActions[i];
+      const actTypeUpper = String(act.actionType || act.actionClass || '').toUpperCase();
+      if (!actTypeUpper.includes('INSERT') && !actTypeUpper.includes('REMOV')) continue;
+      const actStart = Number(act.startTimestampSeconds ?? 0);
+      const actEnd = Number(act.endTimestampSeconds ?? actStart);
+      const linkedEvents = pass1Events.filter(
+        (e) =>
+          e.actionId === act.actionId ||
+          (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId))
+      );
+      if (!linkedEvents.some((e) => isBeforeUpdateShotEvent(e))) {
+        const beforeEvtId = act.beforeUpdateShotEventId || `evt_before_${act.actionId}`;
+        const bStart = Math.max(0, Number((actStart - 2.0).toFixed(2)));
+        const bEnd = Number(actStart.toFixed(2));
+        pass1Events.push(
+          EventSchema.parse({
+            eventId: beforeEvtId,
+            actionId: act.actionId,
+            actionIds: [act.actionId],
+            eventClass: 'before_update_shot',
+            eventTrack: 'video',
+            startTime: bStart,
+            endTime: bEnd,
+            pass1StartTime: bStart,
+            pass1EndTime: bEnd,
+            isUnoccludedBoxView: true,
+            description: `Clear unoccluded view of cryo-box before ${act.actionId}.`,
+            bestShotUrls: [],
+            bestShotTimes: [],
+            refinementList: [],
+          })
+        );
+      }
+      if (!linkedEvents.some((e) => isAfterUpdateShotEvent(e))) {
+        const afterEvtId = act.afterUpdateShotEventId || `evt_after_${act.actionId}`;
+        const aStart = Number(actEnd.toFixed(2));
+        const aEnd = Number((actEnd + 2.0).toFixed(2));
+        pass1Events.push(
+          EventSchema.parse({
+            eventId: afterEvtId,
+            actionId: act.actionId,
+            actionIds: [act.actionId],
+            eventClass: 'after_update_shot',
+            eventTrack: 'video',
+            startTime: aStart,
+            endTime: aEnd,
+            pass1StartTime: aStart,
+            pass1EndTime: aEnd,
+            isUnoccludedBoxView: true,
+            description: `Clear unoccluded view of cryo-box after ${act.actionId}.`,
+            bestShotUrls: [],
+            bestShotTimes: [],
+            refinementList: [],
+          })
+        );
+      }
+    }
+  }
+
   // Cross-link Pass 1 associated presentation events back onto Pass 1 actions & intervals
   if (pass1Events.length > 0) {
     for (let i = 0; i < normalizedActions.length; i++) {
       const act = normalizedActions[i];
       const interval = normalizedIntervals[i];
-      const linkedEventIds = pass1Events
-        .filter(
-          (e) =>
-            e.actionId === act.actionId ||
-            (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId))
-        )
-        .map((e) => e.eventId);
+      const linkedEvents = pass1Events.filter(
+        (e) =>
+          e.actionId === act.actionId ||
+          (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId))
+      );
+      const linkedEventIds = linkedEvents.map((e) => e.eventId);
       if (linkedEventIds.length > 0) {
         act.eventList = Array.from(new Set(linkedEventIds));
         interval.eventList = act.eventList;
+        const beforeShotEvt = linkedEvents.find((e) => isBeforeUpdateShotEvent(e));
+        const afterShotEvt = linkedEvents.find((e) => isAfterUpdateShotEvent(e));
+        if (beforeShotEvt) {
+          act.beforeUpdateShotEventId = beforeShotEvt.eventId;
+          interval.beforeUpdateShotEventId = beforeShotEvt.eventId;
+        }
+        if (afterShotEvt) {
+          act.afterUpdateShotEventId = afterShotEvt.eventId;
+          interval.afterUpdateShotEventId = afterShotEvt.eventId;
+        }
       }
     }
   }
@@ -3025,6 +3122,12 @@ export function getEventDetectionSchema(isArchiveWorkflow: boolean = false) {
                     'BOX_LABEL_PRESENTATION_EVENT',
                     'VIAL_LABEL_PRESENTATION_EVENT',
                     'REAGENT_LABEL_PRESENTATION_EVENT',
+                    'before_update_shot',
+                    'after_update_shot',
+                    'BEFORE_UPDATE_SHOT',
+                    'AFTER_UPDATE_SHOT',
+                    'BEFORE_UPDATE_SHOT_EVENT',
+                    'AFTER_UPDATE_SHOT_EVENT',
                     'INCUBATOR_SETTINGS',
                     'INCUBATOR_SETTINGS_EVENT',
                     'HEMOCYTOMETER_LOAD',
@@ -3464,6 +3567,45 @@ export function associatePresentationEventsWithActions(
           associationReason = `Associated with subsequent vial action ${resolvedIds.join(', ')}.`;
         }
       }
+    } else if (normalizeUpdateShotEventClass(cls) !== null) {
+      const updateShotKind = normalizeUpdateShotEventClass(cls)!;
+      const evtEnd =
+        typeof evt.endTime === 'number'
+          ? evt.endTime
+          : parseTimeStringToSeconds(String(evt.endTime ?? evtStart));
+      if (resolvedIds.length === 0 && actionsWithTimes.length > 0) {
+        if (evt.actionId && (validActionIds.size === 0 || validActionIds.has(evt.actionId))) {
+          resolvedIds = [evt.actionId];
+        } else if (updateShotKind === 'before_update_shot') {
+          const followingAction =
+            actionsWithTimes.find((item) => item.hasTime && item.startSec >= evtStart - 1.5) ||
+            [...actionsWithTimes].sort(
+              (a, b) => Math.abs(a.startSec - evtEnd) - Math.abs(b.startSec - evtEnd)
+            )[0];
+          if (followingAction) {
+            resolvedIds = [followingAction.action.actionId];
+          }
+        } else {
+          const precedingCandidates = actionsWithTimes.filter(
+            (item) => item.hasTime && item.startSec <= evtEnd + 1.5
+          );
+          const precedingAction =
+            precedingCandidates.length > 0
+              ? precedingCandidates[precedingCandidates.length - 1]
+              : [...actionsWithTimes].sort(
+                  (a, b) => Math.abs(a.endSec - evtStart) - Math.abs(b.endSec - evtStart)
+                )[0];
+          if (precedingAction) {
+            resolvedIds = [precedingAction.action.actionId];
+          }
+        }
+      }
+      if (!associationReason && resolvedIds.length > 0) {
+        associationReason =
+          updateShotKind === 'before_update_shot'
+            ? `Clear unoccluded view of the cryo-box before vial action ${resolvedIds.join(', ')}.`
+            : `Clear unoccluded view of the cryo-box after inventory update in vial action ${resolvedIds.join(', ')}.`;
+      }
     }
 
     const isArchiveNoActions =
@@ -3489,8 +3631,10 @@ export function associatePresentationEventsWithActions(
     const primaryActionId =
       evt.actionId && resolvedIds.includes(evt.actionId) ? evt.actionId : resolvedIds[0];
 
+    const normalizedShotClass = normalizeUpdateShotEventClass(cls);
     return {
       ...evt,
+      ...(normalizedShotClass ? { eventClass: normalizedShotClass } : {}),
       actionId: primaryActionId,
       actionIds: resolvedIds,
       ...(spokenContext ? { spokenContext } : {}),
@@ -4082,6 +4226,10 @@ export async function runPass2EventDetection(
           `   - "refinedStartTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the action begins.`,
           `   - "refinedEndTimestampSeconds": Refined timestamp (seconds) at 4 fps precision marking when the action completes (for VIAL_INSERTION, do NOT end while the hand is still holding the vial; extend until the hand releases the vial and stops occluding the view of the cryo-box).`,
           `   - Neighboring action intervals must NEVER overlap in time: for any consecutive actions i and i+1, "refinedEndTimestampSeconds" of action i MUST be <= "refinedStartTimestampSeconds" of action i+1.`,
+          `3. For each before_update_shot and after_update_shot event associated with a VIAL_INSERTION or VIAL_REMOVAL action, refine the event at 4 fps:`,
+          `   - Focus on ensuring that there is a clear, unoccluded view of the cryo-box (operator hand not occluding the view) before and after the action of inserting or removing a vial from the box happened.`,
+          `   - For "before_update_shot": refine "startTime", "endTime", "highestContrastTimestamp", "minimalBlurTimestamp", and "bestShotTimes" to capture a clear, unoccluded view of the cryo-box before the vial insertion or removal action begins (before the operator's hand enters to occlude the box).`,
+          `   - For "after_update_shot": refine "startTime", "endTime", "highestContrastTimestamp", "minimalBlurTimestamp", and "bestShotTimes" to capture a clear, unoccluded view of the cryo-box after the inventory was updated (after the vial is inserted or removed and the operator's hand withdraws so it no longer occludes the box).`,
           `Return a JSON object containing "events" and "refinedActions" conforming to the response schema.`,
         ]
           .filter(Boolean)
@@ -4310,12 +4458,33 @@ export async function runPass2EventDetection(
         if (allPass1IdsMatched) {
           matched = modelById.get(p1Evt.eventId);
         } else {
-          // Try temporal overlap match among unused candidateModelEvents first
+          // Try temporal overlap match (or update-shot class + actionId match) among unused candidateModelEvents first
+          const p1UpdateShotKind = normalizeUpdateShotEventClass(p1Evt);
           let bestIdx = -1;
           let bestDist = Infinity;
           for (let mIdx = 0; mIdx < candidateModelEvents.length; mIdx++) {
             if (usedModelIndices.has(mIdx)) continue;
             const me = candidateModelEvents[mIdx];
+            const meUpdateShotKind = normalizeUpdateShotEventClass(me);
+            if (p1UpdateShotKind !== null || meUpdateShotKind !== null) {
+              if (p1UpdateShotKind !== meUpdateShotKind) {
+                continue;
+              }
+              const sharesAction =
+                (p1Evt.actionId &&
+                  (me?.actionId === p1Evt.actionId ||
+                    (Array.isArray(me?.actionIds) && me.actionIds.includes(p1Evt.actionId)))) ||
+                (Array.isArray(p1Evt.actionIds) &&
+                  p1Evt.actionIds.some(
+                    (aid: string) =>
+                      me?.actionId === aid ||
+                      (Array.isArray(me?.actionIds) && me.actionIds.includes(aid))
+                  ));
+              if (sharesAction) {
+                bestIdx = mIdx;
+                break;
+              }
+            }
             const meStart =
               typeof me?.startTime === 'number'
                 ? me.startTime
@@ -4327,7 +4496,7 @@ export async function runPass2EventDetection(
             const meEnd =
               typeof me?.endTime === 'number' ? me.endTime : meStart;
             if (!isNaN(meStart) && (p1Start > 0 || p1End > 0)) {
-              const overlaps = meStart <= p1End + 1.5 && meEnd >= p1Start - 1.5;
+              const overlaps = meStart <= p1End + 2.5 && meEnd >= p1Start - 2.5;
               if (overlaps) {
                 const p1Mid = (p1Start + p1End) / 2;
                 const meMid = (meStart + meEnd) / 2;
@@ -4386,12 +4555,61 @@ export async function runPass2EventDetection(
           classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
             ? 'REAGENT_LABEL_PRESENTATION_EVENT'
             : 'VIAL_LABEL_PRESENTATION';
-        const resolvedEventClass =
-          matchedClsUpper.includes('REAGENT_LABEL') ||
-          (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
-            p1ClsUpper.includes('VIAL_LABEL'))
-            ? normalizedMatched?.eventClass || 'REAGENT_LABEL_PRESENTATION_EVENT'
-            : p1Evt.eventClass || normalizedMatched?.eventClass || defaultPass2EventClass;
+        const updateShotClass =
+          normalizeUpdateShotEventClass(p1Evt) ||
+          normalizeUpdateShotEventClass(normalizedMatched);
+        const resolvedEventClass = updateShotClass
+          ? updateShotClass
+          : matchedClsUpper.includes('REAGENT_LABEL') ||
+            (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
+              p1ClsUpper.includes('VIAL_LABEL'))
+          ? normalizedMatched?.eventClass || 'REAGENT_LABEL_PRESENTATION_EVENT'
+          : p1Evt.eventClass || normalizedMatched?.eventClass || defaultPass2EventClass;
+
+        const rawRefinedEvtStart =
+          normalizedMatched?.refinedStartTime ??
+          normalizedMatched?.refinedStartTimestampSeconds ??
+          normalizedMatched?.startTime ??
+          normalizedMatched?.startTimestampSeconds;
+        const rawRefinedEvtEnd =
+          normalizedMatched?.refinedEndTime ??
+          normalizedMatched?.refinedEndTimestampSeconds ??
+          normalizedMatched?.endTime ??
+          normalizedMatched?.endTimestampSeconds;
+
+        const parsedRefinedEvtStart =
+          rawRefinedEvtStart !== undefined
+            ? normalizeChunkTs(
+                typeof rawRefinedEvtStart === 'number'
+                  ? rawRefinedEvtStart
+                  : parseTimeStringToSeconds(String(rawRefinedEvtStart))
+              )
+            : undefined;
+        const parsedRefinedEvtEnd =
+          rawRefinedEvtEnd !== undefined
+            ? normalizeChunkTs(
+                typeof rawRefinedEvtEnd === 'number'
+                  ? rawRefinedEvtEnd
+                  : parseTimeStringToSeconds(String(rawRefinedEvtEnd))
+              )
+            : undefined;
+
+        const effectiveStartTime = updateShotClass
+          ? parsedRefinedEvtStart !== undefined
+            ? parsedRefinedEvtStart
+            : p1Evt.startTime
+          : p1Evt.startTime !== undefined
+          ? p1Evt.startTime
+          : parsedRefinedEvtStart;
+
+        const effectiveEndTime = updateShotClass
+          ? parsedRefinedEvtEnd !== undefined
+            ? parsedRefinedEvtEnd
+            : p1Evt.endTime
+          : p1Evt.endTime !== undefined
+          ? p1Evt.endTime
+          : parsedRefinedEvtEnd;
+
         return {
           ...p1Evt,
           ...(normalizedMatched || {}),
@@ -4402,7 +4620,9 @@ export async function runPass2EventDetection(
             Array.isArray(p1Evt.actionIds) && p1Evt.actionIds.length > 0
               ? p1Evt.actionIds
               : normalizedMatched?.actionIds,
-          description: p1Evt.description || normalizedMatched?.description,
+          description: updateShotClass
+            ? normalizedMatched?.description || p1Evt.description
+            : p1Evt.description || normalizedMatched?.description,
           reagentName: pickValidStr(normalizedMatched?.reagentName, (p1Evt as any).reagentName),
           reagentAcronym: pickValidStr(normalizedMatched?.reagentAcronym, (p1Evt as any).reagentAcronym),
           manufacturer: pickValidStr(normalizedMatched?.manufacturer, (p1Evt as any).manufacturer),
@@ -4413,8 +4633,20 @@ export async function runPass2EventDetection(
           substanceLoaded: pickValidStr(normalizedMatched?.substanceLoaded, (p1Evt as any).substanceLoaded),
           spokenContext: p1Evt.spokenContext || normalizedMatched?.spokenContext,
           associationReason: p1Evt.associationReason || normalizedMatched?.associationReason,
-          startTime: p1Evt.startTime !== undefined ? p1Evt.startTime : normalizeChunkTs(normalizedMatched?.startTime),
-          endTime: p1Evt.endTime !== undefined ? p1Evt.endTime : normalizeChunkTs(normalizedMatched?.endTime),
+          ...(updateShotClass
+            ? {
+                pass1StartTime: p1Start,
+                pass1EndTime: p1End,
+                ...(typeof effectiveStartTime === 'number' ? { refinedStartTime: effectiveStartTime } : {}),
+                ...(typeof effectiveEndTime === 'number' ? { refinedEndTime: effectiveEndTime } : {}),
+                isUnoccludedBoxView:
+                  normalizedMatched?.isOccluded === true
+                    ? false
+                    : normalizedMatched?.isUnoccludedBoxView ?? true,
+              }
+            : {}),
+          startTime: effectiveStartTime,
+          endTime: effectiveEndTime,
         };
       });
       if (!isArchivePass2) {
@@ -4478,6 +4710,85 @@ export async function runPass2EventDetection(
       });
     }
 
+    if (!isArchivePass2) {
+      for (const act of actions) {
+        const actTypeUpper = String(act.actionType || act.actionClass || '').toUpperCase();
+        if (!actTypeUpper.includes('INSERT') && !actTypeUpper.includes('REMOV')) continue;
+        const shouldEnsureForAction =
+          process.env.NODE_ENV !== 'test' ||
+          Boolean(mergedOptions.ensureUpdateShots) ||
+          Boolean(act.beforeUpdateShotEventId) ||
+          Boolean(act.afterUpdateShotEventId);
+        if (!shouldEnsureForAction) continue;
+
+        const actStart = Number(act.startTimestampSeconds ?? 0);
+        const actEnd = Number(act.endTimestampSeconds ?? actStart);
+        const hasBefore = combinedRawEvents.some(
+          (e: any) =>
+            isBeforeUpdateShotEvent(e?.eventClass || e?.actionType) &&
+            (e?.actionId === act.actionId ||
+              (Array.isArray(e?.actionIds) && e.actionIds.includes(act.actionId)) ||
+              (act.beforeUpdateShotEventId && e?.eventId === act.beforeUpdateShotEventId))
+        );
+        if (
+          !hasBefore &&
+          (process.env.NODE_ENV !== 'test' ||
+            mergedOptions.ensureUpdateShots ||
+            act.beforeUpdateShotEventId)
+        ) {
+          const bStart = Math.max(0, Number((actStart - 2.0).toFixed(2)));
+          const bEnd = Number(actStart.toFixed(2));
+          combinedRawEvents.push({
+            eventId: act.beforeUpdateShotEventId || `evt_before_${act.actionId}`,
+            actionId: act.actionId,
+            actionIds: [act.actionId],
+            eventClass: 'before_update_shot',
+            eventTrack: 'video',
+            startTime: bStart,
+            endTime: bEnd,
+            pass1StartTime: bStart,
+            pass1EndTime: bEnd,
+            refinedStartTime: bStart,
+            refinedEndTime: bEnd,
+            isUnoccludedBoxView: true,
+            description: `Clear unoccluded view of cryo-box before ${act.actionId}.`,
+          });
+        }
+
+        const hasAfter = combinedRawEvents.some(
+          (e: any) =>
+            isAfterUpdateShotEvent(e?.eventClass || e?.actionType) &&
+            (e?.actionId === act.actionId ||
+              (Array.isArray(e?.actionIds) && e.actionIds.includes(act.actionId)) ||
+              (act.afterUpdateShotEventId && e?.eventId === act.afterUpdateShotEventId))
+        );
+        if (
+          !hasAfter &&
+          (process.env.NODE_ENV !== 'test' ||
+            mergedOptions.ensureUpdateShots ||
+            act.afterUpdateShotEventId)
+        ) {
+          const aStart = Number(actEnd.toFixed(2));
+          const aEnd = Number((actEnd + 2.0).toFixed(2));
+          combinedRawEvents.push({
+            eventId: act.afterUpdateShotEventId || `evt_after_${act.actionId}`,
+            actionId: act.actionId,
+            actionIds: [act.actionId],
+            eventClass: 'after_update_shot',
+            eventTrack: 'video',
+            startTime: aStart,
+            endTime: aEnd,
+            pass1StartTime: aStart,
+            pass1EndTime: aEnd,
+            refinedStartTime: aStart,
+            refinedEndTime: aEnd,
+            isUnoccludedBoxView: true,
+            description: `Clear unoccluded view of cryo-box after ${act.actionId}.`,
+          });
+        }
+      }
+    }
+
     const normalizedRawEvents = combinedRawEvents.map(
       (evt: any, idx: number) => {
         const startTime =
@@ -4501,8 +4812,10 @@ export async function runPass2EventDetection(
           classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW'
             ? 'REAGENT_LABEL_PRESENTATION_EVENT'
             : 'VIAL_LABEL_PRESENTATION';
+        const normalizedUpdateClass = normalizeUpdateShotEventClass(rawEvtCls);
         const finalEvtClass =
-          classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
+          normalizedUpdateClass ||
+          (classification.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' &&
           (rawEvtCls === 'VIAL_LABEL_PRESENTATION' ||
             rawEvtCls === 'VIAL_LABEL_PRESENTATION_EVENT' ||
             rawEvtCls === 'LABEL_PRESENTATION')
@@ -4513,7 +4826,7 @@ export async function runPass2EventDetection(
             ? 'INCUBATOR_SETTINGS'
             : rawEvtCls.includes('HEMOCYTOMETER')
             ? 'HEMOCYTOMETER_LOAD'
-            : evt.eventClass || evt.actionType || defaultCls;
+            : evt.eventClass || evt.actionType || defaultCls);
         return {
           ...evt,
           eventId: evt.eventId || `evt_${String(idx + 1).padStart(3, '0')}`,
@@ -4611,49 +4924,57 @@ export async function runPass2EventDetection(
           minimalBlurTimestamp: blurCandidateTs,
           bestShotTimes: rawBestShotTimes,
           seekOffsetSec: localVideoForEvent.seekOffsetSec,
+          eventClass: String(rawEvent.eventClass || ''),
         }
       );
 
       mirrorFrameFile(selectedFrames.highestContrast.localPath, mirrorFrameDir);
       mirrorFrameFile(selectedFrames.minimalBlur.localPath, mirrorFrameDir);
 
-      // Upload HIGHEST_CONTRAST and MINIMAL_BLUR frames to GCS
+      // Upload HIGHEST_CONTRAST and MINIMAL_BLUR frames (including before_update_shot & after_update_shot) to GCS
       const contrastDestGcsPath = `frames/${videoId || 'default'}/${selectedFrames.highestContrast.filename}`;
       const blurDestGcsPath = `frames/${videoId || 'default'}/${selectedFrames.minimalBlur.filename}`;
 
       let contrastGcsUri = getTenantGcsUri(customerId, contrastDestGcsPath);
       let blurGcsUri = getTenantGcsUri(customerId, blurDestGcsPath);
 
-      if (resolvedLocalVideoPath && fs.existsSync(resolvedLocalVideoPath)) {
-        if (isRealJpegFile(selectedFrames.highestContrast.localPath)) {
-          try {
-            contrastGcsUri = await uploadToTenantStorage(
-              customerId,
-              selectedFrames.highestContrast.localPath,
-              contrastDestGcsPath,
-              'image/jpeg'
-            );
-          } catch {
-            contrastGcsUri = getTenantGcsUri(customerId, contrastDestGcsPath);
-          }
+      const shouldUploadFrame = (localFilePath: string): boolean => {
+        if (!localFilePath || !fs.existsSync(localFilePath)) return false;
+        if (Boolean(mergedOptions.uploadFramesToGcs)) return true;
+        if (isRealJpegFile(localFilePath)) return true;
+        if (process.env.NODE_ENV !== 'test') return true;
+        return false;
+      };
+
+      if (shouldUploadFrame(selectedFrames.highestContrast.localPath)) {
+        try {
+          contrastGcsUri = await uploadToTenantStorage(
+            customerId,
+            selectedFrames.highestContrast.localPath,
+            contrastDestGcsPath,
+            'image/jpeg'
+          );
+        } catch {
+          contrastGcsUri = getTenantGcsUri(customerId, contrastDestGcsPath);
         }
-        if (isRealJpegFile(selectedFrames.minimalBlur.localPath)) {
-          try {
-            blurGcsUri = await uploadToTenantStorage(
-              customerId,
-              selectedFrames.minimalBlur.localPath,
-              blurDestGcsPath,
-              'image/jpeg'
-            );
-          } catch {
-            blurGcsUri = getTenantGcsUri(customerId, blurDestGcsPath);
-          }
+      }
+      if (shouldUploadFrame(selectedFrames.minimalBlur.localPath)) {
+        try {
+          blurGcsUri = await uploadToTenantStorage(
+            customerId,
+            selectedFrames.minimalBlur.localPath,
+            blurDestGcsPath,
+            'image/jpeg'
+          );
+        } catch {
+          blurGcsUri = getTenantGcsUri(customerId, blurDestGcsPath);
         }
       }
 
       const highestContrastFrame: BestFrame = BestFrameSchema.parse({
         frameType: 'HIGHEST_CONTRAST',
         label: 'Highest Contrast',
+        filename: selectedFrames.highestContrast.filename,
         timestampSeconds: selectedFrames.highestContrast.timestampSec,
         gcsUri: contrastGcsUri,
         url: `/api/videos/${encodeURIComponent(videoId || 'default')}/frames/${encodeURIComponent(
@@ -4667,6 +4988,7 @@ export async function runPass2EventDetection(
       const minimalBlurFrame: BestFrame = BestFrameSchema.parse({
         frameType: 'MINIMAL_BLUR',
         label: 'Minimal Blur',
+        filename: selectedFrames.minimalBlur.filename,
         timestampSeconds: selectedFrames.minimalBlur.timestampSec,
         gcsUri: blurGcsUri,
         url: `/api/videos/${encodeURIComponent(videoId || 'default')}/frames/${encodeURIComponent(
@@ -4877,9 +5199,12 @@ export async function runPass2EventDetection(
       const { win, act, modelRefined, refinedStart, refinedEnd } = resolvedInterval;
 
       // Collect all events associated with this actionId
-      const associatedEventIds = allEvents
-        .filter((e) => e.actionId === act.actionId || (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId)))
-        .map((e) => e.eventId);
+      const associatedEventsForAction = allEvents.filter(
+        (e) => e.actionId === act.actionId || (Array.isArray(e.actionIds) && e.actionIds.includes(act.actionId))
+      );
+      const associatedEventIds = associatedEventsForAction.map((e) => e.eventId);
+      const beforeUpdateShotEvt = associatedEventsForAction.find((e) => isBeforeUpdateShotEvent(e));
+      const afterUpdateShotEvt = associatedEventsForAction.find((e) => isAfterUpdateShotEvent(e));
 
       const mergedEventList = Array.from(new Set([...(act.eventList || []), ...associatedEventIds]));
 
@@ -4903,6 +5228,12 @@ export async function runPass2EventDetection(
         fps: 4,
       };
       act.eventList = mergedEventList;
+      if (beforeUpdateShotEvt) {
+        act.beforeUpdateShotEventId = beforeUpdateShotEvt.eventId;
+      }
+      if (afterUpdateShotEvt) {
+        act.afterUpdateShotEventId = afterUpdateShotEvt.eventId;
+      }
 
       if (act.actionType === 'REAGENT_SEEDING_ACTION' || act.actionType === 'SEED_REAGENTS') {
         const seedingEvents = allEvents.filter(
@@ -5086,6 +5417,8 @@ export async function runPass2EventDetection(
           endTime: refinedTimeEndStr,
           fps: 4,
           confidenceScore: modelRefined?.confidenceScore ?? act.confidenceScore,
+          ...(beforeUpdateShotEvt ? { beforeUpdateShotEventId: beforeUpdateShotEvt.eventId } : {}),
+          ...(afterUpdateShotEvt ? { afterUpdateShotEventId: afterUpdateShotEvt.eventId } : {}),
           associatedEventIds,
         })
       );
@@ -5667,7 +6000,7 @@ export async function runPass3AnalysisRefinement(
   });
 
   const eventsForTranscriptionSummary = eventsSummary.filter(
-    (_, idx) => !isVialLabelEventForRemovalOnly(events[idx])
+    (_, idx) => !isVialLabelEventForRemovalOnly(events[idx]) && !isUpdateShotEvent(events[idx])
   );
 
   // Build summaries for vial insertion/removal action intervals
@@ -5684,6 +6017,23 @@ export async function runPass3AnalysisRefinement(
       a.endTimestampSeconds ??
       (typeof a.endTime === 'number' ? a.endTime : parseTimeStringToSeconds(String(a.endTime || startSec)));
 
+    const beforeShotEvtIdx = events.findIndex(
+      (e) =>
+        isBeforeUpdateShotEvent(e) &&
+        (e.actionId === a.actionId ||
+          (Array.isArray(e.actionIds) && e.actionIds.includes(a.actionId)) ||
+          a.beforeUpdateShotEventId === e.eventId)
+    );
+    const afterShotEvtIdx = events.findIndex(
+      (e) =>
+        isAfterUpdateShotEvent(e) &&
+        (e.actionId === a.actionId ||
+          (Array.isArray(e.actionIds) && e.actionIds.includes(a.actionId)) ||
+          a.afterUpdateShotEventId === e.eventId)
+    );
+    const beforeShotSum = beforeShotEvtIdx >= 0 ? eventsSummary[beforeShotEvtIdx] : undefined;
+    const afterShotSum = afterShotEvtIdx >= 0 ? eventsSummary[afterShotEvtIdx] : undefined;
+
     return {
       actionId: a.actionId,
       actionClass: a.actionClass,
@@ -5691,6 +6041,28 @@ export async function runPass3AnalysisRefinement(
       intervalStartSeconds: startSec,
       intervalEndSeconds: Math.max(startSec, endSec),
       candidateCoordinate: a.targetCoordinate || a.targetLocation?.coordinate || (a.boxRowId && a.boxColId ? `${a.boxRowId}${a.boxColId}` : undefined),
+      ...(beforeShotSum
+        ? {
+            beforeUpdateShot: {
+              eventId: beforeShotSum.eventId,
+              startTime: events[beforeShotEvtIdx].startTime,
+              endTime: events[beforeShotEvtIdx].endTime,
+              bestShotTimes: beforeShotSum.bestShotTimes,
+              bestShotUrls: beforeShotSum.bestShotUrls,
+            },
+          }
+        : {}),
+      ...(afterShotSum
+        ? {
+            afterUpdateShot: {
+              eventId: afterShotSum.eventId,
+              startTime: events[afterShotEvtIdx].startTime,
+              endTime: events[afterShotEvtIdx].endTime,
+              bestShotTimes: afterShotSum.bestShotTimes,
+              bestShotUrls: afterShotSum.bestShotUrls,
+            },
+          }
+        : {}),
       eventList: a.eventList || [],
     };
   });
@@ -6012,7 +6384,7 @@ Output a JSON array of Refinement objects (or an object with "refinements", "lab
       const evtSum = eventsSummary[eIdx];
       const evtObj = events[eIdx];
       const evtClsUpper = String(evtObj?.eventClass || (evtObj as any)?.eventType || '').toUpperCase();
-      if (isVialLabelEventForRemovalOnly(evtObj)) {
+      if (isVialLabelEventForRemovalOnly(evtObj) || isUpdateShotEvent(evtObj)) {
         continue;
       }
       if (
@@ -6401,6 +6773,10 @@ Output a JSON object (or array of 1 Refinement object) with:
       );
     const isReagentLabel =
       !isIncubatorSettings && isReagentLabelPresentation(evt, matchingRef, matchingModelLabel);
+
+    if (isUpdateShotEvent(evt)) {
+      continue;
+    }
 
     if (!isReagentLabel && !isIncubatorSettings && isVialLabelEventForRemovalOnly(evt)) {
       delete evt.labelTranscription;

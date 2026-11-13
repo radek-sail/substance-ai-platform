@@ -2389,5 +2389,386 @@ describe('Phase 3: The 4-Stage Hierarchical AI Pipeline Service', () => {
       assert.ok(pass2RefinedProps.refinedEndTimestampSeconds.description.includes('stops occluding the view of the cryo-box'));
       assert.strictEqual(pass2Result.refinedActions[0].refinedEndTimestampSeconds, 16.5);
     });
+
+    it('should detect before_update_shot and after_update_shot events in Pass 1 and refine them in Pass 2 for a clear unoccluded cryo-box view before and after vial insertion and removal actions', async () => {
+      const capturedCalls = [];
+      setGenAIClient({
+        models: {
+          generateContent: async (params) => {
+            capturedCalls.push(params);
+            // Call 1: Pass 1 (1 fps)
+            if (capturedCalls.length === 1) {
+              return {
+                text: JSON.stringify({
+                  workflowContext: 'INVENTORY_UPDATE_WORKFLOW',
+                  totalActionsDetected: 2,
+                  totalEventsDetected: 5,
+                  actions: [
+                    {
+                      actionId: 'act_insert_01',
+                      actionType: 'VIAL_INSERTION',
+                      actionClass: 'VIAL_INSERTION_ACTION',
+                      description: 'Operator inserts vial into slot A1 and withdraws hand',
+                      startTime: '00:10',
+                      endTime: '00:15',
+                      startTimestampSeconds: 10.0,
+                      endTimestampSeconds: 15.0,
+                      confidenceScore: 0.98,
+                      targetCoordinate: 'A1',
+                    },
+                    {
+                      actionId: 'act_remove_02',
+                      actionType: 'VIAL_REMOVAL',
+                      actionClass: 'VIAL_REMOVAL_ACTION',
+                      description: 'Operator removes vial from slot B2 and withdraws hand',
+                      startTime: '00:22',
+                      endTime: '00:27',
+                      startTimestampSeconds: 22.0,
+                      endTimestampSeconds: 27.0,
+                      confidenceScore: 0.97,
+                      targetCoordinate: 'B2',
+                    },
+                  ],
+                  events: [
+                    {
+                      eventId: 'evt_vial_lbl_01',
+                      eventClass: 'VIAL_LABEL_PRESENTATION',
+                      eventTrack: 'video',
+                      actionId: 'act_insert_01',
+                      actionIds: ['act_insert_01'],
+                      startTimestampSeconds: 3.0,
+                      endTimestampSeconds: 6.0,
+                      description: 'Operator presents HEK293 vial label to camera',
+                    },
+                    {
+                      eventId: 'evt_before_01',
+                      eventClass: 'before_update_shot',
+                      eventTrack: 'video',
+                      actionId: 'act_insert_01',
+                      actionIds: ['act_insert_01'],
+                      startTimestampSeconds: 8.0,
+                      endTimestampSeconds: 10.0,
+                      description: 'Clear view of cryo-box before vial insertion at A1 (hand not occluding view)',
+                    },
+                    {
+                      eventId: 'evt_after_01',
+                      eventClass: 'after_update_shot',
+                      eventTrack: 'video',
+                      actionId: 'act_insert_01',
+                      actionIds: ['act_insert_01'],
+                      startTimestampSeconds: 15.0,
+                      endTimestampSeconds: 17.0,
+                      description: 'Clear view of cryo-box after vial insertion at A1 (hand withdrawn)',
+                    },
+                    {
+                      eventId: 'evt_before_02',
+                      eventClass: 'BEFORE_UPDATE_SHOT',
+                      eventTrack: 'video',
+                      startTimestampSeconds: 20.0,
+                      endTimestampSeconds: 22.0,
+                      description: 'Clear view of cryo-box before vial removal at B2',
+                    },
+                    {
+                      eventId: 'evt_after_02',
+                      eventClass: 'AFTER_UPDATE_SHOT',
+                      eventTrack: 'video',
+                      startTimestampSeconds: 27.0,
+                      endTimestampSeconds: 29.0,
+                      description: 'Clear view of cryo-box after vial removal at B2',
+                    },
+                  ],
+                }),
+              };
+            }
+            // Call 2: Pass 2 (4 fps)
+            if (capturedCalls.length === 2) {
+              return {
+                text: JSON.stringify({
+                  events: [
+                    {
+                      eventId: 'evt_vial_lbl_01',
+                      eventClass: 'VIAL_LABEL_PRESENTATION',
+                      actionId: 'act_insert_01',
+                      actionIds: ['act_insert_01'],
+                      startTime: 3.0,
+                      endTime: 6.0,
+                      highestContrastTimestamp: 4.25,
+                      minimalBlurTimestamp: 4.5,
+                      bestShotTimes: [4.25, 4.5],
+                    },
+                    {
+                      eventId: 'evt_before_01',
+                      eventClass: 'before_update_shot',
+                      actionId: 'act_insert_01',
+                      actionIds: ['act_insert_01'],
+                      startTime: 8.5,
+                      endTime: 9.75,
+                      highestContrastTimestamp: 9.25,
+                      minimalBlurTimestamp: 9.5,
+                      bestShotTimes: [9.25, 9.5],
+                      isOccluded: false,
+                      description: 'Refined clear unoccluded view of cryo-box before vial insertion at A1',
+                    },
+                    {
+                      eventId: 'evt_after_01',
+                      eventClass: 'after_update_shot',
+                      actionId: 'act_insert_01',
+                      actionIds: ['act_insert_01'],
+                      startTime: 15.25,
+                      endTime: 16.75,
+                      highestContrastTimestamp: 15.5,
+                      minimalBlurTimestamp: 15.75,
+                      bestShotTimes: [15.5, 15.75],
+                      isOccluded: false,
+                      description: 'Refined clear unoccluded view of cryo-box after vial insertion at A1',
+                    },
+                    {
+                      eventId: 'evt_before_02',
+                      eventClass: 'before_update_shot',
+                      actionId: 'act_remove_02',
+                      actionIds: ['act_remove_02'],
+                      startTime: 20.5,
+                      endTime: 21.75,
+                      highestContrastTimestamp: 21.25,
+                      minimalBlurTimestamp: 21.5,
+                      bestShotTimes: [21.25, 21.5],
+                      isOccluded: false,
+                      description: 'Refined clear unoccluded view of cryo-box before vial removal at B2',
+                    },
+                    {
+                      eventId: 'evt_after_02',
+                      eventClass: 'after_update_shot',
+                      actionId: 'act_remove_02',
+                      actionIds: ['act_remove_02'],
+                      startTime: 27.25,
+                      endTime: 28.5,
+                      highestContrastTimestamp: 27.5,
+                      minimalBlurTimestamp: 27.75,
+                      bestShotTimes: [27.5, 27.75],
+                      isOccluded: false,
+                      description: 'Refined clear unoccluded view of cryo-box after vial removal at B2',
+                    },
+                  ],
+                  refinedActions: [
+                    {
+                      actionId: 'act_insert_01',
+                      refinedStartTimestampSeconds: 10.0,
+                      refinedEndTimestampSeconds: 15.25,
+                    },
+                    {
+                      actionId: 'act_remove_02',
+                      refinedStartTimestampSeconds: 22.0,
+                      refinedEndTimestampSeconds: 27.25,
+                    },
+                  ],
+                }),
+              };
+            }
+            // Subsequent calls: Pass 3
+            return {
+              text: JSON.stringify([
+                {
+                  refinementId: 'ref_evt_vial_lbl_01',
+                  eventId: 'evt_vial_lbl_01',
+                  actionId: 'act_insert_01',
+                  refinementClass: 'OCR_CONFLATION',
+                  transcriptionText: 'HEK293 JD 2026-01-15',
+                  vialLabelData: {
+                    cellLineName: 'HEK293',
+                    userInitials: 'JD',
+                    dateFrozen: '2026-01-15',
+                    fullText: 'HEK293 JD 2026-01-15',
+                  },
+                },
+                {
+                  refinementId: 'ref_act_insert_01',
+                  actionId: 'act_insert_01',
+                  refinementClass: 'SPATIAL_REFINEMENT',
+                  boxWellLocation: {
+                    actionId: 'act_insert_01',
+                    row: 'A',
+                    col: 1,
+                    coordinate: 'A1',
+                    originCorner: 'TOP_LEFT_BLACK',
+                  },
+                },
+                {
+                  refinementId: 'ref_act_remove_02',
+                  actionId: 'act_remove_02',
+                  refinementClass: 'SPATIAL_REFINEMENT',
+                  boxWellLocation: {
+                    actionId: 'act_remove_02',
+                    row: 'B',
+                    col: 2,
+                    coordinate: 'B2',
+                    originCorner: 'TOP_LEFT_BLACK',
+                  },
+                },
+              ]),
+            };
+          },
+        },
+      });
+
+      const classification = {
+        workflowType: 'INVENTORY_UPDATE_WORKFLOW',
+        inventoryName: 'CryoTank-Alpha',
+        transcribedAudio: 'Inserting HEK293 into A1 and removing from B2.',
+      };
+
+      const pass1Actions = await runPass1ActionDetection({
+        videoId: 'vid-update-shots-01',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_vid-update-shots-01.mp4',
+        classification,
+      });
+
+      // Verify Pass 1 prompt & schema include before_update_shot and after_update_shot
+      const pass1Req = capturedCalls[0];
+      const pass1Sys = pass1Req.config.systemInstruction;
+      const pass1Prompt = pass1Req.contents[0].parts.find((p) => p.text).text;
+      const pass1EventEnum =
+        pass1Req.config.responseSchema.properties.events.items.properties.eventClass.enum;
+      assert.ok(pass1Sys.includes('before_update_shot'));
+      assert.ok(pass1Sys.includes('after_update_shot'));
+      assert.ok(pass1Prompt.includes('before_update_shot'));
+      assert.ok(pass1Prompt.includes('after_update_shot'));
+      assert.ok(pass1EventEnum.includes('before_update_shot'));
+      assert.ok(pass1EventEnum.includes('after_update_shot'));
+
+      // Verify Pass 1 events normalized and associated with both insertion and removal actions
+      assert.strictEqual(pass1Actions.length, 2);
+      assert.strictEqual(pass1Actions.events.length, 5);
+      const p1Before1 = pass1Actions.events.find((e) => e.eventId === 'evt_before_01');
+      const p1After1 = pass1Actions.events.find((e) => e.eventId === 'evt_after_01');
+      const p1Before2 = pass1Actions.events.find((e) => e.eventId === 'evt_before_02');
+      const p1After2 = pass1Actions.events.find((e) => e.eventId === 'evt_after_02');
+
+      assert.strictEqual(p1Before1.eventClass, 'before_update_shot');
+      assert.strictEqual(p1After1.eventClass, 'after_update_shot');
+      assert.strictEqual(p1Before2.eventClass, 'before_update_shot');
+      assert.strictEqual(p1After2.eventClass, 'after_update_shot');
+      assert.strictEqual(p1Before2.actionId, 'act_remove_02');
+      assert.strictEqual(p1After2.actionId, 'act_remove_02');
+      assert.strictEqual(pass1Actions[0].beforeUpdateShotEventId, 'evt_before_01');
+      assert.strictEqual(pass1Actions[0].afterUpdateShotEventId, 'evt_after_01');
+      assert.strictEqual(pass1Actions[1].beforeUpdateShotEventId, 'evt_before_02');
+      assert.strictEqual(pass1Actions[1].afterUpdateShotEventId, 'evt_after_02');
+
+      // Run Pass 2 refinement
+      const pass2Events = await runPass2EventDetection({
+        videoId: 'vid-update-shots-01',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_vid-update-shots-01.mp4',
+        classification,
+        actions: pass1Actions,
+        events: pass1Actions.events,
+      });
+
+      const pass2Req = capturedCalls[1];
+      const pass2Sys = pass2Req.config.systemInstruction;
+      const pass2Prompt = pass2Req.contents[0].parts.find((p) => p.text).text;
+      const pass2EventEnum =
+        pass2Req.config.responseSchema.properties.events.items.properties.eventClass.enum;
+      assert.ok(pass2Sys.includes('Refining before_update_shot and after_update_shot Events'));
+      assert.ok(pass2Prompt.includes('before_update_shot'));
+      assert.ok(pass2Prompt.includes('after_update_shot'));
+      assert.ok(pass2Prompt.includes('clear, unoccluded view of the cryo-box'));
+      assert.ok(pass2EventEnum.includes('before_update_shot'));
+      assert.ok(pass2EventEnum.includes('after_update_shot'));
+
+      // Verify Pass 2 refined boundaries and best frames for before_update_shot and after_update_shot
+      assert.strictEqual(pass2Events.length, 5);
+      const p2Before1 = pass2Events.find((e) => e.eventId === 'evt_before_01');
+      const p2After1 = pass2Events.find((e) => e.eventId === 'evt_after_01');
+      const p2Before2 = pass2Events.find((e) => e.eventId === 'evt_before_02');
+      const p2After2 = pass2Events.find((e) => e.eventId === 'evt_after_02');
+
+      assert.strictEqual(p2Before1.eventClass, 'before_update_shot');
+      assert.strictEqual(p2Before1.pass1StartTime, 8.0);
+      assert.strictEqual(p2Before1.pass1EndTime, 10.0);
+      assert.strictEqual(p2Before1.startTime, 8.5);
+      assert.strictEqual(p2Before1.endTime, 9.75);
+      assert.strictEqual(p2Before1.isUnoccludedBoxView, true);
+      assert.deepStrictEqual(p2Before1.bestShotTimes, [9.25, 9.5]);
+      assert.strictEqual(p2Before1.bestFrames.length, 2);
+      assert.strictEqual(p2Before1.bestFrames[0].filename, 'frame_evt_before_01_highest_contrast_9.25.jpg');
+      assert.strictEqual(p2Before1.bestFrames[1].filename, 'frame_evt_before_01_minimal_blur_9.5.jpg');
+      assert.ok(
+        p2Before1.bestFrames[0].gcsUri.endsWith('/frames/vid-update-shots-01/frame_evt_before_01_highest_contrast_9.25.jpg')
+      );
+
+      assert.strictEqual(p2After1.eventClass, 'after_update_shot');
+      assert.strictEqual(p2After1.pass1StartTime, 15.0);
+      assert.strictEqual(p2After1.pass1EndTime, 17.0);
+      assert.strictEqual(p2After1.startTime, 15.25);
+      assert.strictEqual(p2After1.endTime, 16.75);
+      assert.strictEqual(p2After1.isUnoccludedBoxView, true);
+      assert.deepStrictEqual(p2After1.bestShotTimes, [15.5, 15.75]);
+      assert.strictEqual(p2After1.bestFrames.length, 2);
+      assert.strictEqual(p2After1.bestFrames[0].filename, 'frame_evt_after_01_highest_contrast_15.5.jpg');
+      assert.strictEqual(p2After1.bestFrames[1].filename, 'frame_evt_after_01_minimal_blur_15.75.jpg');
+      assert.ok(
+        p2After1.bestFrames[0].gcsUri.endsWith('/frames/vid-update-shots-01/frame_evt_after_01_highest_contrast_15.5.jpg')
+      );
+
+      assert.strictEqual(p2Before2.eventClass, 'before_update_shot');
+      assert.strictEqual(p2Before2.startTime, 20.5);
+      assert.strictEqual(p2Before2.endTime, 21.75);
+      assert.strictEqual(p2After2.eventClass, 'after_update_shot');
+      assert.strictEqual(p2After2.startTime, 27.25);
+      assert.strictEqual(p2After2.endTime, 28.5);
+
+      assert.strictEqual(pass2Events.refinedActions[0].beforeUpdateShotEventId, 'evt_before_01');
+      assert.strictEqual(pass2Events.refinedActions[0].afterUpdateShotEventId, 'evt_after_01');
+      assert.strictEqual(pass2Events.refinedActions[1].beforeUpdateShotEventId, 'evt_before_02');
+      assert.strictEqual(pass2Events.refinedActions[1].afterUpdateShotEventId, 'evt_after_02');
+
+      // Run Pass 3 and verify before_update_shot and after_update_shot are excluded from labelTranscriptions
+      const pass3Result = await runPass3AnalysisRefinement({
+        videoId: 'vid-update-shots-01',
+        videoGcsUri: 'gs://test-bucket/normalized/norm_vid-update-shots-01.mp4',
+        classification,
+        actions: pass1Actions,
+        events: pass2Events,
+      });
+
+      assert.strictEqual(
+        pass3Result.labelTranscriptions.length,
+        1,
+        'Only VIAL_LABEL_PRESENTATION should be in labelTranscriptions, not before_update_shot or after_update_shot'
+      );
+      assert.strictEqual(pass3Result.labelTranscriptions[0].eventId, 'evt_vial_lbl_01');
+      assert.strictEqual(pass3Result.actionWellLocations.length, 2);
+      assert.strictEqual(pass3Result.actionWellLocations[0].coordinate, 'A1');
+      assert.strictEqual(pass3Result.actionWellLocations[1].coordinate, 'B2');
+
+      // Verify View Analysis window in VideoManager.tsx displays before_update_shot and after_update_shot in Pass 1 and Pass 2
+      const vmSource = fs.readFileSync(
+        path.join(__dirname, '../../client/src/components/VideoManager.tsx'),
+        'utf-8'
+      );
+      assert.ok(
+        vmSource.includes('Pass 1 Label Presentation, before_update_shot & after_update_shot Events (1 fps)'),
+        'View Analysis Pass 1 header must include before_update_shot & after_update_shot'
+      );
+      assert.ok(
+        vmSource.includes('pass1-action-update-shots-'),
+        'View Analysis Pass 1 action cards must display associated before_update_shot & after_update_shot events'
+      );
+      assert.ok(
+        vmSource.includes('pass2-action-update-shots-'),
+        'View Analysis Pass 2 refined action cards must display refined before_update_shot & after_update_shot events'
+      );
+      assert.ok(
+        vmSource.includes('Clear Unoccluded Cryo-Box View (4 fps Refined)'),
+        'View Analysis Pass 2 event cards must display unoccluded cryo-box view badge for refined update shots'
+      );
+      assert.ok(
+        vmSource.includes('pass2-frame-filename-') &&
+          vmSource.includes('pass2-frame-bucket-entry-') &&
+          vmSource.includes('pass2-frame-download-') &&
+          vmSource.includes('download=1'),
+        'View Analysis Pass 2 frame cards must display frame filename, storage bucket path, and a Download button next to the frame name'
+      );
+    });
   });
 });

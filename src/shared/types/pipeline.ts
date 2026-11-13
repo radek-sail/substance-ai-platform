@@ -137,6 +137,7 @@ export type BestFrameType = z.infer<typeof BestFrameTypeSchema>;
 export const BestFrameSchema = z.object({
   frameType: BestFrameTypeSchema,
   label: z.string().optional(),
+  filename: z.string().optional(),
   timestampSeconds: z.number(),
   timestamp: z.number().optional(),
   gcsUri: z.string(),
@@ -284,6 +285,8 @@ export const ActionIntervalSchema = z.object({
   substanceLoaded: z.string().optional(),
   reagents: z.array(ArchiveReagentSchema).optional(),
   labelEventId: z.string().optional(),
+  beforeUpdateShotEventId: z.string().optional(),
+  afterUpdateShotEventId: z.string().optional(),
   eventList: z.array(z.string()).optional(),
 });
 export type ActionInterval = z.infer<typeof ActionIntervalSchema>;
@@ -404,6 +407,8 @@ export const ActionSchema = z.object({
   seededWells: z.array(z.string()).optional(),
   reagents: z.array(ArchiveReagentSchema).optional(),
   labelEventId: z.string().optional(),
+  beforeUpdateShotEventId: z.string().optional(),
+  afterUpdateShotEventId: z.string().optional(),
   eventList: z.array(z.string()),
 });
 export type Action = z.infer<typeof ActionSchema>;
@@ -429,6 +434,11 @@ export const EventSchema = z.object({
   eventTrack: z.enum(['video', 'audio']).default('video'),
   startTime: timeField,
   endTime: timeField,
+  pass1StartTime: z.number().optional(),
+  pass1EndTime: z.number().optional(),
+  refinedStartTime: z.number().optional(),
+  refinedEndTime: z.number().optional(),
+  isUnoccludedBoxView: z.boolean().optional(),
   description: z.string().optional(),
   spokenContext: z.string().optional(),
   associationReason: z.string().optional(),
@@ -896,9 +906,53 @@ export const RefinedActionBoundarySchema = z.object({
   endTime: z.string(),
   fps: z.number().default(4),
   confidenceScore: z.number().optional(),
+  beforeUpdateShotEventId: z.string().optional(),
+  afterUpdateShotEventId: z.string().optional(),
   associatedEventIds: z.array(z.string()).default([]),
 });
 export type RefinedActionBoundary = z.infer<typeof RefinedActionBoundarySchema>;
+
+export function normalizeUpdateShotEventClass(
+  eventOrClass?: Partial<Event> | string | null
+): 'before_update_shot' | 'after_update_shot' | null {
+  if (!eventOrClass) return null;
+  const rawClass =
+    typeof eventOrClass === 'string'
+      ? eventOrClass
+      : String(eventOrClass.eventClass || (eventOrClass as any).actionType || '');
+  const upper = rawClass.trim().toUpperCase();
+  if (
+    upper === 'BEFORE_UPDATE_SHOT' ||
+    upper === 'BEFORE_UPDATE_SHOT_EVENT'
+  ) {
+    return 'before_update_shot';
+  }
+  if (
+    upper === 'AFTER_UPDATE_SHOT' ||
+    upper === 'AFTER_UPDATE_SHOT_EVENT'
+  ) {
+    return 'after_update_shot';
+  }
+  return null;
+}
+
+export function isBeforeUpdateShotEvent(
+  eventOrClass?: Partial<Event> | string | null
+): boolean {
+  return normalizeUpdateShotEventClass(eventOrClass) === 'before_update_shot';
+}
+
+export function isAfterUpdateShotEvent(
+  eventOrClass?: Partial<Event> | string | null
+): boolean {
+  return normalizeUpdateShotEventClass(eventOrClass) === 'after_update_shot';
+}
+
+export function isUpdateShotEvent(
+  eventOrClass?: Partial<Event> | string | null
+): boolean {
+  return normalizeUpdateShotEventClass(eventOrClass) !== null;
+}
 
 export const EventDetectionSchema = z.object({
   events: z.array(EventSchema),

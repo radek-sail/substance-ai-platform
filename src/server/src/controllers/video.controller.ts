@@ -14,6 +14,7 @@ import {
   storage,
   uploadToTenantStorage,
   getTenantGcsUri,
+  getTenantBucketName,
 } from '../services/storage.service';
 import {
   normalizeVideo,
@@ -1561,6 +1562,14 @@ export const getVideoFrameHandler = async (req: Request, res: Response): Promise
   }
 
   const safeFilename = path.basename(filename);
+  const isDownloadRequest =
+    String(req.query?.download || '') === '1' ||
+    String(req.query?.download || '').toLowerCase() === 'true';
+  const applyDownloadHeaderIfRequested = () => {
+    if (isDownloadRequest) {
+      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    }
+  };
   const scratchDir = getScratchDir();
   const candidateFrameDirs = Array.from(
     new Set([
@@ -1578,38 +1587,52 @@ export const getVideoFrameHandler = async (req: Request, res: Response): Promise
         if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
           res.setHeader('Content-Type', 'image/jpeg');
           res.setHeader('Cache-Control', 'public, max-age=3600');
+          applyDownloadHeaderIfRequested();
           return res.status(200).send(buf);
         }
       }
     }
 
     // 2. Try downloading from GCS if not in local cache
-    const bucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
+    const defaultBucketName = process.env.GCS_BUCKET_NAME || 'sail-platform-videos-prod';
+    const queryCustomerId = String(req.query?.customerId || req.query?.tenant || '').trim();
+    const candidateBuckets = Array.from(
+      new Set(
+        [
+          queryCustomerId ? getTenantBucketName(queryCustomerId) : undefined,
+          defaultBucketName,
+        ].filter((b): b is string => Boolean(b))
+      )
+    );
+    const bucketName = candidateBuckets[0] || defaultBucketName;
     const gcsObjectPath = `frames/${videoId}/${safeFilename}`;
-    try {
-      const file = storage.bucket(bucketName).file(gcsObjectPath);
-      const [exists] = await file.exists();
-      if (exists) {
-        const [contents] = await file.download();
-        if (contents && contents.length > 4 && contents[0] === 0xff && contents[1] === 0xd8) {
-          // Cache locally for subsequent requests
-          for (const dir of candidateFrameDirs) {
-            try {
-              if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
+    for (const candBucket of candidateBuckets) {
+      try {
+        const file = storage.bucket(candBucket).file(gcsObjectPath);
+        const [exists] = await file.exists();
+        if (exists) {
+          const [contents] = await file.download();
+          if (contents && contents.length > 4 && contents[0] === 0xff && contents[1] === 0xd8) {
+            // Cache locally for subsequent requests
+            for (const dir of candidateFrameDirs) {
+              try {
+                if (!fs.existsSync(dir)) {
+                  fs.mkdirSync(dir, { recursive: true });
+                }
+                fs.writeFileSync(path.join(dir, safeFilename), contents);
+              } catch {
+                // ignore local cache write errors
               }
-              fs.writeFileSync(path.join(dir, safeFilename), contents);
-            } catch {
-              // ignore local cache write errors
             }
+            res.setHeader('Content-Type', 'image/jpeg');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            applyDownloadHeaderIfRequested();
+            return res.status(200).send(contents);
           }
-          res.setHeader('Content-Type', 'image/jpeg');
-          res.setHeader('Cache-Control', 'public, max-age=3600');
-          return res.status(200).send(contents);
         }
+      } catch {
+        // fall through to next bucket or on-demand extraction
       }
-    } catch {
-      // fall through to on-demand extraction
     }
 
     // 3. On-demand FFmpeg frame extraction if timestamp can be resolved from query ?t= or filename
@@ -1802,6 +1825,7 @@ export const getVideoFrameHandler = async (req: Request, res: Response): Promise
 
               res.setHeader('Content-Type', 'image/jpeg');
               res.setHeader('Cache-Control', 'public, max-age=3600');
+              applyDownloadHeaderIfRequested();
               return res.status(200).send(buf);
             }
           }
@@ -1815,17 +1839,36 @@ export const getVideoFrameHandler = async (req: Request, res: Response): Promise
     const lowerName = safeFilename.toLowerCase();
     const isFirst = lowerName.includes('_first_');
     const isLast = lowerName.includes('_last_');
+    const isBeforeShot = lowerName.includes('before_update_shot') || lowerName.includes('evt_before');
+    const isAfterShot = lowerName.includes('after_update_shot') || lowerName.includes('evt_after');
     const isContrast = lowerName.includes('contrast');
     const title = isFirst
       ? 'ACTION FIRST FRAME'
       : isLast
       ? 'ACTION LAST FRAME'
+      : isBeforeShot
+      ? 'BEFORE UPDATE SHOT'
+      : isAfterShot
+      ? 'AFTER UPDATE SHOT'
       : isContrast
       ? 'HIGHEST CONTRAST'
       : 'MINIMAL BLUR';
-    const badgeColor = isFirst || isLast ? '#10b981' : isContrast ? '#f59e0b' : '#38bdf8';
+    const badgeColor =
+      isFirst || isLast
+        ? '#10b981'
+        : isBeforeShot
+        ? '#f59e0b'
+        : isAfterShot
+        ? '#14b8a6'
+        : isContrast
+        ? '#f59e0b'
+        : '#38bdf8';
     const subtitle =
-      isFirst || isLast ? 'ACTION BOUNDARY FRAME PREVIEW' : 'CRYO-LABEL FRAME PREVIEW';
+      isFirst || isLast
+        ? 'ACTION BOUNDARY FRAME PREVIEW'
+        : isBeforeShot || isAfterShot
+        ? 'UNOCCLUDED CRYO-BOX UPDATE SHOT'
+        : 'CRYO-LABEL FRAME PREVIEW';
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180">
       <rect width="320" height="180" fill="#0f172a"/>
       <rect x="8" y="8" width="304" height="164" rx="8" fill="#1e293b" stroke="${badgeColor}" stroke-width="1.5"/>
@@ -1837,6 +1880,7 @@ export const getVideoFrameHandler = async (req: Request, res: Response): Promise
       <text x="32" y="143" fill="#64748b" font-family="monospace" font-size="9">Pass 2 @ 4 FPS Frame Extraction</text>
     </svg>`;
     res.setHeader('Content-Type', 'image/svg+xml');
+    applyDownloadHeaderIfRequested();
     return res.status(200).send(svg);
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'Failed to serve frame' });

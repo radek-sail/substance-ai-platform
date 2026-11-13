@@ -31,6 +31,7 @@ import {
   Trash2,
   RotateCcw,
   Pause,
+  Download,
 } from 'lucide-react';
 import {
   type VideoAnalysisDoc,
@@ -48,6 +49,10 @@ import {
   render96WellPlateMarkdown,
   resolveSeededColumnsAndWells,
   parseColumnNumbersFromText,
+  isBeforeUpdateShotEvent,
+  isAfterUpdateShotEvent,
+  isUpdateShotEvent,
+  normalizeUpdateShotEventClass,
 } from '@sail/shared';
 import {
   TenantConfig,
@@ -2851,7 +2856,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       passKey: 'pass1',
       title: 'Pass 1: Action & Label Event Detection (Pro @ 1 fps)',
       subtitle:
-        'Coarse temporal action span detection + box/vial label presentation events & action associations at 1 fps',
+        'Coarse temporal action span detection + box/vial label presentation, before_update_shot & after_update_shot events at 1 fps',
       buttonLabel: 'Run Pass 1',
       artifactFilename: 'action_detection_pass.json',
     },
@@ -2860,7 +2865,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
       passKey: 'pass2',
       title: 'Pass 2: Best Frames & Boundary Refinement (Temporal 4 fps)',
       subtitle:
-        'Targeted 4 fps dual best-frame selection (highest contrast & minimal blur) & [start-1s, end+1s] action boundary refinement',
+        'Targeted 4 fps dual best-frame selection, unoccluded cryo-box before_update_shot & after_update_shot refinement & [start-1s, end+1s] action boundary refinement',
       buttonLabel: 'Run Pass 2',
       artifactFilename: 'event_detection_pass.json',
     },
@@ -4259,9 +4264,28 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             : Array.isArray(pass1Data?.actions)
                             ? pass1Data.actions
                             : [];
-                          const pass1Events: any[] = Array.isArray(pass1Data?.events)
-                            ? pass1Data.events
+                          const pass2RawForP1 = selectedPasses.pass2?.data;
+                          const pass2EventsForP1: any[] = Array.isArray(pass2RawForP1)
+                            ? pass2RawForP1
+                            : Array.isArray((pass2RawForP1 as any)?.events)
+                            ? (pass2RawForP1 as any).events
+                            : Array.isArray(analysisCache[selectedVideo.videoId]?.events)
+                            ? (analysisCache[selectedVideo.videoId]?.events as any[])
                             : [];
+                          const pass1Events: any[] =
+                            Array.isArray(pass1Data?.events) && pass1Data.events.length > 0
+                              ? pass1Data.events
+                              : pass2EventsForP1.map((evt: any) => ({
+                                  ...evt,
+                                  startTime:
+                                    typeof evt.pass1StartTime === 'number'
+                                      ? evt.pass1StartTime
+                                      : evt.startTime,
+                                  endTime:
+                                    typeof evt.pass1EndTime === 'number'
+                                      ? evt.pass1EndTime
+                                      : evt.endTime,
+                                }));
                           const totalDetected = pass1Data?.totalActionsDetected ?? rawActions.length;
                           const workflowCtx = pass1Data?.workflowContext;
                           const isArchiveWorkflow =
@@ -4269,6 +4293,18 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             selectedVideo.passes?.pass0?.data?.workflowType === 'EXPERIMENT_NOTEBOOK_WORKFLOW' ||
                             Boolean(selectedVideo.archiveId) ||
                             Boolean(selectedVideo.archiveAssociationType);
+                          const pass1BeforeShots = pass1Events.filter((e: any) =>
+                            isBeforeUpdateShotEvent(e?.eventClass)
+                          );
+                          const pass1AfterShots = pass1Events.filter((e: any) =>
+                            isAfterUpdateShotEvent(e?.eventClass)
+                          );
+                          const pass1UpdateShotEvents = pass1Events.filter((e: any) =>
+                            isUpdateShotEvent(e?.eventClass)
+                          );
+                          const pass1LabelOnlyEvents = pass1Events.filter(
+                            (e: any) => !isUpdateShotEvent(e?.eventClass)
+                          );
 
                           if (rawActions.length === 0 && pass1Events.length === 0) {
                             return (
@@ -4280,10 +4316,15 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
                           return (
                             <div className="space-y-3">
-                              <div className="flex items-center justify-between text-xs font-mono px-1">
-                                <span className="text-indigo-300 font-semibold flex items-center gap-1.5">
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono px-1">
+                                <span className="text-indigo-300 font-semibold flex flex-wrap items-center gap-1.5">
                                   <Sparkles className="w-3.5 h-3.5" />
-                                  Total Actions Detected: {totalDetected} ({rawActions.filter((a: any) => (a.actionType || a.actionClass || '').includes('INSERTION')).length} Insertions, {rawActions.filter((a: any) => (a.actionType || a.actionClass || '').includes('REMOVAL')).length} Removals) • Label Events: {pass1Events.length}
+                                  <span>
+                                    Total Actions Detected: {totalDetected} ({rawActions.filter((a: any) => (a.actionType || a.actionClass || '').includes('INSERTION')).length} Insertions, {rawActions.filter((a: any) => (a.actionType || a.actionClass || '').includes('REMOVAL')).length} Removals) • Label Events: {pass1LabelOnlyEvents.length}
+                                    {!isArchiveWorkflow
+                                      ? ` • Before/After Update Shots: ${pass1UpdateShotEvents.length} (${pass1BeforeShots.length} before_update_shot, ${pass1AfterShots.length} after_update_shot)`
+                                      : ''}
+                                  </span>
                                 </span>
                                 <div className="flex items-center gap-2">
                                   {pass1Data?.modelUsed && (
@@ -4345,6 +4386,54 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                       : 0.95) * 100
                                   );
 
+                                  const isEvtLinkedToAction = (evt: any) =>
+                                    evt &&
+                                    (evt.actionId === actId ||
+                                      (Array.isArray(evt.actionIds) && evt.actionIds.includes(actId)) ||
+                                      (Array.isArray(actionItem.eventList) &&
+                                        evt.eventId &&
+                                        actionItem.eventList.includes(evt.eventId)));
+                                  const p1BeforeShotEvt =
+                                    pass1Events.find(
+                                      (e: any) =>
+                                        (actionItem.beforeUpdateShotEventId &&
+                                          e?.eventId === actionItem.beforeUpdateShotEventId) ||
+                                        (isBeforeUpdateShotEvent(e?.eventClass) && isEvtLinkedToAction(e))
+                                    ) ||
+                                    pass2EventsForP1.find(
+                                      (e: any) =>
+                                        (actionItem.beforeUpdateShotEventId &&
+                                          e?.eventId === actionItem.beforeUpdateShotEventId) ||
+                                        (isBeforeUpdateShotEvent(e?.eventClass) && isEvtLinkedToAction(e))
+                                    );
+                                  const p1AfterShotEvt =
+                                    pass1Events.find(
+                                      (e: any) =>
+                                        (actionItem.afterUpdateShotEventId &&
+                                          e?.eventId === actionItem.afterUpdateShotEventId) ||
+                                        (isAfterUpdateShotEvent(e?.eventClass) && isEvtLinkedToAction(e))
+                                    ) ||
+                                    pass2EventsForP1.find(
+                                      (e: any) =>
+                                        (actionItem.afterUpdateShotEventId &&
+                                          e?.eventId === actionItem.afterUpdateShotEventId) ||
+                                        (isAfterUpdateShotEvent(e?.eventClass) && isEvtLinkedToAction(e))
+                                    );
+                                  const p2BeforeShotEvt = pass2EventsForP1.find(
+                                    (e: any) =>
+                                      (p1BeforeShotEvt?.eventId && e?.eventId === p1BeforeShotEvt.eventId) ||
+                                      (actionItem.beforeUpdateShotEventId &&
+                                        e?.eventId === actionItem.beforeUpdateShotEventId) ||
+                                      (isBeforeUpdateShotEvent(e?.eventClass) && isEvtLinkedToAction(e))
+                                  );
+                                  const p2AfterShotEvt = pass2EventsForP1.find(
+                                    (e: any) =>
+                                      (p1AfterShotEvt?.eventId && e?.eventId === p1AfterShotEvt.eventId) ||
+                                      (actionItem.afterUpdateShotEventId &&
+                                        e?.eventId === actionItem.afterUpdateShotEventId) ||
+                                      (isAfterUpdateShotEvent(e?.eventClass) && isEvtLinkedToAction(e))
+                                  );
+
                                   let typeBadgeColor = 'bg-slate-800 text-slate-300 border-slate-700';
                                   if (actType === 'VIAL_INSERTION' || actType.includes('INSERTION')) {
                                     typeBadgeColor = 'bg-emerald-950/80 text-emerald-300 border-emerald-800/80';
@@ -4395,17 +4484,163 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
 
                                       {Array.isArray(actionItem.eventList) && actionItem.eventList.length > 0 && (
                                         <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-mono">
-                                          <span className="text-slate-400">Associated Label Events:</span>
-                                          {actionItem.eventList.map((evtId: string) => (
-                                            <span
-                                              key={evtId}
-                                              className="px-1.5 py-0.5 rounded bg-indigo-950/70 text-indigo-300 border border-indigo-700/60"
-                                            >
-                                              {evtId}
-                                            </span>
-                                          ))}
+                                          <span className="text-slate-400">Associated Events:</span>
+                                          {actionItem.eventList.map((evtId: string) => {
+                                            const matchedEvt =
+                                              pass1Events.find((e: any) => e?.eventId === evtId) ||
+                                              pass2EventsForP1.find((e: any) => e?.eventId === evtId);
+                                            const isBefore = isBeforeUpdateShotEvent(matchedEvt?.eventClass);
+                                            const isAfter = isAfterUpdateShotEvent(matchedEvt?.eventClass);
+                                            return (
+                                              <span
+                                                key={evtId}
+                                                className={`px-1.5 py-0.5 rounded border ${
+                                                  isBefore
+                                                    ? 'bg-amber-950/70 text-amber-300 border-amber-700/60'
+                                                    : isAfter
+                                                    ? 'bg-teal-950/70 text-teal-300 border-teal-700/60'
+                                                    : 'bg-indigo-950/70 text-indigo-300 border-indigo-700/60'
+                                                }`}
+                                              >
+                                                {isBefore
+                                                  ? `📸 before_update_shot (${evtId})`
+                                                  : isAfter
+                                                  ? `📸 after_update_shot (${evtId})`
+                                                  : evtId}
+                                              </span>
+                                            );
+                                          })}
                                         </div>
                                       )}
+
+                                      {!isArchiveAct &&
+                                        !isArchiveWorkflow &&
+                                        (p1BeforeShotEvt ||
+                                          p1AfterShotEvt ||
+                                          actionItem.beforeUpdateShotEventId ||
+                                          actionItem.afterUpdateShotEventId) && (
+                                          <div
+                                            data-testid={`pass1-action-update-shots-${actId}`}
+                                            className="text-[10px] font-mono bg-slate-950/80 border border-slate-800 rounded-lg p-2 space-y-1.5"
+                                          >
+                                            <div className="text-slate-300 font-semibold flex items-center justify-between">
+                                              <span>Unoccluded Cryo-Box Update Shots (Pass 1 → Pass 2)</span>
+                                              <span className="text-[9px] text-cyan-400">
+                                                before_update_shot &amp; after_update_shot
+                                              </span>
+                                            </div>
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                                              <div className="rounded bg-amber-950/35 border border-amber-800/50 px-2 py-1 space-y-0.5">
+                                                <div className="flex items-center justify-between text-amber-300 font-semibold">
+                                                  <span>📸 before_update_shot</span>
+                                                  <span className="text-[9px] text-amber-200/80">
+                                                    {p1BeforeShotEvt?.eventId ||
+                                                      actionItem.beforeUpdateShotEventId ||
+                                                      '—'}
+                                                  </span>
+                                                </div>
+                                                {p1BeforeShotEvt ? (
+                                                  <div className="text-slate-300 space-y-0.5">
+                                                    <div>
+                                                      Pass 1 (1fps):{' '}
+                                                      <strong className="text-amber-200">
+                                                        {Number(
+                                                          p1BeforeShotEvt.pass1StartTime ??
+                                                            p1BeforeShotEvt.startTime ??
+                                                            p1BeforeShotEvt.startTimestampSeconds ??
+                                                            0
+                                                        ).toFixed(2)}
+                                                        s–
+                                                        {Number(
+                                                          p1BeforeShotEvt.pass1EndTime ??
+                                                            p1BeforeShotEvt.endTime ??
+                                                            p1BeforeShotEvt.endTimestampSeconds ??
+                                                            0
+                                                        ).toFixed(2)}
+                                                        s
+                                                      </strong>
+                                                    </div>
+                                                    {p2BeforeShotEvt && (
+                                                      <div className="text-cyan-300">
+                                                        Pass 2 (4fps):{' '}
+                                                        <strong>
+                                                          {Number(
+                                                            p2BeforeShotEvt.refinedStartTime ??
+                                                              p2BeforeShotEvt.startTime ??
+                                                              0
+                                                          ).toFixed(2)}
+                                                          s–
+                                                          {Number(
+                                                            p2BeforeShotEvt.refinedEndTime ??
+                                                              p2BeforeShotEvt.endTime ??
+                                                              0
+                                                          ).toFixed(2)}
+                                                          s
+                                                        </strong>
+                                                      </div>
+                                                    )}
+                                                  </div>
+                                                ) : (
+                                                  <div className="text-slate-500 italic">Pending detection</div>
+                                                )}
+                                              </div>
+                                              <div className="rounded bg-teal-950/35 border border-teal-800/50 px-2 py-1 space-y-0.5">
+                                                <div className="flex items-center justify-between text-teal-300 font-semibold">
+                                                  <span>📸 after_update_shot</span>
+                                                  <span className="text-[9px] text-teal-200/80">
+                                                    {p1AfterShotEvt?.eventId ||
+                                                      actionItem.afterUpdateShotEventId ||
+                                                      '—'}
+                                                  </span>
+                                                </div>
+                                                {p1AfterShotEvt ? (
+                                                  <div className="text-slate-300 space-y-0.5">
+                                                    <div>
+                                                      Pass 1 (1fps):{' '}
+                                                      <strong className="text-teal-200">
+                                                        {Number(
+                                                          p1AfterShotEvt.pass1StartTime ??
+                                                            p1AfterShotEvt.startTime ??
+                                                            p1AfterShotEvt.startTimestampSeconds ??
+                                                            0
+                                                        ).toFixed(2)}
+                                                        s–
+                                                        {Number(
+                                                          p1AfterShotEvt.pass1EndTime ??
+                                                            p1AfterShotEvt.endTime ??
+                                                            p1AfterShotEvt.endTimestampSeconds ??
+                                                            0
+                                                        ).toFixed(2)}
+                                                        s
+                                                      </strong>
+                                                    </div>
+                                                    {p2AfterShotEvt && (
+                                                      <div className="text-cyan-300">
+                                                        Pass 2 (4fps):{' '}
+                                                        <strong>
+                                                          {Number(
+                                                            p2AfterShotEvt.refinedStartTime ??
+                                                              p2AfterShotEvt.startTime ??
+                                                              0
+                                                          ).toFixed(2)}
+                                                          s–
+                                                          {Number(
+                                                            p2AfterShotEvt.refinedEndTime ??
+                                                              p2AfterShotEvt.endTime ??
+                                                              0
+                                                          ).toFixed(2)}
+                                                          s
+                                                        </strong>
+                                                      </div>
+                                                    )}
+                                                  </div>
+                                                ) : (
+                                                  <div className="text-slate-500 italic">Pending detection</div>
+                                                )}
+                                              </div>
+                                            </div>
+                                          </div>
+                                        )}
 
                                       {typeof actionItem.refinedStartTimestampSeconds === 'number' &&
                                         typeof actionItem.pass1StartTimestampSeconds === 'number' && (
@@ -4647,59 +4882,121 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                 })}
                               </div>
 
-                              {/* Pass 1 Label Presentation Events & Action Associations */}
+                              {/* Pass 1 Label Presentation & Before/After Update Shot Events & Action Associations */}
                               {pass1Events.length > 0 && (
                                 <div className="rounded-xl bg-slate-950/90 border border-slate-800 p-3.5 space-y-2.5">
-                                  <div className="flex items-center justify-between text-xs font-mono">
+                                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
                                     <span className="font-semibold text-cyan-300">
                                       {isArchiveWorkflow
                                         ? 'Pass 1 Reagent Label Presentation Events & Action Associations (1 fps)'
-                                        : 'Pass 1 Label Presentation Events & Action Associations (1 fps)'}
+                                        : 'Pass 1 Label Presentation, before_update_shot & after_update_shot Events (1 fps)'}
                                     </span>
                                     <span className="text-[11px] text-slate-400">
-                                      Best frames extracted at 4 fps in Pass 2
+                                      {isArchiveWorkflow
+                                        ? 'Best frames extracted at 4 fps in Pass 2'
+                                        : 'Detected at 1 fps in Pass 1 • Refined at 4 fps in Pass 2 for unoccluded cryo-box & label views'}
                                     </span>
                                   </div>
                                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
                                     {pass1Events.map((evt: any, eIdx: number) => {
                                       const evtId = evt.eventId || `evt_${eIdx + 1}`;
-                                      const isBoxEvt = String(evt.eventClass || '').includes('BOX_LABEL');
+                                      const evtClassStr = String(evt.eventClass || '');
+                                      const isBoxEvt = evtClassStr.toUpperCase().includes('BOX_LABEL');
+                                      const isBeforeShot = isBeforeUpdateShotEvent(evtClassStr);
+                                      const isAfterShot = isAfterUpdateShotEvent(evtClassStr);
+                                      const isUpdateShot = isBeforeShot || isAfterShot;
+                                      const matchedP2Evt = pass2EventsForP1.find(
+                                        (p2e: any) => p2e && p2e.eventId === evtId
+                                      );
                                       const assocIds: string[] =
                                         Array.isArray(evt.actionIds) && evt.actionIds.length > 0
                                           ? evt.actionIds
                                           : evt.actionId
                                           ? [evt.actionId]
                                           : [];
-                                      const evtStart = typeof evt.startTime === 'number' ? evt.startTime : 0;
-                                      const evtEnd = typeof evt.endTime === 'number' ? evt.endTime : evtStart;
+                                      const evtStart =
+                                        typeof evt.pass1StartTime === 'number'
+                                          ? evt.pass1StartTime
+                                          : typeof evt.startTime === 'number'
+                                          ? evt.startTime
+                                          : typeof evt.startTimestampSeconds === 'number'
+                                          ? evt.startTimestampSeconds
+                                          : 0;
+                                      const evtEnd =
+                                        typeof evt.pass1EndTime === 'number'
+                                          ? evt.pass1EndTime
+                                          : typeof evt.endTime === 'number'
+                                          ? evt.endTime
+                                          : typeof evt.endTimestampSeconds === 'number'
+                                          ? evt.endTimestampSeconds
+                                          : evtStart;
+                                      const p2RefStart =
+                                        matchedP2Evt &&
+                                        typeof (matchedP2Evt.refinedStartTime ?? matchedP2Evt.startTime) ===
+                                          'number'
+                                          ? Number(matchedP2Evt.refinedStartTime ?? matchedP2Evt.startTime)
+                                          : undefined;
+                                      const p2RefEnd =
+                                        matchedP2Evt &&
+                                        typeof (matchedP2Evt.refinedEndTime ?? matchedP2Evt.endTime) ===
+                                          'number'
+                                          ? Number(matchedP2Evt.refinedEndTime ?? matchedP2Evt.endTime)
+                                          : undefined;
 
                                       return (
                                         <div
                                           key={evtId}
+                                          data-testid={`pass1-event-card-${evtId}`}
                                           className="rounded-lg bg-slate-900/90 border border-slate-800 p-3 space-y-2 text-xs font-mono"
                                         >
-                                          <div className="flex items-center justify-between gap-2">
-                                            <span
-                                              className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
-                                                isBoxEvt
-                                                  ? 'bg-cyan-950/80 text-cyan-300 border-cyan-700/60'
-                                                  : 'bg-emerald-950/80 text-emerald-300 border-emerald-700/60'
-                                              }`}
-                                            >
-                                              {evt.eventClass ||
-                                                (isBoxEvt
-                                                  ? 'BOX_LABEL_PRESENTATION'
-                                                  : isArchiveWorkflow
-                                                  ? 'REAGENT_LABEL_PRESENTATION_EVENT'
-                                                  : 'VIAL_LABEL_PRESENTATION')}
-                                            </span>
+                                          <div className="flex flex-wrap items-center justify-between gap-2">
+                                            <div className="flex flex-wrap items-center gap-1.5">
+                                              <span
+                                                className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
+                                                  isBeforeShot
+                                                    ? 'bg-amber-950/80 text-amber-300 border-amber-700/60'
+                                                    : isAfterShot
+                                                    ? 'bg-teal-950/80 text-teal-300 border-teal-700/60'
+                                                    : isBoxEvt
+                                                    ? 'bg-cyan-950/80 text-cyan-300 border-cyan-700/60'
+                                                    : 'bg-emerald-950/80 text-emerald-300 border-emerald-700/60'
+                                                }`}
+                                              >
+                                                {isBeforeShot
+                                                  ? '📸 before_update_shot (Unoccluded Box Before Action)'
+                                                  : isAfterShot
+                                                  ? '📸 after_update_shot (Unoccluded Box After Action)'
+                                                  : evt.eventClass ||
+                                                    (isBoxEvt
+                                                      ? 'BOX_LABEL_PRESENTATION'
+                                                      : isArchiveWorkflow
+                                                      ? 'REAGENT_LABEL_PRESENTATION_EVENT'
+                                                      : 'VIAL_LABEL_PRESENTATION')}
+                                              </span>
+                                              <span className="text-[10px] text-slate-400">
+                                                ID: {evtId}
+                                              </span>
+                                            </div>
                                             <span className="text-[11px] text-cyan-300 flex items-center gap-1">
                                               <Clock className="w-3 h-3" />
                                               <span>
-                                                {evtStart.toFixed(1)}s–{evtEnd.toFixed(1)}s
+                                                Pass 1 (1fps): {evtStart.toFixed(1)}s–{evtEnd.toFixed(1)}s
                                               </span>
                                             </span>
                                           </div>
+                                          {isUpdateShot && (
+                                            <div className="flex flex-wrap items-center justify-between gap-2 text-[10px]">
+                                              <span className="px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-700/50 text-emerald-300">
+                                                ✓ Clear Unoccluded Cryo-Box View (Hand Not Occluding Box)
+                                              </span>
+                                              {p2RefStart !== undefined && p2RefEnd !== undefined && (
+                                                <span className="px-2 py-0.5 rounded bg-purple-950/60 border border-purple-700/50 text-purple-300">
+                                                  Pass 2 Refined (4fps): {p2RefStart.toFixed(2)}s–
+                                                  {p2RefEnd.toFixed(2)}s
+                                                </span>
+                                              )}
+                                            </div>
+                                          )}
                                           {evt.description && (
                                             <p className="text-[11px] text-slate-300 font-sans">
                                               {evt.description}
@@ -4779,6 +5076,21 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             : Array.isArray(pass1Raw?.actions)
                             ? pass1Raw.actions
                             : [];
+                          const pass1EventsForP2: any[] = Array.isArray(pass1Raw?.events)
+                            ? pass1Raw.events
+                            : [];
+                          const pass2BeforeShotEvents = rawEvents.filter((e: any) =>
+                            isBeforeUpdateShotEvent(e?.eventClass)
+                          );
+                          const pass2AfterShotEvents = rawEvents.filter((e: any) =>
+                            isAfterUpdateShotEvent(e?.eventClass)
+                          );
+                          const pass2UpdateShotEvents = rawEvents.filter((e: any) =>
+                            isUpdateShotEvent(e?.eventClass)
+                          );
+                          const pass2LabelOnlyEvents = rawEvents.filter(
+                            (e: any) => !isUpdateShotEvent(e?.eventClass)
+                          );
                           const refinedActions: any[] =
                             Array.isArray((pass2Data as any)?.refinedActions) &&
                             (pass2Data as any).refinedActions.length > 0
@@ -4794,19 +5106,24 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                             <div className="space-y-4">
                               {/* Summary Header */}
                               <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono px-1">
-                                <span className="text-purple-300 font-semibold flex items-center gap-1.5">
+                                <span className="text-purple-300 font-semibold flex flex-wrap items-center gap-1.5">
                                   <Sparkles className="w-3.5 h-3.5" />
-                                  Detected Presentation Events: {rawEvents.length} {isArchiveWorkflow ? '(Reagent Labels)' : '(Box Labels & Vial Labels)'}
+                                  <span>
+                                    Detected Presentation &amp; Update Shot Events: {rawEvents.length}{' '}
+                                    {isArchiveWorkflow
+                                      ? '(Reagent Labels)'
+                                      : `(Box & Vial Labels: ${pass2LabelOnlyEvents.length} • Before/After Update Shots: ${pass2UpdateShotEvents.length} [${pass2BeforeShotEvents.length} before_update_shot, ${pass2AfterShotEvents.length} after_update_shot])`}
+                                  </span>
                                 </span>
                                 <span className="px-2 py-0.5 text-[11px] rounded bg-cyan-950/60 text-cyan-300 border border-cyan-700/50">
-                                  4 FPS Action Boundary Refinement Window: [Pass1 Start - 1s, Pass1 End + 1s]
+                                  4 FPS Unoccluded Cryo-Box &amp; Action Boundary Refinement: [Pass1 Start - 1s, Pass1 End + 1s]
                                 </span>
                               </div>
 
-                              {/* 1. Box & Vial Label Presentation Events + 2 Best Frames */}
+                              {/* 1. Box & Vial Label Presentation Events + Before/After Update Shot Events + 2 Best Frames */}
                               {rawEvents.length === 0 ? (
                                 <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 text-center text-xs text-slate-400 font-mono">
-                                  No label presentation events detected in Pass 2.
+                                  No label presentation or update shot events detected in Pass 2.
                                 </div>
                               ) : (
                                 <div className="space-y-3">
@@ -4815,8 +5132,30 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                     const defaultEvtClass = isArchiveWorkflow ? 'REAGENT_LABEL_PRESENTATION_EVENT' : 'VIAL_LABEL_PRESENTATION';
                                     const evtClass = String(evt.eventClass || defaultEvtClass);
                                     const isBoxLabel = evtClass.toUpperCase().includes('BOX_LABEL');
-                                    const startSec = Number(evt.startTime || 0);
-                                    const endSec = Number(evt.endTime || startSec);
+                                    const isBeforeShot = isBeforeUpdateShotEvent(evtClass);
+                                    const isAfterShot = isAfterUpdateShotEvent(evtClass);
+                                    const isUpdateShot = isBeforeShot || isAfterShot;
+                                    const matchedP1Evt = pass1EventsForP2.find(
+                                      (p1e: any) => p1e && p1e.eventId === evtId
+                                    );
+                                    const p1StartSec =
+                                      typeof evt.pass1StartTime === 'number'
+                                        ? evt.pass1StartTime
+                                        : typeof matchedP1Evt?.startTime === 'number'
+                                        ? matchedP1Evt.startTime
+                                        : typeof matchedP1Evt?.startTimestampSeconds === 'number'
+                                        ? matchedP1Evt.startTimestampSeconds
+                                        : undefined;
+                                    const p1EndSec =
+                                      typeof evt.pass1EndTime === 'number'
+                                        ? evt.pass1EndTime
+                                        : typeof matchedP1Evt?.endTime === 'number'
+                                        ? matchedP1Evt.endTime
+                                        : typeof matchedP1Evt?.endTimestampSeconds === 'number'
+                                        ? matchedP1Evt.endTimestampSeconds
+                                        : undefined;
+                                    const startSec = Number(evt.refinedStartTime ?? evt.startTime ?? 0);
+                                    const endSec = Number(evt.refinedEndTime ?? evt.endTime ?? startSec);
                                     const associatedActionIds: string[] =
                                       Array.isArray(evt.actionIds) && evt.actionIds.length > 0
                                         ? evt.actionIds
@@ -4842,6 +5181,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                     return (
                                       <div
                                         key={evtId}
+                                        data-testid={`pass2-event-card-${evtId}`}
                                         className="rounded-xl p-4 bg-slate-900/95 border border-slate-800 space-y-3"
                                       >
                                         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -4850,6 +5190,10 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               className={`text-[11px] font-mono px-2.5 py-0.5 rounded border font-semibold ${
                                                 isBoxLabel
                                                   ? 'bg-amber-950/80 text-amber-300 border-amber-700/80'
+                                                  : isBeforeShot
+                                                  ? 'bg-amber-950/80 text-amber-300 border-amber-700/80'
+                                                  : isAfterShot
+                                                  ? 'bg-teal-950/80 text-teal-300 border-teal-700/80'
                                                   : evtClass.toUpperCase().includes('REAGENT_LABEL')
                                                   ? 'bg-cyan-950/80 text-cyan-300 border-cyan-700/80'
                                                   : evtClass.toUpperCase().includes('MIXING') ||
@@ -4860,6 +5204,10 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                             >
                                               {isBoxLabel
                                                 ? '📦 BOX LABEL PRESENTATION'
+                                                : isBeforeShot
+                                                ? '📸 BEFORE UPDATE SHOT (before_update_shot)'
+                                                : isAfterShot
+                                                ? '📸 AFTER UPDATE SHOT (after_update_shot)'
                                                 : evtClass.toUpperCase().includes('INCUBATOR_SETTINGS')
                                                 ? '🌡 INCUBATOR SETTINGS'
                                                 : evtClass.toUpperCase().includes('HEMOCYTOMETER_LOAD')
@@ -4877,6 +5225,19 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                 ? '🧪 REAGENT LABEL PRESENTATION'
                                                 : '🧪 VIAL LABEL PRESENTATION'}
                                             </span>
+                                            {isUpdateShot && (
+                                              <span
+                                                className={`text-xs font-mono px-2 py-0.5 rounded border font-semibold ${
+                                                  evt.isUnoccludedBoxView !== false && !evt.isOccluded
+                                                    ? 'bg-emerald-950/70 text-emerald-300 border-emerald-700/70'
+                                                    : 'bg-amber-950/70 text-amber-300 border-amber-700/70'
+                                                }`}
+                                              >
+                                                {evt.isUnoccludedBoxView !== false && !evt.isOccluded
+                                                  ? '✓ Clear Unoccluded Cryo-Box View (4 fps Refined)'
+                                                  : '⚠ Partial Occlusion Flagged'}
+                                              </span>
+                                            )}
                                             {(evt.incubatorSettings || evt.temperature || evt.co2Level) && (
                                               <span className="text-xs font-mono text-amber-300 bg-amber-950/60 px-2 py-0.5 rounded border border-amber-800/60 font-semibold">
                                                 Temp: {evt.incubatorSettings?.temperature || evt.temperature || 'N/A'} • CO2: {evt.incubatorSettings?.co2Level || evt.co2Level || 'N/A'}
@@ -4904,8 +5265,14 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               </span>
                                             )}
                                             <span className="text-xs font-mono text-cyan-300 bg-cyan-950/60 px-2 py-0.5 rounded border border-cyan-800/60">
+                                              {isUpdateShot ? 'Refined (4fps): ' : ''}
                                               {startSec.toFixed(2)}s – {endSec.toFixed(2)}s
                                             </span>
+                                            {p1StartSec !== undefined && p1EndSec !== undefined && (
+                                              <span className="text-[11px] font-mono text-purple-300 bg-purple-950/50 px-2 py-0.5 rounded border border-purple-800/60">
+                                                Pass 1 (1fps): {p1StartSec.toFixed(2)}s – {p1EndSec.toFixed(2)}s
+                                              </span>
+                                            )}
                                             <span className="text-[11px] font-mono text-slate-400">
                                               ID: {evtId}
                                             </span>
@@ -4922,6 +5289,12 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               onPlayInterval={() => setActiveSeekedActionId(evtId)}
                                             />
                                           </div>
+
+                                        {evt.description && (
+                                          <p className="text-xs text-slate-200 font-sans">
+                                            {evt.description}
+                                          </p>
+                                        )}
 
                                         {/* Associated Actions & Spoken Context */}
                                         <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
@@ -4955,20 +5328,32 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               frame.timestampSeconds ?? frame.timestamp ?? startSec
                                             );
                                             const rawUrl = String(frame.url || frame.gcsUri || '');
-                                            const fallbackFilename =
-                                              rawUrl.split('/').pop() ||
-                                              `frame_${evtId}_${isContrast ? 'contrast' : 'blur'}_${Number(
+                                            const rawUrlWithoutQuery = rawUrl.split('?')[0];
+                                            const extractedFilenameFromUrl = rawUrlWithoutQuery
+                                              ? decodeURIComponent(rawUrlWithoutQuery.split('/').pop() || '')
+                                              : '';
+                                            const frameFilename =
+                                              String(frame.filename || '').trim() ||
+                                              extractedFilenameFromUrl ||
+                                              `frame_${evtId}_${isContrast ? 'highest_contrast' : 'minimal_blur'}_${Number(
                                                 frameTs.toFixed(2)
                                               )}.jpg`;
+                                            const storageBucketPath =
+                                              frame.gcsUri && String(frame.gcsUri).startsWith('gs://')
+                                                ? String(frame.gcsUri)
+                                                : `frames/${selectedVideo.videoId}/${frameFilename}`;
                                             const basePreviewUrl =
                                               rawUrl && !rawUrl.startsWith('gs://')
                                                 ? rawUrl
                                                 : `/api/videos/${encodeURIComponent(
                                                     selectedVideo.videoId
-                                                  )}/frames/${encodeURIComponent(fallbackFilename)}`;
+                                                  )}/frames/${encodeURIComponent(frameFilename)}`;
                                             const previewUrl = basePreviewUrl.includes('?')
                                               ? basePreviewUrl
                                               : `${basePreviewUrl}?t=${Number(frameTs.toFixed(2))}`;
+                                            const downloadUrl = `${previewUrl}${
+                                              previewUrl.includes('?') ? '&' : '?'
+                                            }download=1`;
                                             return (
                                               <div
                                                 key={`${evtId}_frame_${fIdx}`}
@@ -4989,6 +5374,39 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                                   <span className="text-cyan-400">
                                                     @{frameTs.toFixed(2)}s
                                                   </span>
+                                                </div>
+
+                                                {/* Frame Filename & Download Button for GCS Storage Identification */}
+                                                <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded bg-slate-900/90 border border-slate-800 text-[11px] font-mono">
+                                                  <div className="min-w-0 flex-1">
+                                                    <div className="flex items-center gap-1.5 truncate">
+                                                      <span className="text-slate-400 shrink-0">Frame:</span>
+                                                      <span
+                                                        data-testid={`pass2-frame-filename-${evtId}-${fIdx}`}
+                                                        title={frameFilename}
+                                                        className="text-emerald-300 font-semibold truncate"
+                                                      >
+                                                        {frameFilename}
+                                                      </span>
+                                                    </div>
+                                                    <div
+                                                      data-testid={`pass2-frame-bucket-entry-${evtId}-${fIdx}`}
+                                                      title={storageBucketPath}
+                                                      className="text-[10px] text-slate-400 truncate"
+                                                    >
+                                                      Bucket: {storageBucketPath}
+                                                    </div>
+                                                  </div>
+                                                  <a
+                                                    href={downloadUrl}
+                                                    download={frameFilename}
+                                                    data-testid={`pass2-frame-download-${evtId}-${fIdx}`}
+                                                    title={`Download ${frameFilename}`}
+                                                    className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded bg-indigo-950/90 hover:bg-indigo-900 text-indigo-200 border border-indigo-700/70 text-[10px] font-semibold transition-colors"
+                                                  >
+                                                    <Download className="w-3 h-3" />
+                                                    <span>Download</span>
+                                                  </a>
                                                 </div>
 
                                                 <div className="w-full rounded bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center">
@@ -5024,7 +5442,7 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                               {refinedActions.length > 0 && (
                                 <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-3.5 space-y-3">
                                   <div className="text-xs font-mono font-semibold text-cyan-300 flex items-center justify-between">
-                                    <span>Refined Inventory Update Action Boundaries (4 FPS)</span>
+                                    <span>Refined Inventory Update Action Boundaries &amp; Before/After Update Shots (4 FPS)</span>
                                     <span className="text-[10px] text-slate-400">
                                       Window = [Pass 1 Start - 1.0s, Pass 1 End + 1.0s] @ 4 fps
                                     </span>
@@ -5063,6 +5481,24 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                         : Array.isArray(ra.eventList)
                                         ? ra.eventList
                                         : [];
+                                      const isLinkedToRa = (evt: any) =>
+                                        evt &&
+                                        (evt.actionId === ra.actionId ||
+                                          (Array.isArray(evt.actionIds) &&
+                                            evt.actionIds.includes(ra.actionId)) ||
+                                          (evt.eventId && associatedEvents.includes(evt.eventId)));
+                                      const beforeShotP2 = rawEvents.find(
+                                        (e: any) =>
+                                          (ra.beforeUpdateShotEventId &&
+                                            e?.eventId === ra.beforeUpdateShotEventId) ||
+                                          (isBeforeUpdateShotEvent(e?.eventClass) && isLinkedToRa(e))
+                                      );
+                                      const afterShotP2 = rawEvents.find(
+                                        (e: any) =>
+                                          (ra.afterUpdateShotEventId &&
+                                            e?.eventId === ra.afterUpdateShotEventId) ||
+                                          (isAfterUpdateShotEvent(e?.eventClass) && isLinkedToRa(e))
+                                      );
 
                                       return (
                                         <div
@@ -5104,6 +5540,270 @@ export const VideoManager: React.FC<VideoManagerViewProps> = ({
                                               </span>
                                             )}
                                           </div>
+                                          {(beforeShotP2 ||
+                                            afterShotP2 ||
+                                            ra.beforeUpdateShotEventId ||
+                                            ra.afterUpdateShotEventId) && (
+                                            <div
+                                              data-testid={`pass2-action-update-shots-${ra.actionId}`}
+                                              className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1.5 border-t border-slate-800/80 text-[10px]"
+                                            >
+                                              <div className="rounded bg-amber-950/30 border border-amber-800/50 p-2 space-y-1">
+                                                <div className="flex items-center justify-between text-amber-300 font-semibold">
+                                                  <span>📸 before_update_shot (Unoccluded Box Before)</span>
+                                                  <span>
+                                                    {beforeShotP2?.eventId ||
+                                                      ra.beforeUpdateShotEventId ||
+                                                      '—'}
+                                                  </span>
+                                                </div>
+                                                {beforeShotP2 ? (
+                                                  <div className="space-y-1.5">
+                                                    <div className="flex items-center justify-between gap-2 text-slate-300">
+                                                      <div className="space-y-0.5">
+                                                        {typeof beforeShotP2.pass1StartTime === 'number' && (
+                                                          <div className="text-slate-400">
+                                                            Pass 1 (1fps): {beforeShotP2.pass1StartTime.toFixed(2)}s–
+                                                            {Number(
+                                                              beforeShotP2.pass1EndTime ?? beforeShotP2.endTime ?? 0
+                                                            ).toFixed(2)}
+                                                            s
+                                                          </div>
+                                                        )}
+                                                        <div className="text-amber-200 font-semibold">
+                                                          Refined (4fps):{' '}
+                                                          {Number(
+                                                            beforeShotP2.refinedStartTime ??
+                                                              beforeShotP2.startTime ??
+                                                              0
+                                                          ).toFixed(2)}
+                                                          s–
+                                                          {Number(
+                                                            beforeShotP2.refinedEndTime ??
+                                                              beforeShotP2.endTime ??
+                                                              0
+                                                          ).toFixed(2)}
+                                                          s
+                                                        </div>
+                                                        {Array.isArray(beforeShotP2.bestShotTimes) &&
+                                                          beforeShotP2.bestShotTimes.length > 0 && (
+                                                            <div className="text-cyan-300">
+                                                              Best Shots:{' '}
+                                                              {beforeShotP2.bestShotTimes
+                                                                .map((t: number) => `@${Number(t).toFixed(2)}s`)
+                                                                .join(', ')}
+                                                            </div>
+                                                          )}
+                                                      </div>
+                                                      <IntervalThumbnailPreview
+                                                        videoId={selectedVideo.videoId}
+                                                        status={selectedVideo.status}
+                                                        tenant={tenant}
+                                                        organizationId={(selectedVideo as any).organizationId}
+                                                        startSeconds={Number(
+                                                          beforeShotP2.refinedStartTime ??
+                                                            beforeShotP2.startTime ??
+                                                            0
+                                                        )}
+                                                        endSeconds={Number(
+                                                          beforeShotP2.refinedEndTime ??
+                                                            beforeShotP2.endTime ??
+                                                            0
+                                                        )}
+                                                        intervalId={`p2_ra_before_${ra.actionId}`}
+                                                        onPlayInterval={() =>
+                                                          setActiveSeekedActionId(beforeShotP2.eventId)
+                                                        }
+                                                      />
+                                                    </div>
+                                                    {Array.isArray(beforeShotP2.bestFrames) &&
+                                                      beforeShotP2.bestFrames.length > 0 && (
+                                                        <div className="space-y-1 pt-1 border-t border-amber-800/40">
+                                                          {beforeShotP2.bestFrames.map(
+                                                            (bf: any, bfIdx: number) => {
+                                                              const bfTs = Number(
+                                                                bf.timestampSeconds ??
+                                                                  bf.timestamp ??
+                                                                  beforeShotP2.startTime ??
+                                                                  0
+                                                              );
+                                                              const bfRawUrl = String(bf.url || bf.gcsUri || '');
+                                                              const bfName =
+                                                                String(bf.filename || '').trim() ||
+                                                                (bfRawUrl
+                                                                  ? decodeURIComponent(
+                                                                      bfRawUrl.split('?')[0].split('/').pop() || ''
+                                                                    )
+                                                                  : '') ||
+                                                                `frame_${beforeShotP2.eventId}_${
+                                                                  bfIdx === 0 ? 'highest_contrast' : 'minimal_blur'
+                                                                }_${Number(bfTs.toFixed(2))}.jpg`;
+                                                              const bfDlUrl = `/api/videos/${encodeURIComponent(
+                                                                selectedVideo.videoId
+                                                              )}/frames/${encodeURIComponent(bfName)}?t=${Number(
+                                                                bfTs.toFixed(2)
+                                                              )}&download=1`;
+                                                              return (
+                                                                <div
+                                                                  key={`ra_before_${ra.actionId}_${bfIdx}`}
+                                                                  className="flex items-center justify-between gap-2 bg-slate-950/80 px-2 py-1 rounded border border-amber-900/50"
+                                                                >
+                                                                  <span
+                                                                    className="text-amber-200 truncate"
+                                                                    title={`frames/${selectedVideo.videoId}/${bfName}`}
+                                                                  >
+                                                                    {bfName}
+                                                                  </span>
+                                                                  <a
+                                                                    href={bfDlUrl}
+                                                                    download={bfName}
+                                                                    className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-900/60 hover:bg-amber-800 text-amber-100 border border-amber-700/60 text-[9px] font-semibold"
+                                                                  >
+                                                                    <Download className="w-2.5 h-2.5" />
+                                                                    <span>Download</span>
+                                                                  </a>
+                                                                </div>
+                                                              );
+                                                            }
+                                                          )}
+                                                        </div>
+                                                      )}
+                                                  </div>
+                                                ) : (
+                                                  <div className="text-slate-500 italic">
+                                                    Event ID: {ra.beforeUpdateShotEventId}
+                                                  </div>
+                                                )}
+                                              </div>
+                                              <div className="rounded bg-teal-950/30 border border-teal-800/50 p-2 space-y-1">
+                                                <div className="flex items-center justify-between text-teal-300 font-semibold">
+                                                  <span>📸 after_update_shot (Unoccluded Box After)</span>
+                                                  <span>
+                                                    {afterShotP2?.eventId ||
+                                                      ra.afterUpdateShotEventId ||
+                                                      '—'}
+                                                  </span>
+                                                </div>
+                                                {afterShotP2 ? (
+                                                  <div className="space-y-1.5">
+                                                    <div className="flex items-center justify-between gap-2 text-slate-300">
+                                                      <div className="space-y-0.5">
+                                                        {typeof afterShotP2.pass1StartTime === 'number' && (
+                                                          <div className="text-slate-400">
+                                                            Pass 1 (1fps): {afterShotP2.pass1StartTime.toFixed(2)}s–
+                                                            {Number(
+                                                              afterShotP2.pass1EndTime ?? afterShotP2.endTime ?? 0
+                                                            ).toFixed(2)}
+                                                            s
+                                                          </div>
+                                                        )}
+                                                        <div className="text-teal-200 font-semibold">
+                                                          Refined (4fps):{' '}
+                                                          {Number(
+                                                            afterShotP2.refinedStartTime ??
+                                                              afterShotP2.startTime ??
+                                                              0
+                                                          ).toFixed(2)}
+                                                          s–
+                                                          {Number(
+                                                            afterShotP2.refinedEndTime ??
+                                                              afterShotP2.endTime ??
+                                                              0
+                                                          ).toFixed(2)}
+                                                          s
+                                                        </div>
+                                                        {Array.isArray(afterShotP2.bestShotTimes) &&
+                                                          afterShotP2.bestShotTimes.length > 0 && (
+                                                            <div className="text-cyan-300">
+                                                              Best Shots:{' '}
+                                                              {afterShotP2.bestShotTimes
+                                                                .map((t: number) => `@${Number(t).toFixed(2)}s`)
+                                                                .join(', ')}
+                                                            </div>
+                                                          )}
+                                                      </div>
+                                                      <IntervalThumbnailPreview
+                                                        videoId={selectedVideo.videoId}
+                                                        status={selectedVideo.status}
+                                                        tenant={tenant}
+                                                        organizationId={(selectedVideo as any).organizationId}
+                                                        startSeconds={Number(
+                                                          afterShotP2.refinedStartTime ??
+                                                            afterShotP2.startTime ??
+                                                            0
+                                                        )}
+                                                        endSeconds={Number(
+                                                          afterShotP2.refinedEndTime ??
+                                                            afterShotP2.endTime ??
+                                                            0
+                                                        )}
+                                                        intervalId={`p2_ra_after_${ra.actionId}`}
+                                                        onPlayInterval={() =>
+                                                          setActiveSeekedActionId(afterShotP2.eventId)
+                                                        }
+                                                      />
+                                                    </div>
+                                                    {Array.isArray(afterShotP2.bestFrames) &&
+                                                      afterShotP2.bestFrames.length > 0 && (
+                                                        <div className="space-y-1 pt-1 border-t border-teal-800/40">
+                                                          {afterShotP2.bestFrames.map(
+                                                            (af: any, afIdx: number) => {
+                                                              const afTs = Number(
+                                                                af.timestampSeconds ??
+                                                                  af.timestamp ??
+                                                                  afterShotP2.startTime ??
+                                                                  0
+                                                              );
+                                                              const afRawUrl = String(af.url || af.gcsUri || '');
+                                                              const afName =
+                                                                String(af.filename || '').trim() ||
+                                                                (afRawUrl
+                                                                  ? decodeURIComponent(
+                                                                      afRawUrl.split('?')[0].split('/').pop() || ''
+                                                                    )
+                                                                  : '') ||
+                                                                `frame_${afterShotP2.eventId}_${
+                                                                  afIdx === 0 ? 'highest_contrast' : 'minimal_blur'
+                                                                }_${Number(afTs.toFixed(2))}.jpg`;
+                                                              const afDlUrl = `/api/videos/${encodeURIComponent(
+                                                                selectedVideo.videoId
+                                                              )}/frames/${encodeURIComponent(afName)}?t=${Number(
+                                                                afTs.toFixed(2)
+                                                              )}&download=1`;
+                                                              return (
+                                                                <div
+                                                                  key={`ra_after_${ra.actionId}_${afIdx}`}
+                                                                  className="flex items-center justify-between gap-2 bg-slate-950/80 px-2 py-1 rounded border border-teal-900/50"
+                                                                >
+                                                                  <span
+                                                                    className="text-teal-200 truncate"
+                                                                    title={`frames/${selectedVideo.videoId}/${afName}`}
+                                                                  >
+                                                                    {afName}
+                                                                  </span>
+                                                                  <a
+                                                                    href={afDlUrl}
+                                                                    download={afName}
+                                                                    className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-teal-900/60 hover:bg-teal-800 text-teal-100 border border-teal-700/60 text-[9px] font-semibold"
+                                                                  >
+                                                                    <Download className="w-2.5 h-2.5" />
+                                                                    <span>Download</span>
+                                                                  </a>
+                                                                </div>
+                                                              );
+                                                            }
+                                                          )}
+                                                        </div>
+                                                      )}
+                                                  </div>
+                                                ) : (
+                                                  <div className="text-slate-500 italic">
+                                                    Event ID: {ra.afterUpdateShotEventId}
+                                                  </div>
+                                                )}
+                                              </div>
+                                            </div>
+                                          )}
                                         </div>
                                       );
                                     })}

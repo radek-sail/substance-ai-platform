@@ -22,15 +22,18 @@ Identify and segment EVERY individual vial insertion (`VIAL_INSERTION`) or remov
 
 Extracted fields: `actionId`, `actionClass`, `inventoryId`, `cellLineName`, `cellLineInfo`, `towerId`, `boxRowId` (A–Z), `boxColId` (1–N), `eventList`.
 
-### Label Presentation Event Detection & Action Association (Pass 1 @ 1 fps)
-In the `events` array during Pass 1 (at 1 fps), detect every instance where the operator presents a box label or vial label to the camera:
+### Label Presentation & Update Shot Event Detection & Action Association (Pass 1 @ 1 fps)
+In the `events` array during Pass 1 (at 1 fps), detect every instance where the operator presents a box label or vial label to the camera, as well as the `before_update_shot` and `after_update_shot` cryo-box view events associated with each vial insertion (`VIAL_INSERTION`) or vial removal (`VIAL_REMOVAL`) action:
 1. `BOX_LABEL_PRESENTATION` (`BOX_LABEL_PRESENTATION_EVENT`, `eventTrack: 'video'`): Operator shows or presents the cryo-box label, rack/box identifier, or box inscription to the camera.
 2. `VIAL_LABEL_PRESENTATION` (`VIAL_LABEL_PRESENTATION_EVENT`, `eventTrack: 'video'`): Operator presents the specimen cryovial label, barcode, or vial inscription to the camera.
+3. `before_update_shot` (`BEFORE_UPDATE_SHOT`, `eventTrack: 'video'`): Associated with a `VIAL_INSERTION` or `VIAL_REMOVAL` action (`actionId` and `actionIds: [actionId]`). Shows a clear view of the cryo-box (operator hand not occluding the view) before the action of insertion or removal of a vial happened.
+4. `after_update_shot` (`AFTER_UPDATE_SHOT`, `eventTrack: 'video'`): Associated with a `VIAL_INSERTION` or `VIAL_REMOVAL` action (`actionId` and `actionIds: [actionId]`). Shows a clear view of the cryo-box (operator hand not occluding the view) after the inventory was updated (after the action of inserting or removing a vial from the box happened).
 
-Every detected `BOX_LABEL_PRESENTATION` and `VIAL_LABEL_PRESENTATION` event MUST be associated in Pass 1 with the specific Pass 1 actions (`actionIds: string[]`, plus primary `actionId`) to which it applies:
+Every detected `BOX_LABEL_PRESENTATION`, `VIAL_LABEL_PRESENTATION`, `before_update_shot`, and `after_update_shot` event MUST be associated in Pass 1 with the specific Pass 1 actions (`actionIds: string[]`, plus primary `actionId`) to which it applies:
 - **Box-Wide Association**: If the operator presents a box label at the beginning of the video (or prior to working on a box) and then performs multiple vial insertions or removals in that box, associate that `BOX_LABEL_PRESENTATION` event with **all** of those vial insertion/removal actions (`actionIds: ["act_001", "act_002", ...]`).
 - **Spoken Multi-Vial Association**: If the operator presents a vial label to the camera and states a count (e.g., says `"four vials"`), associate that `VIAL_LABEL_PRESENTATION` event with the **4** subsequent vial insertion (or removal) actions that follow the presentation (`actionIds: ["act_001", "act_002", "act_003", "act_004"]`).
 - **Single-Action Association**: If a vial label presentation immediately precedes or accompanies a single vial insertion or removal without a multi-vial spoken count, associate it with that single action (`actionIds: ["act_001"]`).
+- **`before_update_shot` & `after_update_shot` Association**: For every `VIAL_INSERTION` and `VIAL_REMOVAL` action, associate its `before_update_shot` (clear unoccluded view of the cryo-box before the vial insertion or removal action happened) and `after_update_shot` (clear unoccluded view of the cryo-box after the inventory was updated) directly with that action (`actionId: "act_001"`, `actionIds: ["act_001"]`), and include both event IDs in the action's `eventList`.
 - Always record `spokenContext` (any relevant operator speech such as `"four vials"`) and `associationReason` explaining why the event is linked to those `actionIds`.
 - **`INVENTORY_IDENTIFICATION` Exclusion (Do NOT Repeat Pass 0 Identification Events in Pass 1)**:
   - The operator's announcement or identification of the target cryogenic storage unit / inventory name (e.g., `"Tank Alpha"`, `"Cryo-Tank 2"`) is an `INVENTORY_IDENTIFICATION` event populated in **Pass 0**.
@@ -52,8 +55,15 @@ Pass 1 action detection runs at 1 fps. In Pass 2, refine the interval boundaries
 - Inspect each Pass 1 `VIAL_INSERTION` or `VIAL_REMOVAL` action strictly at **4 fps** (0.25s resolution) ONLY within the local search window extending the Pass 1 interval by **1 second before `startTimestampSeconds` and 1 second after `endTimestampSeconds`**:
   `[max(0, pass1Start - 1.0), min(videoDuration, pass1End + 1.0)]` (clamped so adjacent windows never overlap).
 - Determine the refined start timestamp (`refinedStartTimestampSeconds`) and refined end timestamp (`refinedEndTimestampSeconds`) at 4 fps precision that accurately bound the vial insertion or removal action within its search window. For `VIAL_INSERTION` actions, `refinedEndTimestampSeconds` MUST NOT end while the hand is still holding the vial; extend it until the hand releases the vial and stops occluding the view of the cryo-box.
-- Do NOT select or extract before/after box frames for actions; only refine and report the action interval boundaries (`refinedStartTimestampSeconds`, `refinedEndTimestampSeconds`, `startTime`, `endTime`).
+- Do NOT select or extract before/after box frames directly on the `refinedActions` objects; instead, refine the dedicated `before_update_shot` and `after_update_shot` events in the `events` array (see Section 3 below) and report the refined action interval boundaries (`refinedStartTimestampSeconds`, `refinedEndTimestampSeconds`, `startTime`, `endTime`) in `refinedActions`.
 - **No Temporal Overlap Between Neighboring Action Intervals**: Refined action intervals must NEVER overlap in time with neighboring actions. For any consecutive actions $i$ and $i+1$, `refinedEndTimestampSeconds` of action $i$ MUST be less than or equal to (`<=`) `refinedStartTimestampSeconds` of action $i+1$.
+
+### 3. Refining before_update_shot and after_update_shot Events for Clear Unoccluded Cryo-Box Views (Pass 2 @ 4 fps)
+For every `before_update_shot` and `after_update_shot` event detected in Pass 1 and associated with a `VIAL_INSERTION` or `VIAL_REMOVAL` action, refine the event at **4 fps** during Pass 2:
+- **Refinement Focus — Unoccluded Cryo-Box View**: The Pass 2 refinement of `before_update_shot` and `after_update_shot` MUST focus on ensuring that there is a **clear, unoccluded view of the cryo-box** (the operator's hand, fingers, forceps, or vial are NOT occluding the view of the box grid) before and after the action of inserting or removing a vial from the box happened.
+- **`before_update_shot` Refinement**: Refine `startTime`, `endTime`, `highestContrastTimestamp`, `minimalBlurTimestamp`, and `bestShotTimes` at 4 fps so that `before_update_shot` captures a clear, unoccluded view of the cryo-box **before** the operator's hand enters/occludes the box to insert or remove the vial.
+- **`after_update_shot` Refinement**: Refine `startTime`, `endTime`, `highestContrastTimestamp`, `minimalBlurTimestamp`, and `bestShotTimes` at 4 fps so that `after_update_shot` captures a clear, unoccluded view of the cryo-box **after** the inventory was updated (after the vial was inserted or removed and the operator's hand has withdrawn so it no longer occludes the cryo-box).
+- Preserve the event's association (`actionId` and `actionIds`) with its corresponding `VIAL_INSERTION` or `VIAL_REMOVAL` action.
 
 ## Output Schema
 Ensure output conforms strictly to `ActionSchema` and `EventSchema`.

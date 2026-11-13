@@ -51,14 +51,17 @@ export const TimelineViewer: React.FC<TimelineViewerProps> = ({
   const playheadPercent = Math.max(0, Math.min(100, (currentTime / (duration || 35)) * 100));
 
   const getEventBadgeColor = (eventClass: string) => {
-    if (eventClass.includes('BOX_LABEL')) return 'bg-amber-600/30 border-amber-500 text-amber-200';
-    if (eventClass.includes('VIAL_LABEL') || eventClass.includes('LABEL'))
+    const upper = eventClass.toUpperCase();
+    if (upper.includes('BOX_LABEL')) return 'bg-amber-600/30 border-amber-500 text-amber-200';
+    if (upper.includes('VIAL_LABEL') || upper.includes('LABEL'))
       return 'bg-purple-600/30 border-purple-500 text-purple-200';
-    if (eventClass.includes('PRE_ACTION')) return 'bg-amber-600/30 border-amber-500 text-amber-200';
-    if (eventClass.includes('POST_ACTION')) return 'bg-teal-600/30 border-teal-500 text-teal-200';
-    if (eventClass.includes('INSERTION')) return 'bg-cyan-600/30 border-cyan-500 text-cyan-200';
-    if (eventClass.includes('SEEDING')) return 'bg-emerald-600/30 border-emerald-500 text-emerald-200';
-    if (eventClass.includes('REAGENT') || eventClass.includes('ASPIRATION'))
+    if (upper.includes('BEFORE_UPDATE_SHOT') || upper.includes('PRE_ACTION'))
+      return 'bg-amber-600/30 border-amber-500 text-amber-200';
+    if (upper.includes('AFTER_UPDATE_SHOT') || upper.includes('POST_ACTION'))
+      return 'bg-teal-600/30 border-teal-500 text-teal-200';
+    if (upper.includes('INSERTION')) return 'bg-cyan-600/30 border-cyan-500 text-cyan-200';
+    if (upper.includes('SEEDING')) return 'bg-emerald-600/30 border-emerald-500 text-emerald-200';
+    if (upper.includes('REAGENT') || upper.includes('ASPIRATION'))
       return 'bg-blue-600/30 border-blue-500 text-blue-200';
     return 'bg-slate-700/50 border-slate-600 text-slate-300';
   };
